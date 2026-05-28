@@ -263,6 +263,14 @@ class AggregateSensor(_BaseTripSensor):
         "avg_consumption_kwh_100km": ("kWh/100km", None, "mdi:car-electric"),
     }
 
+    _SLUG_BY_KEY: dict[str, str] = {
+        "distance_km": "distance",
+        "energy_kwh": "energy",
+        "cost": "cost",
+        "count": "count",
+        "avg_consumption_kwh_100km": "avg_consumption",
+    }
+
     def __init__(
         self, coordinator: EvTripLoggerCoordinator, *, period: str, key: str
     ) -> None:
@@ -272,9 +280,7 @@ class AggregateSensor(_BaseTripSensor):
         self._value: float | int | None = None
 
         unit, device_class, icon = self._PERIODIC_KEYS_UNITS[key]
-        slug = f"{period}_{key.replace('_kwh_100km', '_consumption')}".replace(
-            "_km", ""
-        )
+        slug = f"{period}_{self._SLUG_BY_KEY[key]}"
         self.entity_description = SensorEntityDescription(
             key=f"total_{slug}",
             translation_key=f"total_{slug}",

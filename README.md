@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brand/logo.png" alt="EV Trip Logger" width="640">
+</p>
+
 # EV Trip Logger for Home Assistant
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
@@ -70,28 +74,30 @@ Configured entirely via the UI. You'll be asked for:
 
 ## Provided entities
 
-Once configured, the integration exposes:
+Once configured, the integration exposes the following sensors. Entity IDs are prefixed with the device name you chose in the config flow — examples below assume a device called **"My EV"** (`sensor.my_ev_*`).
 
 ### Live (during a trip)
 
-- `sensor.ev_trip_current_distance`
-- `sensor.ev_trip_current_duration`
-- `sensor.ev_trip_current_avg_speed`
-- `sensor.ev_trip_current_battery_used`
-- `sensor.ev_trip_current_energy`
-- `sensor.ev_trip_current_consumption`
-- `sensor.ev_trip_current_avg_temperature`
+- `sensor.my_ev_current_trip_distance`
+- `sensor.my_ev_current_trip_duration`
+- `sensor.my_ev_current_trip_average_speed`
+- `sensor.my_ev_current_trip_battery_used`
+- `sensor.my_ev_current_trip_energy`
+- `sensor.my_ev_current_trip_consumption`
+- `sensor.my_ev_current_trip_avg_temperature`
+- `sensor.my_ev_current_trip_max_power` *(only if you configured a power sensor)*
 
 ### Last completed trip
 
-Same set, prefixed `sensor.ev_trip_last_*`.
+Same set, with `current` replaced by `last` (e.g. `sensor.my_ev_last_trip_distance`).
 
 ### Aggregations
 
-- `sensor.ev_trip_total_distance_today` / `_week` / `_month` / `_year`
-- `sensor.ev_trip_total_energy_month` / `_cost_month`
-- `sensor.ev_trip_avg_consumption_30d`
-- `sensor.ev_trip_count_month`
+- `sensor.my_ev_distance_today` / `_this_week` / `_this_month` / `_this_year`
+- `sensor.my_ev_energy_this_month`
+- `sensor.my_ev_cost_this_month`
+- `sensor.my_ev_trips_this_month`
+- `sensor.my_ev_avg_consumption_30_days`
 
 ## Events
 

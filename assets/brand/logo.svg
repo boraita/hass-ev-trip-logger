@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f766e"/>
+      <stop offset="100%" stop-color="#064e3b"/>
+    </linearGradient>
+  </defs>
+
+  <g transform="translate(20, 20)">
+    <rect width="280" height="280" rx="64" fill="url(#bg)"/>
+    <path d="M 65 192
+             L 127 124
+             L 127 155
+             L 215 90"
+          stroke="#ffffff"
+          stroke-width="13"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          fill="none"/>
+    <circle cx="65" cy="192" r="12" fill="#a7f3d0"/>
+    <circle cx="65" cy="192" r="5" fill="#0f766e"/>
+    <circle cx="215" cy="90" r="12" fill="#a7f3d0"/>
+    <circle cx="215" cy="90" r="5" fill="#0f766e"/>
+  </g>
+
+  <text x="345" y="195" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="96" letter-spacing="-3">
+    <tspan font-weight="700" fill="#0f172a">EV Trip</tspan><tspan font-weight="300" fill="#0f766e" dx="22">Logger</tspan>
+  </text>
+</svg>
