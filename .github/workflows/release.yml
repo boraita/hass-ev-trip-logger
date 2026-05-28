@@ -1,0 +1,25 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+      - name: Set version in manifest
+        run: |
+          python -c "import json,pathlib; p=pathlib.Path('custom_components/ev_trip_logger/manifest.json'); m=json.loads(p.read_text()); m['version']='${{ steps.version.outputs.version }}'; p.write_text(json.dumps(m, indent=2)+'\n')"
+      - name: Create release zip
+        run: |
+          cd custom_components/ev_trip_logger
+          zip ../../ev_trip_logger.zip -r .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ev_trip_logger.zip

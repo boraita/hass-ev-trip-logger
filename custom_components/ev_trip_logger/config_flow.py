@@ -1,0 +1,250 @@
+"""Config flow for EV Trip Logger."""
+from __future__ import annotations
+
+from typing import Any
+
+import voluptuous as vol
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    TextSelector,
+)
+
+from .const import (
+    CONF_BATTERY,
+    CONF_BATTERY_CAPACITY,
+    CONF_CURRENCY,
+    CONF_ENERGY_PRICE,
+    CONF_IDLE_TIMEOUT,
+    CONF_LOCATION,
+    CONF_MIN_TRIP_DISTANCE,
+    CONF_NAME,
+    CONF_ODOMETER,
+    CONF_POWER,
+    CONF_RANGE,
+    CONF_TEMP,
+    CONF_VEHICLE_ON,
+    DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_CURRENCY,
+    DEFAULT_ENERGY_PRICE,
+    DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_MIN_TRIP_DISTANCE,
+    DOMAIN,
+)
+
+
+def _required_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
+    defaults = defaults or {}
+    return vol.Schema(
+        {
+            vol.Required(CONF_NAME, default=defaults.get(CONF_NAME, "My EV")): TextSelector(),
+            vol.Required(
+                CONF_ODOMETER, default=defaults.get(CONF_ODOMETER)
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="distance")
+            ),
+            vol.Required(
+                CONF_BATTERY, default=defaults.get(CONF_BATTERY)
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="battery")
+            ),
+            vol.Required(
+                CONF_VEHICLE_ON, default=defaults.get(CONF_VEHICLE_ON)
+            ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
+        }
+    )
+
+
+def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
+    defaults = defaults or {}
+
+    def _optional(key: str, selector: Any) -> Any:
+        if defaults.get(key) is not None:
+            return vol.Optional(key, default=defaults[key])
+        return vol.Optional(key)
+
+    return vol.Schema(
+        {
+            _optional(
+                CONF_POWER,
+                EntitySelector(EntitySelectorConfig(domain="sensor", device_class="power")),
+            ): EntitySelector(EntitySelectorConfig(domain="sensor", device_class="power")),
+            _optional(
+                CONF_RANGE,
+                EntitySelector(EntitySelectorConfig(domain="sensor", device_class="distance")),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="distance")
+            ),
+            _optional(
+                CONF_LOCATION,
+                EntitySelector(EntitySelectorConfig(domain="device_tracker")),
+            ): EntitySelector(EntitySelectorConfig(domain="device_tracker")),
+            _optional(
+                CONF_TEMP,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="temperature")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="temperature")
+            ),
+            vol.Required(
+                CONF_BATTERY_CAPACITY,
+                default=defaults.get(CONF_BATTERY_CAPACITY, DEFAULT_BATTERY_CAPACITY),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=1, max=300, step=0.1, mode=NumberSelectorMode.BOX, unit_of_measurement="kWh"
+                )
+            ),
+            vol.Required(
+                CONF_MIN_TRIP_DISTANCE,
+                default=defaults.get(CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=10, step=0.1, mode=NumberSelectorMode.BOX, unit_of_measurement="km"
+                )
+            ),
+            vol.Required(
+                CONF_IDLE_TIMEOUT,
+                default=defaults.get(CONF_IDLE_TIMEOUT, DEFAULT_IDLE_TIMEOUT),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=30, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min"
+                )
+            ),
+            vol.Required(
+                CONF_ENERGY_PRICE,
+                default=defaults.get(CONF_ENERGY_PRICE, DEFAULT_ENERGY_PRICE),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=5, step=0.001, mode=NumberSelectorMode.BOX
+                )
+            ),
+            vol.Required(
+                CONF_CURRENCY,
+                default=defaults.get(CONF_CURRENCY, DEFAULT_CURRENCY),
+            ): TextSelector(),
+        }
+    )
+
+
+class EvTripLoggerConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Initial config flow."""
+
+    VERSION = 1
+
+    def __init__(self) -> None:
+        self._data: dict[str, Any] = {}
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            await self.async_set_unique_id(user_input[CONF_NAME].lower())
+            self._abort_if_unique_id_configured()
+            self._data.update(user_input)
+            return await self.async_step_optional()
+
+        return self.async_show_form(step_id="user", data_schema=_required_schema())
+
+    async def async_step_optional(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            self._data.update(user_input)
+            return self.async_create_entry(
+                title=self._data[CONF_NAME], data=self._data
+            )
+
+        return self.async_show_form(
+            step_id="optional", data_schema=_optional_schema()
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        entry = self._get_reconfigure_entry()
+        if user_input is not None:
+            merged = {**entry.data, **entry.options, **user_input}
+            return self.async_update_reload_and_abort(entry, data=merged)
+
+        defaults = {**entry.data, **entry.options}
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=_required_schema(defaults).extend(
+                _optional_schema(defaults).schema
+            ),
+        )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(entry: ConfigEntry) -> OptionsFlow:
+        return EvTripLoggerOptionsFlow()
+
+
+class EvTripLoggerOptionsFlow(OptionsFlow):
+    """Options flow — adjust thresholds without losing history."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        defaults = {**self.config_entry.data, **self.config_entry.options}
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_BATTERY_CAPACITY,
+                        default=defaults.get(
+                            CONF_BATTERY_CAPACITY, DEFAULT_BATTERY_CAPACITY
+                        ),
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=1, max=300, step=0.1, mode=NumberSelectorMode.BOX, unit_of_measurement="kWh"
+                        )
+                    ),
+                    vol.Required(
+                        CONF_MIN_TRIP_DISTANCE,
+                        default=defaults.get(
+                            CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE
+                        ),
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0, max=10, step=0.1, mode=NumberSelectorMode.BOX, unit_of_measurement="km"
+                        )
+                    ),
+                    vol.Required(
+                        CONF_IDLE_TIMEOUT,
+                        default=defaults.get(CONF_IDLE_TIMEOUT, DEFAULT_IDLE_TIMEOUT),
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0, max=30, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min"
+                        )
+                    ),
+                    vol.Required(
+                        CONF_ENERGY_PRICE,
+                        default=defaults.get(CONF_ENERGY_PRICE, DEFAULT_ENERGY_PRICE),
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0, max=5, step=0.001, mode=NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Required(
+                        CONF_CURRENCY,
+                        default=defaults.get(CONF_CURRENCY, DEFAULT_CURRENCY),
+                    ): TextSelector(),
+                }
+            ),
+        )

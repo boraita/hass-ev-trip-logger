@@ -1,0 +1,98 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "EV Trip Logger",
+        "description": "Pick the entities that describe your vehicle. All three are required.",
+        "data": {
+          "name": "Name",
+          "odometer_sensor": "Odometer sensor",
+          "battery_sensor": "Battery level sensor",
+          "vehicle_on_sensor": "Vehicle-on binary sensor"
+        }
+      },
+      "optional": {
+        "title": "Optional sensors and parameters",
+        "description": "Pick any optional sensors and set your vehicle parameters.",
+        "data": {
+          "power_sensor": "Power sensor (kW)",
+          "range_sensor": "Range sensor",
+          "location_tracker": "Location tracker",
+          "exterior_temp_sensor": "Exterior temperature sensor",
+          "battery_capacity_kwh": "Battery capacity (kWh)",
+          "min_trip_distance_km": "Minimum trip distance (km)",
+          "idle_timeout_minutes": "Idle timeout (min)",
+          "energy_price_kwh": "Energy price per kWh",
+          "currency": "Currency"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure EV Trip Logger",
+        "description": "Update the sensors and parameters. Existing trip history is preserved."
+      }
+    },
+    "abort": {
+      "already_configured": "This vehicle is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EV Trip Logger options",
+        "data": {
+          "battery_capacity_kwh": "Battery capacity (kWh)",
+          "min_trip_distance_km": "Minimum trip distance (km)",
+          "idle_timeout_minutes": "Idle timeout (min)",
+          "energy_price_kwh": "Energy price per kWh",
+          "currency": "Currency"
+        }
+      }
+    }
+  },
+  "services": {
+    "start_trip": {
+      "name": "Start trip",
+      "description": "Manually open a trip session."
+    },
+    "end_trip": {
+      "name": "End trip",
+      "description": "Manually close the current trip session."
+    },
+    "delete_last_trip": {
+      "name": "Delete last trip",
+      "description": "Remove the most recent trip from history."
+    },
+    "export_csv": {
+      "name": "Export CSV",
+      "description": "Dump the full trip history to a CSV file."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "current_distance": { "name": "Current trip distance" },
+      "current_duration": { "name": "Current trip duration" },
+      "current_avg_speed": { "name": "Current trip average speed" },
+      "current_battery_used": { "name": "Current trip battery used" },
+      "current_energy": { "name": "Current trip energy" },
+      "current_consumption": { "name": "Current trip consumption" },
+      "current_avg_temperature": { "name": "Current trip avg. temperature" },
+      "current_max_power": { "name": "Current trip max power" },
+      "last_distance": { "name": "Last trip distance" },
+      "last_duration": { "name": "Last trip duration" },
+      "last_avg_speed": { "name": "Last trip average speed" },
+      "last_battery_used": { "name": "Last trip battery used" },
+      "last_energy": { "name": "Last trip energy" },
+      "last_consumption": { "name": "Last trip consumption" },
+      "last_avg_temperature": { "name": "Last trip avg. temperature" },
+      "last_max_power": { "name": "Last trip max power" },
+      "total_today_distance": { "name": "Distance today" },
+      "total_week_distance": { "name": "Distance this week" },
+      "total_month_distance": { "name": "Distance this month" },
+      "total_year_distance": { "name": "Distance this year" },
+      "total_month_energy": { "name": "Energy this month" },
+      "total_month_cost": { "name": "Cost this month" },
+      "total_month_count": { "name": "Trips this month" },
+      "total_30d_avg_consumption": { "name": "Avg. consumption (30 days)" }
+    }
+  }
+}

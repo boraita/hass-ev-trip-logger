@@ -1,0 +1,98 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "EV Trip Logger",
+        "description": "Elige las entidades que describen tu vehículo. Las tres son obligatorias.",
+        "data": {
+          "name": "Nombre",
+          "odometer_sensor": "Sensor de odómetro",
+          "battery_sensor": "Sensor de batería",
+          "vehicle_on_sensor": "Binary sensor de coche encendido"
+        }
+      },
+      "optional": {
+        "title": "Sensores opcionales y parámetros",
+        "description": "Elige los sensores opcionales y configura los parámetros del vehículo.",
+        "data": {
+          "power_sensor": "Sensor de potencia (kW)",
+          "range_sensor": "Sensor de autonomía",
+          "location_tracker": "Tracker de ubicación",
+          "exterior_temp_sensor": "Sensor de temperatura exterior",
+          "battery_capacity_kwh": "Capacidad de batería (kWh)",
+          "min_trip_distance_km": "Distancia mínima por viaje (km)",
+          "idle_timeout_minutes": "Tiempo de inactividad (min)",
+          "energy_price_kwh": "Precio de energía por kWh",
+          "currency": "Moneda"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigurar EV Trip Logger",
+        "description": "Actualiza sensores y parámetros. El historial de viajes se conserva."
+      }
+    },
+    "abort": {
+      "already_configured": "Este vehículo ya está configurado."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opciones de EV Trip Logger",
+        "data": {
+          "battery_capacity_kwh": "Capacidad de batería (kWh)",
+          "min_trip_distance_km": "Distancia mínima por viaje (km)",
+          "idle_timeout_minutes": "Tiempo de inactividad (min)",
+          "energy_price_kwh": "Precio de energía por kWh",
+          "currency": "Moneda"
+        }
+      }
+    }
+  },
+  "services": {
+    "start_trip": {
+      "name": "Iniciar viaje",
+      "description": "Abre manualmente una sesión de viaje."
+    },
+    "end_trip": {
+      "name": "Finalizar viaje",
+      "description": "Cierra manualmente el viaje en curso."
+    },
+    "delete_last_trip": {
+      "name": "Eliminar último viaje",
+      "description": "Borra el último viaje registrado del historial."
+    },
+    "export_csv": {
+      "name": "Exportar CSV",
+      "description": "Vuelca el historial completo de viajes a un fichero CSV."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "current_distance": { "name": "Distancia del viaje actual" },
+      "current_duration": { "name": "Duración del viaje actual" },
+      "current_avg_speed": { "name": "Velocidad media del viaje actual" },
+      "current_battery_used": { "name": "Batería usada en el viaje actual" },
+      "current_energy": { "name": "Energía del viaje actual" },
+      "current_consumption": { "name": "Consumo del viaje actual" },
+      "current_avg_temperature": { "name": "Temperatura media del viaje actual" },
+      "current_max_power": { "name": "Potencia máxima del viaje actual" },
+      "last_distance": { "name": "Distancia del último viaje" },
+      "last_duration": { "name": "Duración del último viaje" },
+      "last_avg_speed": { "name": "Velocidad media del último viaje" },
+      "last_battery_used": { "name": "Batería usada en el último viaje" },
+      "last_energy": { "name": "Energía del último viaje" },
+      "last_consumption": { "name": "Consumo del último viaje" },
+      "last_avg_temperature": { "name": "Temperatura media del último viaje" },
+      "last_max_power": { "name": "Potencia máxima del último viaje" },
+      "total_today_distance": { "name": "Distancia hoy" },
+      "total_week_distance": { "name": "Distancia esta semana" },
+      "total_month_distance": { "name": "Distancia este mes" },
+      "total_year_distance": { "name": "Distancia este año" },
+      "total_month_energy": { "name": "Energía este mes" },
+      "total_month_cost": { "name": "Coste este mes" },
+      "total_month_count": { "name": "Viajes este mes" },
+      "total_30d_avg_consumption": { "name": "Consumo medio (30 días)" }
+    }
+  }
+}

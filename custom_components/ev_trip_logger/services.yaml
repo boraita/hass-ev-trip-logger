@@ -1,0 +1,45 @@
+start_trip:
+  name: Start trip
+  description: Manually open a trip session.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Restrict the action to a specific config entry.
+      selector:
+        text:
+
+end_trip:
+  name: End trip
+  description: Manually close the current trip session.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Restrict the action to a specific config entry.
+      selector:
+        text:
+
+delete_last_trip:
+  name: Delete last trip
+  description: Remove the most recently logged trip (in case of accidental detection).
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Restrict the action to a specific config entry.
+      selector:
+        text:
+
+export_csv:
+  name: Export CSV
+  description: Dump the full trip history to a CSV file.
+  fields:
+    path:
+      name: Path
+      description: Absolute path of the CSV file to write.
+      required: true
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Restrict the action to a specific config entry.
+      selector:
+        text:

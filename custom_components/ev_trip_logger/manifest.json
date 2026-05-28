@@ -1,0 +1,13 @@
+{
+  "domain": "ev_trip_logger",
+  "name": "EV Trip Logger",
+  "version": "0.1.0",
+  "documentation": "https://github.com/boraita/hass-ev-trip-logger",
+  "issue_tracker": "https://github.com/boraita/hass-ev-trip-logger/issues",
+  "codeowners": ["@boraita"],
+  "requirements": [],
+  "dependencies": ["recorder"],
+  "iot_class": "calculated",
+  "config_flow": true,
+  "integration_type": "service"
+}
