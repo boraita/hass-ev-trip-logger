@@ -661,7 +661,9 @@ class LastChargeSensor(_BaseTripSensor):
         "kwh": {
             "unit": UnitOfEnergy.KILO_WATT_HOUR,
             "device_class": SensorDeviceClass.ENERGY,
-            "state_class": SensorStateClass.MEASUREMENT,
+            # HA rejects measurement for device_class=energy; last-charge is a
+            # one-shot value, not a running total — None is the right call.
+            "state_class": None,
             "precision": 2,
             "slug": "last_charge_kwh",
         },

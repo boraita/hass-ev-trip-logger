@@ -38,7 +38,6 @@ CREATE TABLE IF NOT EXISTS trips (
     journey_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
-CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id);
 
 CREATE TABLE IF NOT EXISTS charges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,9 +175,10 @@ class TripStorage:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()}
         if "journey_id" not in cols:
             conn.execute("ALTER TABLE trips ADD COLUMN journey_id INTEGER")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
-            )
+        # Safe to call on fresh or migrated DBs.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
+        )
 
     async def async_insert(self, record: TripRecord) -> int:
         """Persist a completed trip, return its id."""
