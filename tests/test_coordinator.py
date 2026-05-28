@@ -327,6 +327,87 @@ async def test_auto_detect_skips_when_recent_manual_charge_exists(
     assert coordinator.last_charge.location == "manual"
 
 
+async def _run_stage(
+    hass: HomeAssistant, *, odo_start: float, odo_end: float, soc_end: float,
+    location_end: str,
+) -> None:
+    """Helper: open vehicle_on, set odo+battery+location, close via end_trip service."""
+    hass.states.async_set(ODO, str(odo_start))
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, str(odo_end))
+    hass.states.async_set(BAT, str(soc_end))
+    hass.states.async_set(LOC, location_end)
+    await hass.async_block_till_done()
+    await hass.services.async_call(DOMAIN, SERVICE_END_TRIP, {}, blocking=True)
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+
+
+async def test_journey_chains_stages_until_home(hass: HomeAssistant) -> None:
+    """Home → work → shops → home should produce a single 3-stage journey."""
+    hass.states.async_set(LOC, "home")  # starting at home
+    entry = await _setup(hass, **{CONF_LOCATION: LOC})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="work")
+    assert coordinator.current_journey_id is not None
+    assert coordinator.last_completed_journey_id is None
+    j_id = coordinator.current_journey_id
+
+    # Continue to shops
+    hass.states.async_set(LOC, "work")  # start of next stage = location_end of last
+    await _run_stage(hass, odo_start=1020, odo_end=1025, soc_end=72, location_end="shops")
+    assert coordinator.current_journey_id == j_id
+
+    # Return home
+    hass.states.async_set(LOC, "shops")
+    await _run_stage(hass, odo_start=1025, odo_end=1045, soc_end=65, location_end="home")
+    assert coordinator.current_journey_id is None
+    assert coordinator.last_completed_journey_id == j_id
+
+    summary = await coordinator.storage.async_journey_summary(j_id)
+    assert summary is not None
+    assert summary["stages"] == 3
+    assert summary["distance_km"] == pytest.approx(45.0)  # 20 + 5 + 20
+
+
+async def test_journey_does_not_open_when_starting_outside_home(
+    hass: HomeAssistant,
+) -> None:
+    """A stage starting away from home does not open a journey (orphan)."""
+    hass.states.async_set(LOC, "work")
+    entry = await _setup(hass, **{CONF_LOCATION: LOC})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    await _run_stage(hass, odo_start=1000, odo_end=1010, soc_end=75, location_end="shops")
+
+    assert coordinator.current_journey_id is None
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.journey_id is None
+
+
+async def test_journey_zone_is_configurable(hass: HomeAssistant) -> None:
+    """A custom home zone name closes journeys instead of literal 'home'."""
+    from custom_components.ev_trip_logger.const import CONF_HOME_ZONE
+    hass.states.async_set(LOC, "casa")
+    entry = await _setup(
+        hass, **{CONF_LOCATION: LOC, CONF_HOME_ZONE: "casa"}
+    )
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="oficina")
+    j_id = coordinator.current_journey_id
+    assert j_id is not None
+
+    hass.states.async_set(LOC, "oficina")
+    await _run_stage(hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="casa")
+    assert coordinator.last_completed_journey_id == j_id
+    assert coordinator.current_journey_id is None
+
+
 async def test_auto_detect_charge_uses_device_tracker_location(
     hass: HomeAssistant,
 ) -> None:

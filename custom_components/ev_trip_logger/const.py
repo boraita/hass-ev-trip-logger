@@ -21,12 +21,14 @@ CONF_MIN_TRIP_DISTANCE: Final = "min_trip_distance_km"
 CONF_IDLE_TIMEOUT: Final = "idle_timeout_minutes"
 CONF_ENERGY_PRICE: Final = "energy_price_kwh"
 CONF_CURRENCY: Final = "currency"
+CONF_HOME_ZONE: Final = "home_zone"
 
 DEFAULT_BATTERY_CAPACITY: Final = 75.0
 DEFAULT_MIN_TRIP_DISTANCE: Final = 0.5
 DEFAULT_IDLE_TIMEOUT: Final = 2
 DEFAULT_ENERGY_PRICE: Final = 0.15
 DEFAULT_CURRENCY: Final = "EUR"
+DEFAULT_HOME_ZONE: Final = "home"
 
 EVENT_TRIP_STARTED: Final = f"{DOMAIN}_trip_started"
 EVENT_TRIP_ENDED: Final = f"{DOMAIN}_trip_ended"

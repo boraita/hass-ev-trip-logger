@@ -23,7 +23,8 @@
           "min_trip_distance_km": "Minimum trip distance (km)",
           "idle_timeout_minutes": "Idle timeout (min)",
           "energy_price_kwh": "Home charge price per kWh (default when no charge logged)",
-          "currency": "Currency"
+          "currency": "Currency",
+          "home_zone": "Home zone name (closes journeys when device tracker enters)"
         }
       },
       "reconfigure": {
@@ -44,7 +45,8 @@
           "min_trip_distance_km": "Minimum trip distance (km)",
           "idle_timeout_minutes": "Idle timeout (min)",
           "energy_price_kwh": "Home charge price per kWh (default when no charge logged)",
-          "currency": "Currency"
+          "currency": "Currency",
+          "home_zone": "Home zone name (closes journeys when device tracker enters)"
         }
       }
     }
@@ -112,7 +114,9 @@
       "avg_charge_price_30d": { "name": "Avg. charge price (30 days)" },
       "recent_trips": { "name": "Recent trips" },
       "recent_charges": { "name": "Recent charges" },
-      "charge_in_progress": { "name": "Charge in progress" }
+      "charge_in_progress": { "name": "Charge in progress" },
+      "last_journey": { "name": "Last journey" },
+      "current_journey": { "name": "Current journey" }
     }
   }
 }

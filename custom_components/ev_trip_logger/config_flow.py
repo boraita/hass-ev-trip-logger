@@ -26,6 +26,7 @@ from .const import (
     CONF_CHARGE_SENSOR,
     CONF_CURRENCY,
     CONF_ENERGY_PRICE,
+    CONF_HOME_ZONE,
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
+    DEFAULT_HOME_ZONE,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_MIN_TRIP_DISTANCE,
     DOMAIN,
@@ -130,6 +132,10 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             vol.Required(
                 CONF_CURRENCY,
                 default=defaults.get(CONF_CURRENCY, DEFAULT_CURRENCY),
+            ): TextSelector(),
+            vol.Required(
+                CONF_HOME_ZONE,
+                default=defaults.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE),
             ): TextSelector(),
         }
     )
@@ -242,6 +248,10 @@ class EvTripLoggerOptionsFlow(OptionsFlow):
                     vol.Required(
                         CONF_CURRENCY,
                         default=defaults.get(CONF_CURRENCY, DEFAULT_CURRENCY),
+                    ): TextSelector(),
+                    vol.Required(
+                        CONF_HOME_ZONE,
+                        default=defaults.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE),
                     ): TextSelector(),
                 }
             ),

@@ -34,9 +34,11 @@ CREATE TABLE IF NOT EXISTS trips (
     origin TEXT,
     destination TEXT,
     cost REAL,
-    currency TEXT
+    currency TEXT,
+    journey_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
+CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id);
 
 CREATE TABLE IF NOT EXISTS charges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,6 +79,7 @@ class TripRecord:
     destination: str | None = None
     cost: float | None = None
     currency: str | None = None
+    journey_id: int | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -165,6 +168,17 @@ class TripStorage:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self._path) as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Apply additive migrations on existing databases."""
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()}
+        if "journey_id" not in cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN journey_id INTEGER")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
+            )
 
     async def async_insert(self, record: TripRecord) -> int:
         """Persist a completed trip, return its id."""
@@ -178,8 +192,8 @@ class TripStorage:
                     started_at, ended_at, duration_min, distance_km,
                     odometer_start, odometer_end, soc_start, soc_end, soc_used_pct,
                     energy_kwh, consumption_kwh_100km, avg_speed_kmh, max_power_kw,
-                    avg_temp_c, origin, destination, cost, currency
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    avg_temp_c, origin, destination, cost, currency, journey_id
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -200,6 +214,7 @@ class TripStorage:
                     record.destination,
                     record.cost,
                     record.currency,
+                    record.journey_id,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -228,6 +243,84 @@ class TripStorage:
                 "SELECT * FROM trips ORDER BY id DESC LIMIT 1"
             ).fetchone()
         return _row_to_record(row) if row else None
+
+    async def async_next_journey_id(self) -> int:
+        return await self._hass.async_add_executor_job(self._next_journey_id)
+
+    def _next_journey_id(self) -> int:
+        with sqlite3.connect(self._path) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(journey_id), 0) + 1 FROM trips"
+            ).fetchone()
+        return int(row[0])
+
+    async def async_journey_stages(self, journey_id: int) -> list[TripRecord]:
+        return await self._hass.async_add_executor_job(self._journey_stages, journey_id)
+
+    def _journey_stages(self, journey_id: int) -> list[TripRecord]:
+        with sqlite3.connect(self._path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM trips WHERE journey_id = ? ORDER BY id",
+                (journey_id,),
+            ).fetchall()
+        return [_row_to_record(r) for r in rows]
+
+    async def async_journey_summary(self, journey_id: int) -> dict[str, Any] | None:
+        return await self._hass.async_add_executor_job(self._journey_summary, journey_id)
+
+    def _journey_summary(self, journey_id: int) -> dict[str, Any] | None:
+        with sqlite3.connect(self._path) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    MIN(started_at) AS started_at,
+                    MAX(ended_at)   AS ended_at,
+                    COALESCE(SUM(distance_km), 0) AS distance,
+                    COALESCE(SUM(energy_kwh), 0)  AS energy,
+                    COALESCE(SUM(cost), 0)        AS cost,
+                    COUNT(*) AS stages
+                FROM trips WHERE journey_id = ?
+                """,
+                (journey_id,),
+            ).fetchone()
+        if not row or row[5] == 0:
+            return None
+        started_at, ended_at, distance, energy, cost, stages = row
+        return {
+            "journey_id": journey_id,
+            "started_at": datetime.fromisoformat(started_at) if started_at else None,
+            "ended_at": datetime.fromisoformat(ended_at) if ended_at else None,
+            "distance_km": float(distance),
+            "energy_kwh": float(energy),
+            "cost": float(cost),
+            "stages": int(stages),
+        }
+
+    async def async_last_completed_journey_id(self, home_zone: str) -> int | None:
+        return await self._hass.async_add_executor_job(
+            self._last_completed_journey_id, home_zone
+        )
+
+    def _last_completed_journey_id(self, home_zone: str) -> int | None:
+        """The most recent journey whose final stage ended at `home_zone`."""
+        with sqlite3.connect(self._path) as conn:
+            row = conn.execute(
+                """
+                SELECT t.journey_id FROM trips t
+                JOIN (
+                    SELECT journey_id, MAX(id) AS max_id
+                    FROM trips
+                    WHERE journey_id IS NOT NULL
+                    GROUP BY journey_id
+                ) last_stage ON t.id = last_stage.max_id
+                WHERE t.destination = ?
+                ORDER BY t.id DESC
+                LIMIT 1
+                """,
+                (home_zone,),
+            ).fetchone()
+        return int(row[0]) if row else None
 
     async def async_recent_trips(self, limit: int = 10) -> list[TripRecord]:
         return await self._hass.async_add_executor_job(self._recent_trips, limit)
@@ -398,6 +491,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         destination=row["destination"],
         cost=row["cost"],
         currency=row["currency"],
+        journey_id=row["journey_id"] if "journey_id" in row.keys() else None,
     )
 
 

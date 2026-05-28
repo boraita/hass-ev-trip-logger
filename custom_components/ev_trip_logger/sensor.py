@@ -190,6 +190,8 @@ async def async_setup_entry(
     entities.append(RecentTripsSensor(coordinator))
     entities.append(RecentChargesSensor(coordinator))
     entities.append(ChargeInProgressSensor(coordinator))
+    entities.append(LastJourneySensor(coordinator))
+    entities.append(CurrentJourneySensor(coordinator))
 
     entities.extend(
         [
@@ -397,6 +399,7 @@ class AggregateSensor(_BaseTripSensor):
 def _trip_to_attr(trip: Any) -> dict[str, Any]:
     return {
         "id": trip.trip_id,
+        "journey_id": trip.journey_id,
         "started_at": trip.started_at.isoformat(),
         "ended_at": trip.ended_at.isoformat(),
         "distance_km": round(trip.distance_km, 1),
@@ -425,6 +428,113 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         "currency": charge.currency,
         "location": charge.location,
     }
+
+
+class LastJourneySensor(_BaseTripSensor):
+    """Summary of the most recently completed home-to-home journey.
+
+    State is the number of stages; attributes hold totals: distance, energy,
+    cost, started_at, ended_at.
+    """
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self._summary: dict[str, Any] | None = None
+        self.entity_description = SensorEntityDescription(
+            key="last_journey",
+            translation_key="last_journey",
+            icon="mdi:map-marker-path",
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_last_journey"
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self) -> None:
+        jid = self._coordinator.last_completed_journey_id
+        self._summary = (
+            await self._coordinator.storage.async_journey_summary(jid)
+            if jid is not None
+            else None
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        return self._summary["stages"] if self._summary else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if not self._summary:
+            return None
+        s = self._summary
+        return {
+            "journey_id": s["journey_id"],
+            "started_at": s["started_at"].isoformat() if s["started_at"] else None,
+            "ended_at": s["ended_at"].isoformat() if s["ended_at"] else None,
+            "distance_km": round(s["distance_km"], 1),
+            "energy_kwh": round(s["energy_kwh"], 2),
+            "cost": round(s["cost"], 2),
+        }
+
+
+class CurrentJourneySensor(_BaseTripSensor):
+    """Running journey if the car has left home and hasn't returned yet."""
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self._summary: dict[str, Any] | None = None
+        self.entity_description = SensorEntityDescription(
+            key="current_journey",
+            translation_key="current_journey",
+            icon="mdi:map-marker-distance",
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_current_journey"
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self) -> None:
+        jid = self._coordinator.current_journey_id
+        self._summary = (
+            await self._coordinator.storage.async_journey_summary(jid)
+            if jid is not None
+            else None
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return self._summary["stages"] if self._summary else 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if not self._summary:
+            return None
+        s = self._summary
+        return {
+            "journey_id": s["journey_id"],
+            "started_at": s["started_at"].isoformat() if s["started_at"] else None,
+            "distance_km": round(s["distance_km"], 1),
+            "energy_kwh": round(s["energy_kwh"], 2),
+            "cost": round(s["cost"], 2),
+        }
 
 
 class ChargeInProgressSensor(_BaseTripSensor):

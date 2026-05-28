@@ -15,6 +15,7 @@ A trip logger for any electric vehicle in Home Assistant.
 Your HA already shows odometer, battery and "vehicle on/off" from whatever integration runs your car. On their own, those numbers don't tell you anything. This integration sits on top and turns them into trip data:
 
 - **Each drive becomes a trip** — date, distance, energy used, consumption (kWh/100km), cost, score 0–10.
+- **Journeys** group consecutive trips into one "from home to home" outing — work → lunch → errands → back home is one journey, not four trips.
 - **Each charge is logged** — kWh added, what you paid, where, with auto-detection if your car exposes a "charging" sensor.
 - **Monthly totals** — kilometres, energy, money spent on charging, estimated cost of the driving.
 - **History** — the last 10 drives and charges as a list you can drop straight into a Lovelace card.
@@ -87,6 +88,7 @@ A vehicle device with around 30 sensors, grouped:
 - **Charges** — last charge (kWh, cost, €/kWh), monthly totals (kWh charged, money spent, charge count, average €/kWh).
 - **`recent_trips` / `recent_charges`** — count as state, last 10 entries as attributes for Lovelace cards.
 - **`charge_in_progress`** — `charging` / `idle` so you can see at a glance whether the integration is already tracking a session.
+- **`last_journey` / `current_journey`** — stages count as state plus distance, energy, cost as attributes. A journey opens when you leave home and closes when the device tracker re-enters the configured home zone (default `home`, renameable in setup).
 
 ## Logging a charge
 

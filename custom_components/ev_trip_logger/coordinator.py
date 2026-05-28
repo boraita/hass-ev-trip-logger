@@ -31,6 +31,7 @@ from .const import (
     CONF_CHARGE_SENSOR,
     CONF_CURRENCY,
     CONF_ENERGY_PRICE,
+    CONF_HOME_ZONE,
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
@@ -41,6 +42,7 @@ from .const import (
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
+    DEFAULT_HOME_ZONE,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_MIN_TRIP_DISTANCE,
     EVENT_CHARGE_LOGGED,
@@ -108,11 +110,14 @@ class EvTripLoggerCoordinator:
         self._idle_timeout = int(merged.get(CONF_IDLE_TIMEOUT, DEFAULT_IDLE_TIMEOUT))
         self._energy_price = float(merged.get(CONF_ENERGY_PRICE, DEFAULT_ENERGY_PRICE))
         self._currency = merged.get(CONF_CURRENCY, DEFAULT_CURRENCY)
+        self._home_zone = merged.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE)
 
         self.current: TripInProgress | None = None
         self.last_trip: TripRecord | None = None
         self.last_charge: ChargeRecord | None = None
         self.current_charge: ChargeInProgress | None = None
+        self.current_journey_id: int | None = None
+        self.last_completed_journey_id: int | None = None
 
         self._unsub_state: CALLBACK_TYPE | None = None
         self._unsub_metrics: CALLBACK_TYPE | None = None
@@ -170,6 +175,17 @@ class EvTripLoggerCoordinator:
         """Wire up state listeners and seed from existing storage."""
         self.last_trip = await self.storage.async_get_last()
         self.last_charge = await self.storage.async_get_last_charge()
+        self.last_completed_journey_id = (
+            await self.storage.async_last_completed_journey_id(self._home_zone)
+        )
+        # If the last trip belongs to an open journey (ended away from home),
+        # resume that journey id so the next stage chains onto it.
+        if (
+            self.last_trip is not None
+            and self.last_trip.journey_id is not None
+            and self.last_trip.destination != self._home_zone
+        ):
+            self.current_journey_id = self.last_trip.journey_id
 
         self._unsub_state = async_track_state_change_event(
             self.hass, [self._vehicle_on], self._async_vehicle_on_changed
@@ -451,6 +467,17 @@ class EvTripLoggerCoordinator:
             else None
         )
 
+        # Journey membership: continue current, start a new one if leaving home,
+        # or leave NULL (orphan stage outside any journey).
+        is_at_home_end = location_end == self._home_zone
+        started_from_home = active.location_start == self._home_zone
+        if self.current_journey_id is not None:
+            journey_id: int | None = self.current_journey_id
+        elif started_from_home:
+            journey_id = await self.storage.async_next_journey_id()
+        else:
+            journey_id = None
+
         record = TripRecord(
             started_at=active.started_at,
             ended_at=now,
@@ -470,10 +497,18 @@ class EvTripLoggerCoordinator:
             destination=location_end,
             cost=cost,
             currency=cost_currency if cost is not None else None,
+            journey_id=journey_id,
         )
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        # Update journey state after insert: closed by arrival home, otherwise carry on.
+        if is_at_home_end and journey_id is not None:
+            self.last_completed_journey_id = journey_id
+            self.current_journey_id = None
+        else:
+            self.current_journey_id = journey_id
 
         self.last_trip = record
         self.current = None
