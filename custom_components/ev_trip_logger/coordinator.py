@@ -256,18 +256,27 @@ class EvTripLoggerCoordinator:
 
     @callback
     def _async_vehicle_on_changed(self, event: Event[EventStateChangedData]) -> None:
-        old_state = event.data.get("old_state")
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _INVALID_STATES:
-            return
-        if old_state is None or old_state.state in _INVALID_STATES:
-            # Startup / restoration handled by _maybe_resume_trip, not here.
             return
         is_on = new_state.state == STATE_ON
         now = dt_util.now()
         if is_on:
             self._cancel_idle()
             if self.current is None:
+                # Defer opening if metrics aren't ready yet — avoids recording
+                # a bogus odometer_start. The next metric tick will not re-open
+                # automatically, so the user only loses a trip if the BYD
+                # entity reports on before its odometer/battery do, which is
+                # very brief in practice.
+                if (
+                    self._read_float(self._odometer) is None
+                    or self._read_float(self._battery) is None
+                ):
+                    _LOGGER.warning(
+                        "vehicle_on=on but odometer/battery not ready; not opening trip"
+                    )
+                    return
                 self._open_trip(now)
         elif self.current is not None:
             self._schedule_close(now)
@@ -297,12 +306,8 @@ class EvTripLoggerCoordinator:
 
     @callback
     def _async_charge_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
-        old_state = event.data.get("old_state")
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _INVALID_STATES:
-            return
-        if old_state is None or old_state.state in _INVALID_STATES:
-            # Startup / restoration: not a real off↔on transition.
             return
         is_charging = new_state.state == STATE_ON
         now = dt_util.now()
