@@ -614,7 +614,7 @@ class RecentJourneysSensor(_BaseTripSensor):
 
     async def _async_refresh(self) -> None:
         self._journeys = await self._coordinator.storage.async_recent_completed_journeys(
-            self._coordinator.home_zone, self._LIMIT
+            self._coordinator.current_journey_id, self._LIMIT
         )
         self.async_write_ha_state()
 

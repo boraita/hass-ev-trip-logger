@@ -469,6 +469,32 @@ async def test_journey_does_not_open_when_starting_outside_home(
     assert coordinator.last_trip.journey_id is None
 
 
+async def test_journey_retroactively_closes_when_next_stage_starts_at_home(
+    hass: HomeAssistant,
+) -> None:
+    """If device_tracker missed the 'home arrival', the next stage starting at
+    home should close the previous open journey."""
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(hass, **{CONF_LOCATION: LOC})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Stage 1: home → not_home (journey opens, never closes because dest != home)
+    await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="not_home")
+    jid_1 = coordinator.current_journey_id
+    assert jid_1 is not None
+    assert coordinator.last_completed_journey_id is None
+
+    # Stage 2: starts at home (car obviously came back, but GPS missed it)
+    hass.states.async_set(LOC, "home")
+    await _run_stage(hass, odo_start=1020, odo_end=1050, soc_end=60, location_end="not_home")
+
+    # journey 1 should have been retroactively closed
+    assert coordinator.last_completed_journey_id == jid_1
+    # journey 2 should be open with this stage
+    assert coordinator.current_journey_id is not None
+    assert coordinator.current_journey_id != jid_1
+
+
 async def test_journey_zone_is_configurable(hass: HomeAssistant) -> None:
     """A custom home zone name closes journeys instead of literal 'home'."""
     from custom_components.ev_trip_logger.const import CONF_HOME_ZONE

@@ -1,0 +1,173 @@
+title: EV Trip Logger
+views:
+  - title: Driving
+    path: driving
+    icon: mdi:car
+    cards:
+
+      # ===== CONTROLES DE SIMULACIÓN =====
+      - type: vertical-stack
+        cards:
+          - type: markdown
+            content: "### Simulador del coche"
+          - type: entities
+            entities:
+              - entity: input_boolean.ev_vehicle_on
+                name: Encender coche
+              - entity: input_select.ev_location
+                name: Ubicación
+              - entity: input_number.ev_odometer
+                name: Odómetro
+              - entity: input_number.ev_battery
+                name: Batería
+              - entity: input_number.ev_power
+                name: Potencia
+              - entity: input_number.ev_temp
+                name: Temperatura
+
+      # ===== EN CONDUCCIÓN =====
+      - type: vertical-stack
+        cards:
+          - type: markdown
+            content: "### Viaje en curso (live)"
+          - type: glance
+            columns: 5
+            entities:
+              - entity: sensor.sim_ev_current_trip_distance
+                name: km
+              - entity: sensor.sim_ev_current_trip_duration
+                name: min
+              - entity: sensor.sim_ev_current_trip_energy
+                name: kWh
+              - entity: sensor.sim_ev_current_trip_consumption
+                name: kWh/100
+              - entity: sensor.sim_ev_current_trip_max_power
+                name: kW pico
+          - type: gauge
+            entity: sensor.sim_ev_current_trip_battery_used
+            name: Batería gastada en este trip
+            min: 0
+            max: 100
+            severity:
+              green: 0
+              yellow: 20
+              red: 40
+
+      # ===== JOURNEY (viaje completo) =====
+      - type: vertical-stack
+        cards:
+          - type: markdown
+            content: |
+              ### Viaje en curso (journey)
+              {% set j = state_attr('sensor.sim_ev_current_journey', 'distance_km') %}
+              {% if states('sensor.sim_ev_current_journey') | int > 0 %}
+              **{{ states('sensor.sim_ev_current_journey') }} etapas** ·
+              {{ j }} km ·
+              {{ state_attr('sensor.sim_ev_current_journey', 'energy_kwh') }} kWh
+              {% if state_attr('sensor.sim_ev_current_journey', 'stage_active') %}
+              · _en marcha_
+              {% endif %}
+              {% else %}
+              _(en casa)_
+              {% endif %}
+
+      # ===== ÚLTIMO VIAJE / ÚLTIMA JOURNEY =====
+      - type: horizontal-stack
+        cards:
+          - type: vertical-stack
+            cards:
+              - type: markdown
+                content: "### Último trip"
+              - type: glance
+                columns: 3
+                entities:
+                  - entity: sensor.sim_ev_last_trip_distance
+                    name: km
+                  - entity: sensor.sim_ev_last_trip_energy
+                    name: kWh
+                  - entity: sensor.sim_ev_last_trip_consumption
+                    name: kWh/100
+                  - entity: sensor.sim_ev_last_trip_cost
+                    name: €
+                  - entity: sensor.sim_ev_last_trip_score
+                    name: score
+                  - entity: sensor.sim_ev_last_trip_duration
+                    name: min
+
+          - type: vertical-stack
+            cards:
+              - type: markdown
+                content: |
+                  ### Última journey
+                  **{{ states('sensor.sim_ev_last_journey') }} etapas**
+                  {% set d = state_attr('sensor.sim_ev_last_journey', 'distance_km') %}
+                  {% if d %}
+                  - Distancia: **{{ d }} km**
+                  - Energía: **{{ state_attr('sensor.sim_ev_last_journey', 'energy_kwh') }} kWh**
+                  - Coste: **{{ state_attr('sensor.sim_ev_last_journey', 'cost') }} €**
+                  {% endif %}
+
+      # ===== HISTORIAL: ETAPAS =====
+      - type: markdown
+        content: |
+          ### Etapas recientes ({{ states('sensor.sim_ev_recent_trips') }})
+          {%- for t in state_attr('sensor.sim_ev_recent_trips', 'trips') or [] %}
+
+          **{{ as_timestamp(t.ended_at) | timestamp_custom('%d/%m %H:%M') }}** {% if t.journey_id %}_(journey #{{ t.journey_id }})_{% endif %}
+          | {{ t.distance_km }} km | {{ t.energy_kwh or "—" }} kWh | {{ t.consumption_kwh_100km or "—" }} kWh/100 | {{ t.cost or "—" }} € | score **{{ t.score or "—" }}** |
+          {%- endfor %}
+
+      # ===== HISTORIAL: JOURNEYS COMPLETAS =====
+      - type: markdown
+        content: |
+          ### Journeys completas ({{ states('sensor.sim_ev_recent_journeys') }})
+          {%- for j in state_attr('sensor.sim_ev_recent_journeys', 'journeys') or [] %}
+
+          **{{ as_timestamp(j.ended_at) | timestamp_custom('%d/%m %H:%M') }}** — journey #{{ j.journey_id }}
+          {{ j.stages }} etapas · {{ j.distance_km }} km · {{ j.energy_kwh }} kWh · {{ j.cost }} €
+          {%- endfor %}
+
+      # ===== CARGAS =====
+      - type: vertical-stack
+        cards:
+          - type: markdown
+            content: "### Cargas"
+          - type: glance
+            columns: 3
+            entities:
+              - entity: sensor.sim_ev_last_charge_energy
+                name: kWh última
+              - entity: sensor.sim_ev_last_charge_cost
+                name: € última
+              - entity: sensor.sim_ev_last_charge_price_per_kwh
+                name: €/kWh última
+              - entity: sensor.sim_ev_charges_this_month
+                name: cargas mes
+              - entity: sensor.sim_ev_energy_charged_this_month
+                name: kWh mes
+              - entity: sensor.sim_ev_spent_on_charging_this_month
+                name: € mes
+          - entity: sensor.sim_ev_charge_in_progress
+            type: entity
+            name: ¿Hay carga activa?
+          - type: markdown
+            content: |
+              ### Cargas recientes
+              {%- for c in state_attr('sensor.sim_ev_recent_charges', 'charges') or [] %}
+
+              **{{ as_timestamp(c.ended_at) | timestamp_custom('%d/%m %H:%M') }}** — {{ c.location or "—" }}
+              {{ c.kwh }} kWh × {{ c.price_per_kwh }} €/kWh = **{{ c.total_cost }} €**
+              {%- endfor %}
+
+      # ===== AGREGADOS DEL MES =====
+      - type: entities
+        title: Este mes (driving)
+        entities:
+          - sensor.sim_ev_distance_today
+          - sensor.sim_ev_distance_this_week
+          - sensor.sim_ev_distance_this_month
+          - sensor.sim_ev_distance_this_year
+          - sensor.sim_ev_energy_this_month
+          - sensor.sim_ev_cost_this_month
+          - sensor.sim_ev_trips_this_month
+          - sensor.sim_ev_avg_consumption_30_days

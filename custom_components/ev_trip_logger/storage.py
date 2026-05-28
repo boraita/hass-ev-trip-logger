@@ -298,62 +298,65 @@ class TripStorage:
         }
 
     async def async_recent_completed_journeys(
-        self, home_zone: str, limit: int = 10
+        self, current_journey_id: int | None, limit: int = 10
     ) -> list[dict[str, Any]]:
-        """Return summaries of the last N journeys whose final stage ended at home."""
+        """Return summaries of recent journeys, excluding the in-progress one."""
         return await self._hass.async_add_executor_job(
-            self._recent_completed_journeys, home_zone, limit
+            self._recent_completed_journeys, current_journey_id, limit
         )
 
     def _recent_completed_journeys(
-        self, home_zone: str, limit: int
+        self, current_journey_id: int | None, limit: int
     ) -> list[dict[str, Any]]:
+        excl = ""
+        params: tuple = ()
+        if current_journey_id is not None:
+            excl = "AND journey_id != ?"
+            params = (current_journey_id,)
         with sqlite3.connect(self._path) as conn:
             rows = conn.execute(
-                """
-                SELECT t.journey_id FROM trips t
-                JOIN (
-                    SELECT journey_id, MAX(id) AS max_id
-                    FROM trips
-                    WHERE journey_id IS NOT NULL
-                    GROUP BY journey_id
-                ) ls ON t.id = ls.max_id
-                WHERE t.destination = ?
-                ORDER BY t.id DESC
+                f"""
+                SELECT journey_id FROM trips
+                WHERE journey_id IS NOT NULL {excl}
+                GROUP BY journey_id
+                ORDER BY MAX(id) DESC
                 LIMIT ?
                 """,
-                (home_zone, limit),
+                params + (limit,),
             ).fetchall()
-        journey_ids = [int(r[0]) for r in rows]
         out: list[dict[str, Any]] = []
-        for jid in journey_ids:
-            s = self._journey_summary(jid)
+        for r in rows:
+            s = self._journey_summary(int(r[0]))
             if s is not None:
                 out.append(s)
         return out
 
-    async def async_last_completed_journey_id(self, home_zone: str) -> int | None:
+    async def async_last_completed_journey_id(
+        self, current_journey_id: int | None
+    ) -> int | None:
         return await self._hass.async_add_executor_job(
-            self._last_completed_journey_id, home_zone
+            self._last_completed_journey_id, current_journey_id
         )
 
-    def _last_completed_journey_id(self, home_zone: str) -> int | None:
-        """The most recent journey whose final stage ended at `home_zone`."""
+    def _last_completed_journey_id(
+        self, current_journey_id: int | None
+    ) -> int | None:
+        """Most recent journey id that isn't the in-progress one."""
+        excl = ""
+        params: tuple = ()
+        if current_journey_id is not None:
+            excl = "AND journey_id != ?"
+            params = (current_journey_id,)
         with sqlite3.connect(self._path) as conn:
             row = conn.execute(
-                """
-                SELECT t.journey_id FROM trips t
-                JOIN (
-                    SELECT journey_id, MAX(id) AS max_id
-                    FROM trips
-                    WHERE journey_id IS NOT NULL
-                    GROUP BY journey_id
-                ) last_stage ON t.id = last_stage.max_id
-                WHERE t.destination = ?
-                ORDER BY t.id DESC
+                f"""
+                SELECT journey_id FROM trips
+                WHERE journey_id IS NOT NULL {excl}
+                GROUP BY journey_id
+                ORDER BY MAX(id) DESC
                 LIMIT 1
                 """,
-                (home_zone,),
+                params,
             ).fetchone()
         return int(row[0]) if row else None
 

@@ -179,17 +179,18 @@ class EvTripLoggerCoordinator:
         """Wire up state listeners and seed from existing storage."""
         self.last_trip = await self.storage.async_get_last()
         self.last_charge = await self.storage.async_get_last_charge()
-        self.last_completed_journey_id = (
-            await self.storage.async_last_completed_journey_id(self._home_zone)
-        )
-        # If the last trip belongs to an open journey (ended away from home),
-        # resume that journey id so the next stage chains onto it.
+        # Resume an open journey if the last trip didn't end at home.
+        # We test by destination because the retroactive-close happens at the
+        # next stage's _open_trip, not at the previous close.
         if (
             self.last_trip is not None
             and self.last_trip.journey_id is not None
             and self.last_trip.destination != self._home_zone
         ):
             self.current_journey_id = self.last_trip.journey_id
+        self.last_completed_journey_id = (
+            await self.storage.async_last_completed_journey_id(self.current_journey_id)
+        )
 
         self._unsub_state = async_track_state_change_event(
             self.hass, [self._vehicle_on], self._async_vehicle_on_changed
@@ -476,10 +477,22 @@ class EvTripLoggerCoordinator:
             else None
         )
 
-        # Journey membership: continue current, start a new one if leaving home,
-        # or leave NULL (orphan stage outside any journey).
+        # Journey membership.
+        # Heuristic for noisy GPS: device_tracker may say "not_home" when the
+        # car parks just outside the home zone. If this stage *starts* at home
+        # while a journey is still open (last stage ended away), the car must
+        # have come home in between — retroactively close that journey and let
+        # this stage open a fresh one.
         is_at_home_end = location_end == self._home_zone
         started_from_home = active.location_start == self._home_zone
+        if started_from_home and self.current_journey_id is not None:
+            _LOGGER.debug(
+                "Retroactively closing journey %s — stage opened from home",
+                self.current_journey_id,
+            )
+            self.last_completed_journey_id = self.current_journey_id
+            self.current_journey_id = None
+
         if self.current_journey_id is not None:
             journey_id: int | None = self.current_journey_id
         elif started_from_home:
