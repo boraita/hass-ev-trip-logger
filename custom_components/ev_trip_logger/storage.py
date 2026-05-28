@@ -297,6 +297,41 @@ class TripStorage:
             "stages": int(stages),
         }
 
+    async def async_recent_completed_journeys(
+        self, home_zone: str, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Return summaries of the last N journeys whose final stage ended at home."""
+        return await self._hass.async_add_executor_job(
+            self._recent_completed_journeys, home_zone, limit
+        )
+
+    def _recent_completed_journeys(
+        self, home_zone: str, limit: int
+    ) -> list[dict[str, Any]]:
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                """
+                SELECT t.journey_id FROM trips t
+                JOIN (
+                    SELECT journey_id, MAX(id) AS max_id
+                    FROM trips
+                    WHERE journey_id IS NOT NULL
+                    GROUP BY journey_id
+                ) ls ON t.id = ls.max_id
+                WHERE t.destination = ?
+                ORDER BY t.id DESC
+                LIMIT ?
+                """,
+                (home_zone, limit),
+            ).fetchall()
+        journey_ids = [int(r[0]) for r in rows]
+        out: list[dict[str, Any]] = []
+        for jid in journey_ids:
+            s = self._journey_summary(jid)
+            if s is not None:
+                out.append(s)
+        return out
+
     async def async_last_completed_journey_id(self, home_zone: str) -> int | None:
         return await self._hass.async_add_executor_job(
             self._last_completed_journey_id, home_zone

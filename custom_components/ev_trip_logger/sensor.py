@@ -192,6 +192,7 @@ async def async_setup_entry(
     entities.append(ChargeInProgressSensor(coordinator))
     entities.append(LastJourneySensor(coordinator))
     entities.append(CurrentJourneySensor(coordinator))
+    entities.append(RecentJourneysSensor(coordinator))
 
     entities.extend(
         [
@@ -490,11 +491,17 @@ class LastJourneySensor(_BaseTripSensor):
 
 
 class CurrentJourneySensor(_BaseTripSensor):
-    """Running journey if the car has left home and hasn't returned yet."""
+    """Running journey including the active stage's live mileage.
+
+    Closed stages come from storage (refreshed when a trip ends/deletes).
+    The active stage's running km / kWh are overlaid live whenever the
+    coordinator notifies of an odometer or battery move, so the card
+    keeps climbing during the drive instead of freezing between stops.
+    """
 
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
-        self._summary: dict[str, Any] | None = None
+        self._closed: dict[str, Any] | None = None
         self.entity_description = SensorEntityDescription(
             key="current_journey",
             translation_key="current_journey",
@@ -502,6 +509,98 @@ class CurrentJourneySensor(_BaseTripSensor):
             state_class=SensorStateClass.MEASUREMENT,
         )
         self._attr_unique_id = f"{coordinator.entry_id}_current_journey"
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh_closed()
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh_closed)
+        )
+        # Live overlay updates on every coordinator notify (odo / battery / power).
+        self.async_on_remove(
+            self._coordinator.async_add_listener(self.async_write_ha_state)
+        )
+
+    @callback
+    def _schedule_refresh_closed(self) -> None:
+        self.hass.async_create_task(self._async_refresh_closed())
+
+    async def _async_refresh_closed(self) -> None:
+        jid = self._coordinator.current_journey_id
+        self._closed = (
+            await self._coordinator.storage.async_journey_summary(jid)
+            if jid is not None
+            else None
+        )
+        self.async_write_ha_state()
+
+    def _compute(self) -> dict[str, Any] | None:
+        """Merge closed stages + active stage running data."""
+        base = self._closed
+        snap = (
+            self._coordinator.current_snapshot()
+            if self._coordinator.current is not None
+            else None
+        )
+        if base is None and snap is None:
+            return None
+
+        distance = (base["distance_km"] if base else 0.0) + (
+            snap.get("distance_km") or 0.0 if snap else 0.0
+        )
+        energy = (base["energy_kwh"] if base else 0.0) + (
+            snap.get("energy_kwh") or 0.0 if snap else 0.0
+        )
+        stages = (base["stages"] if base else 0) + (1 if snap is not None else 0)
+        started_at = (
+            base["started_at"]
+            if base
+            else (self._coordinator.current.started_at if snap else None)
+        )
+        return {
+            "journey_id": base["journey_id"] if base else None,
+            "started_at": started_at,
+            "distance_km": distance,
+            "energy_kwh": energy,
+            "cost": base["cost"] if base else 0.0,
+            "stages": stages,
+            "stage_active": snap is not None,
+        }
+
+    @property
+    def native_value(self) -> int:
+        s = self._compute()
+        return s["stages"] if s else 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        s = self._compute()
+        if not s:
+            return None
+        return {
+            "journey_id": s["journey_id"],
+            "started_at": s["started_at"].isoformat() if s["started_at"] else None,
+            "distance_km": round(s["distance_km"], 1),
+            "energy_kwh": round(s["energy_kwh"], 2),
+            "cost": round(s["cost"], 2),
+            "stage_active": s["stage_active"],
+        }
+
+
+class RecentJourneysSensor(_BaseTripSensor):
+    """List of the last N completed journeys for Lovelace cards."""
+
+    _LIMIT = 10
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self._journeys: list[dict[str, Any]] = []
+        self.entity_description = SensorEntityDescription(
+            key="recent_journeys",
+            translation_key="recent_journeys",
+            icon="mdi:map-marker-multiple",
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_recent_journeys"
 
     async def async_added_to_hass(self) -> None:
         await self._async_refresh()
@@ -514,29 +613,30 @@ class CurrentJourneySensor(_BaseTripSensor):
         self.hass.async_create_task(self._async_refresh())
 
     async def _async_refresh(self) -> None:
-        jid = self._coordinator.current_journey_id
-        self._summary = (
-            await self._coordinator.storage.async_journey_summary(jid)
-            if jid is not None
-            else None
+        self._journeys = await self._coordinator.storage.async_recent_completed_journeys(
+            self._coordinator.home_zone, self._LIMIT
         )
         self.async_write_ha_state()
 
     @property
     def native_value(self) -> int:
-        return self._summary["stages"] if self._summary else 0
+        return len(self._journeys)
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:
-        if not self._summary:
-            return None
-        s = self._summary
+    def extra_state_attributes(self) -> dict[str, Any]:
         return {
-            "journey_id": s["journey_id"],
-            "started_at": s["started_at"].isoformat() if s["started_at"] else None,
-            "distance_km": round(s["distance_km"], 1),
-            "energy_kwh": round(s["energy_kwh"], 2),
-            "cost": round(s["cost"], 2),
+            "journeys": [
+                {
+                    "journey_id": j["journey_id"],
+                    "started_at": j["started_at"].isoformat() if j["started_at"] else None,
+                    "ended_at": j["ended_at"].isoformat() if j["ended_at"] else None,
+                    "distance_km": round(j["distance_km"], 1),
+                    "energy_kwh": round(j["energy_kwh"], 2),
+                    "cost": round(j["cost"], 2),
+                    "stages": j["stages"],
+                }
+                for j in self._journeys
+            ],
         }
 
 

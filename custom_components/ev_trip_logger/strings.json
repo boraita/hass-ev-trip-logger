@@ -116,7 +116,8 @@
       "recent_charges": { "name": "Recent charges" },
       "charge_in_progress": { "name": "Charge in progress" },
       "last_journey": { "name": "Last journey" },
-      "current_journey": { "name": "Current journey" }
+      "current_journey": { "name": "Current journey" },
+      "recent_journeys": { "name": "Recent journeys" }
     }
   }
 }

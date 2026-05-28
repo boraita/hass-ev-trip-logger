@@ -116,7 +116,8 @@
       "recent_charges": { "name": "Cargas recientes" },
       "charge_in_progress": { "name": "Carga en curso" },
       "last_journey": { "name": "Último viaje (completo)" },
-      "current_journey": { "name": "Viaje en curso" }
+      "current_journey": { "name": "Viaje en curso" },
+      "recent_journeys": { "name": "Viajes recientes (completos)" }
     }
   }
 }

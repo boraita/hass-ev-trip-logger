@@ -371,6 +371,61 @@ async def _run_stage(
     await hass.async_block_till_done()
 
 
+async def test_recent_journeys_lists_only_completed(hass: HomeAssistant) -> None:
+    """recent_journeys should exclude journeys still in progress."""
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(hass, **{CONF_LOCATION: LOC})
+    registry = er.async_get(hass)
+
+    # 1 completed journey: home → work → home
+    await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="work")
+    hass.states.async_set(LOC, "work")
+    await _run_stage(hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="home")
+
+    # 1 open journey: home → work (no return)
+    hass.states.async_set(LOC, "home")
+    await _run_stage(hass, odo_start=1040, odo_end=1060, soc_end=55, location_end="work")
+
+    rj_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_recent_journeys"
+    )
+    state = hass.states.get(rj_id)
+    assert int(state.state) == 1, f"only 1 completed journey expected, got {state.state}"
+    journeys = state.attributes["journeys"]
+    assert journeys[0]["stages"] == 2
+    assert journeys[0]["distance_km"] == pytest.approx(40.0)
+
+
+async def test_current_journey_includes_active_stage_live(
+    hass: HomeAssistant,
+) -> None:
+    """While driving stage 2 of a journey, current_journey should sum stage 1 + active distance."""
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(hass, **{CONF_LOCATION: LOC})
+    registry = er.async_get(hass)
+    cj_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_current_journey"
+    )
+
+    # Stage 1: home → work (20 km closed)
+    await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="work")
+
+    # Stage 2: opens at work, currently 8 km in but not closed yet
+    hass.states.async_set(LOC, "work")
+    hass.states.async_set(ODO, "1020")
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1028")
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+
+    state = hass.states.get(cj_id)
+    assert state is not None
+    assert int(state.state) == 2  # 1 closed + 1 active stage
+    assert state.attributes["distance_km"] == pytest.approx(28.0)  # 20 + 8 live
+    assert state.attributes["stage_active"] is True
+
+
 async def test_journey_chains_stages_until_home(hass: HomeAssistant) -> None:
     """Home → work → shops → home should produce a single 3-stage journey."""
     hass.states.async_set(LOC, "home")  # starting at home

@@ -141,6 +141,10 @@ class EvTripLoggerCoordinator:
     def currency(self) -> str:
         return self._currency
 
+    @property
+    def home_zone(self) -> str:
+        return self._home_zone
+
     def async_add_listener(self, update: Callable[[], None]) -> Callable[[], None]:
         """Subscribe a sensor to coordinator updates."""
         self._listeners.append(update)
