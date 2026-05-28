@@ -228,7 +228,14 @@ class _BaseTripSensor(SensorEntity):
 
 
 class CurrentTripSensor(_BaseTripSensor):
-    """Live metric while a trip is in progress."""
+    """Live metric while a trip is in progress.
+
+    When idle (no active trip), additive metrics show 0 instead of going
+    'unavailable' — cleaner in dashboards. Ratios (avg speed, consumption,
+    avg temperature) stay None because they're undefined without data.
+    """
+
+    _RATIO_KEYS = {"avg_speed_kmh", "consumption_kwh_100km", "avg_temp_c"}
 
     def __init__(
         self, coordinator: EvTripLoggerCoordinator, meta: TripSensorMeta
@@ -246,12 +253,8 @@ class CurrentTripSensor(_BaseTripSensor):
     def native_value(self) -> float | None:
         snapshot = self._coordinator.current_snapshot()
         if snapshot is None:
-            return None
+            return None if self._meta.key in self._RATIO_KEYS else 0.0
         return snapshot.get(self._meta.key)
-
-    @property
-    def available(self) -> bool:
-        return self._coordinator.current is not None
 
 
 class LastTripSensor(_BaseTripSensor):

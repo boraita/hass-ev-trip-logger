@@ -195,6 +195,31 @@ async def test_delete_last_trip_service_removes_record(hass: HomeAssistant) -> N
     assert coordinator.last_trip is None
 
 
+async def test_current_trip_sensors_idle_show_zero_not_unavailable(
+    hass: HomeAssistant,
+) -> None:
+    """When no trip is open, current_* additive sensors show 0; ratios stay None."""
+    entry = await _setup(hass)
+    registry = er.async_get(hass)
+
+    additive_keys = ["distance_km", "duration_min", "soc_used_pct", "energy_kwh", "max_power_kw"]
+    for key in additive_keys:
+        eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_current_{key}")
+        assert eid is not None, f"missing {key}"
+        state = hass.states.get(eid)
+        assert state is not None and state.state not in ("unavailable", "unknown"), (
+            f"{eid} should be available with 0, got {state.state if state else None}"
+        )
+        assert float(state.state) == 0.0
+
+    ratio_keys = ["avg_speed_kmh", "consumption_kwh_100km", "avg_temp_c"]
+    for key in ratio_keys:
+        eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_current_{key}")
+        state = hass.states.get(eid)
+        # Available but value is None → HA renders as "unknown"
+        assert state.state == "unknown", f"{eid} expected unknown, got {state.state}"
+
+
 async def test_current_trip_distance_updates_live(hass: HomeAssistant) -> None:
     """While a trip is open, current_trip_distance reflects odometer changes immediately."""
     entry = await _setup(hass)
