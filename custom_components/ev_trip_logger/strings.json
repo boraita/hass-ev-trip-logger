@@ -121,7 +121,9 @@
       "charge_in_progress": { "name": "Charge in progress" },
       "last_journey": { "name": "Last journey" },
       "current_journey": { "name": "Current journey" },
-      "recent_journeys": { "name": "Recent journeys" }
+      "recent_journeys": { "name": "Recent journeys" },
+      "battery_energy": { "name": "Battery energy" },
+      "energy_to_full": { "name": "Energy to full charge" }
     }
   }
 }

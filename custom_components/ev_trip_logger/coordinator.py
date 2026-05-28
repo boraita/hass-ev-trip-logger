@@ -151,6 +151,11 @@ class EvTripLoggerCoordinator:
     def home_zone(self) -> str:
         return self._home_zone
 
+    @property
+    def battery_level(self) -> float | None:
+        """Current SoC % from the configured battery sensor, None if unreadable."""
+        return self._read_float(self._battery)
+
     def async_add_listener(self, update: Callable[[], None]) -> Callable[[], None]:
         """Subscribe a sensor to coordinator updates."""
         self._listeners.append(update)
@@ -295,13 +300,16 @@ class EvTripLoggerCoordinator:
 
     @callback
     def _async_metric_changed(self, event: Event[EventStateChangedData]) -> None:
-        """Re-render live sensors whenever odometer / battery move during a trip or charge."""
+        """Notify listeners on odometer / battery change, even when idle.
+
+        Idle notifications matter for battery-derived sensors
+        (current_battery_kwh, energy_to_full) which need to update whenever
+        the source battery sensor moves, not just during trips/charges.
+        """
         if self.current_charge is not None:
             soc = self._read_float(self._battery)
             if soc is not None:
                 self.current_charge.last_seen_soc = soc
-        if self.current is None and self.current_charge is None:
-            return
         self._notify_listeners()
 
     @callback

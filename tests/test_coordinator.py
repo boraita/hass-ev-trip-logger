@@ -195,6 +195,27 @@ async def test_delete_last_trip_service_removes_record(hass: HomeAssistant) -> N
     assert coordinator.last_trip is None
 
 
+async def test_battery_energy_and_to_full_sensors(hass: HomeAssistant) -> None:
+    """Battery-derived sensors track the source SoC live, even when idle."""
+    entry = await _setup(hass)
+    registry = er.async_get(hass)
+    be_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_battery_energy"
+    )
+    ef_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_energy_to_full"
+    )
+    # Setup leaves BAT=80 and capacity=75 (CONF_BATTERY_CAPACITY default in _setup)
+    assert float(hass.states.get(be_id).state) == pytest.approx(0.80 * 75)   # 60.0
+    assert float(hass.states.get(ef_id).state) == pytest.approx(0.20 * 75)   # 15.0
+
+    # Move battery and confirm the sensors track without any trip/charge open
+    hass.states.async_set(BAT, "55")
+    await hass.async_block_till_done()
+    assert float(hass.states.get(be_id).state) == pytest.approx(0.55 * 75)   # 41.25
+    assert float(hass.states.get(ef_id).state) == pytest.approx(0.45 * 75)   # 33.75
+
+
 async def test_current_trip_sensors_idle_show_zero_not_unavailable(
     hass: HomeAssistant,
 ) -> None:

@@ -193,6 +193,8 @@ async def async_setup_entry(
     entities.append(LastJourneySensor(coordinator))
     entities.append(CurrentJourneySensor(coordinator))
     entities.append(RecentJourneysSensor(coordinator))
+    entities.append(BatteryEnergySensor(coordinator))
+    entities.append(EnergyToFullSensor(coordinator))
 
     entities.extend(
         [
@@ -755,6 +757,54 @@ class RecentChargesSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"charges": [_charge_to_attr(c) for c in self._charges]}
+
+
+class BatteryEnergySensor(_BaseTripSensor):
+    """kWh currently in the battery: SoC% × battery_capacity / 100."""
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="battery_energy",
+            translation_key="battery_energy",
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:battery-charging",
+            suggested_display_precision=1,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_battery_energy"
+
+    @property
+    def native_value(self) -> float | None:
+        soc = self._coordinator.battery_level
+        if soc is None:
+            return None
+        return round(soc / 100.0 * self._coordinator.battery_capacity, 2)
+
+
+class EnergyToFullSensor(_BaseTripSensor):
+    """kWh needed to reach 100% from current battery level."""
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="energy_to_full",
+            translation_key="energy_to_full",
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:battery-plus",
+            suggested_display_precision=1,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_energy_to_full"
+
+    @property
+    def native_value(self) -> float | None:
+        soc = self._coordinator.battery_level
+        if soc is None:
+            return None
+        return round(max(0.0, (100.0 - soc) / 100.0 * self._coordinator.battery_capacity), 2)
 
 
 class LastChargeSensor(_BaseTripSensor):
