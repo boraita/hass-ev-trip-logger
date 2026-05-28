@@ -75,6 +75,10 @@
     "delete_last_charge": {
       "name": "Delete last charge",
       "description": "Remove the most recently logged charge."
+    },
+    "set_last_charge_price": {
+      "name": "Set last charge price",
+      "description": "Override price / location of the last logged charge (without changing kWh or timestamp)."
     }
   },
   "entity": {

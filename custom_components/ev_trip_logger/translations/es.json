@@ -75,6 +75,10 @@
     "delete_last_charge": {
       "name": "Eliminar última carga",
       "description": "Borra la última carga registrada."
+    },
+    "set_last_charge_price": {
+      "name": "Cambiar precio de la última carga",
+      "description": "Sobrescribe precio / ubicación de la última carga sin tocar kWh ni timestamp."
     }
   },
   "entity": {

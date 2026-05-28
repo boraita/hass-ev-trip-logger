@@ -514,6 +514,54 @@ async def test_journey_zone_is_configurable(hass: HomeAssistant) -> None:
     assert coordinator.current_journey_id is None
 
 
+async def test_set_last_charge_price_updates_in_place(hass: HomeAssistant) -> None:
+    """The new service overrides price + location without losing kwh / timestamp."""
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Auto-style: log at home price
+    await hass.services.async_call(
+        DOMAIN, SERVICE_LOG_CHARGE,
+        {"kwh": 30.0, "location": "auto"},
+        blocking=True,
+    )
+    original = coordinator.last_charge
+    assert original.price_per_kwh == pytest.approx(0.15)  # home default
+
+    # Override: pretend the user actually paid 0.45 €/kWh at a public charger
+    await hass.services.async_call(
+        DOMAIN, "set_last_charge_price",
+        {"price_per_kwh": 0.45, "location": "Iberdrola Móstoles"},
+        blocking=True,
+    )
+    updated = coordinator.last_charge
+    assert updated.charge_id == original.charge_id  # same row
+    assert updated.kwh == pytest.approx(original.kwh)  # unchanged
+    assert updated.price_per_kwh == pytest.approx(0.45)
+    assert updated.total_cost == pytest.approx(30.0 * 0.45)
+    assert updated.location == "Iberdrola Móstoles"
+
+
+async def test_set_last_charge_price_with_total_cost(hass: HomeAssistant) -> None:
+    """Override via total_cost recomputes price_per_kwh from kwh."""
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    await hass.services.async_call(
+        DOMAIN, SERVICE_LOG_CHARGE,
+        {"kwh": 20.0, "price_per_kwh": 0.20},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "set_last_charge_price",
+        {"total_cost": 11.20},
+        blocking=True,
+    )
+    updated = coordinator.last_charge
+    assert updated.total_cost == pytest.approx(11.20)
+    assert updated.price_per_kwh == pytest.approx(11.20 / 20.0)
+
+
 async def test_auto_detect_charge_uses_device_tracker_location(
     hass: HomeAssistant,
 ) -> None:

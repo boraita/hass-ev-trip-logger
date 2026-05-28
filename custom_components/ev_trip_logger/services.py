@@ -16,6 +16,7 @@ from .const import (
     SERVICE_EXPORT_CSV,
     SERVICE_LOG_CHARGE,
     SERVICE_LOG_MANUAL_TRIP,
+    SERVICE_SET_LAST_CHARGE_PRICE,
     SERVICE_START_TRIP,
 )
 from .coordinator import EvTripLoggerCoordinator
@@ -49,6 +50,19 @@ _SCHEMA_LOG_CHARGE = vol.All(
         }
     ),
     _has_price_or_total,
+)
+
+
+_SCHEMA_SET_LAST_CHARGE_PRICE = vol.All(
+    _SCHEMA_ENTRY.extend(
+        {
+            vol.Optional("price_per_kwh"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            vol.Optional("total_cost"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            vol.Optional("location"): cv.string,
+            vol.Optional("notes"): cv.string,
+        }
+    ),
+    cv.has_at_least_one_key("price_per_kwh", "total_cost", "location", "notes"),
 )
 
 
@@ -117,6 +131,15 @@ def async_register_services(hass: HomeAssistant) -> None:
         for c in _resolve_coordinators(hass, call):
             await c.async_delete_last_charge_service()
 
+    async def _set_last_charge_price(call: ServiceCall) -> None:
+        for c in _resolve_coordinators(hass, call):
+            await c.async_set_last_charge_price_service(
+                price_per_kwh=call.data.get("price_per_kwh"),
+                total_cost=call.data.get("total_cost"),
+                location=call.data.get("location"),
+                notes=call.data.get("notes"),
+            )
+
     async def _log_manual_trip(call: ServiceCall) -> None:
         for c in _resolve_coordinators(hass, call):
             await c.async_log_manual_trip_service(
@@ -148,6 +171,10 @@ def async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_DELETE_LAST_CHARGE, _delete_last_charge, schema=_SCHEMA_ENTRY
     )
     hass.services.async_register(
+        DOMAIN, SERVICE_SET_LAST_CHARGE_PRICE, _set_last_charge_price,
+        schema=_SCHEMA_SET_LAST_CHARGE_PRICE,
+    )
+    hass.services.async_register(
         DOMAIN, SERVICE_LOG_MANUAL_TRIP, _log_manual_trip, schema=_SCHEMA_LOG_MANUAL_TRIP
     )
 
@@ -162,6 +189,7 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_EXPORT_CSV,
         SERVICE_LOG_CHARGE,
         SERVICE_DELETE_LAST_CHARGE,
+        SERVICE_SET_LAST_CHARGE_PRICE,
         SERVICE_LOG_MANUAL_TRIP,
     ):
         if hass.services.has_service(DOMAIN, name):

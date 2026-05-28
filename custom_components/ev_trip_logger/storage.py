@@ -447,6 +447,55 @@ class TripStorage:
             ).fetchone()
         return _row_to_charge(row) if row else None
 
+    async def async_update_last_charge(
+        self,
+        *,
+        price_per_kwh: float | None = None,
+        total_cost: float | None = None,
+        location: str | None = None,
+        notes: str | None = None,
+    ) -> ChargeRecord | None:
+        return await self._hass.async_add_executor_job(
+            self._update_last_charge, price_per_kwh, total_cost, location, notes
+        )
+
+    def _update_last_charge(
+        self,
+        price_per_kwh: float | None,
+        total_cost: float | None,
+        location: str | None,
+        notes: str | None,
+    ) -> ChargeRecord | None:
+        with sqlite3.connect(self._path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM charges ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            kwh = row["kwh"]
+            if total_cost is not None:
+                new_total = float(total_cost)
+                new_price = new_total / kwh if kwh else 0.0
+            elif price_per_kwh is not None:
+                new_price = float(price_per_kwh)
+                new_total = kwh * new_price
+            else:
+                # Nothing to update on pricing — keep current values.
+                new_price = row["price_per_kwh"]
+                new_total = row["total_cost"]
+            new_location = location if location is not None else row["location"]
+            new_notes = notes if notes is not None else row["notes"]
+            conn.execute(
+                "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
+                "location = ?, notes = ? WHERE id = ?",
+                (new_price, new_total, new_location, new_notes, row["id"]),
+            )
+            updated = conn.execute(
+                "SELECT * FROM charges WHERE id = ?", (row["id"],)
+            ).fetchone()
+        return _row_to_charge(updated)
+
     async def async_delete_last_charge(self) -> bool:
         return await self._hass.async_add_executor_job(self._delete_last_charge)
 

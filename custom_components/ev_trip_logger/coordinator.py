@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from homeassistant.config_entries import ConfigEntry
@@ -22,7 +22,11 @@ from homeassistant.core import (
     HomeAssistant,
     callback,
 )
-from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -54,6 +58,7 @@ from .storage import ChargeRecord, TripRecord, TripStorage
 _LOGGER = logging.getLogger(__name__)
 
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""}
+_LIVE_TICK = timedelta(seconds=30)
 
 
 @dataclass
@@ -125,6 +130,7 @@ class EvTripLoggerCoordinator:
         self._unsub_temp: CALLBACK_TYPE | None = None
         self._unsub_charge: CALLBACK_TYPE | None = None
         self._unsub_idle: CALLBACK_TYPE | None = None
+        self._unsub_live_tick: CALLBACK_TYPE | None = None
 
         self._listeners: list[Callable[[], None]] = []
         self._trip_log_listeners: list[Callable[[], None]] = []
@@ -252,12 +258,13 @@ class EvTripLoggerCoordinator:
             self._unsub_temp,
             self._unsub_charge,
             self._unsub_idle,
+            self._unsub_live_tick,
         ):
             if unsub:
                 unsub()
         self._unsub_state = self._unsub_metrics = None
         self._unsub_power = self._unsub_temp = self._unsub_idle = None
-        self._unsub_charge = None
+        self._unsub_charge = self._unsub_live_tick = None
 
     @callback
     def _async_vehicle_on_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -385,6 +392,12 @@ class EvTripLoggerCoordinator:
             last_seen_soc=soc,
         )
         _LOGGER.debug("Trip opened at %s odo=%s soc=%s", now, odometer, soc)
+        # Heartbeat so duration / avg_speed tick forward even when no sensor
+        # is changing (e.g. car stopped at a light).
+        if self._unsub_live_tick is None:
+            self._unsub_live_tick = async_track_time_interval(
+                self.hass, self._async_live_tick, _LIVE_TICK
+            )
         self.hass.bus.async_fire(
             EVENT_TRIP_STARTED,
             {
@@ -414,10 +427,21 @@ class EvTripLoggerCoordinator:
             self._unsub_idle()
             self._unsub_idle = None
 
+    @callback
+    def _async_live_tick(self, _now: datetime) -> None:
+        if self.current is not None:
+            self._notify_listeners()
+
+    def _cancel_live_tick(self) -> None:
+        if self._unsub_live_tick is not None:
+            self._unsub_live_tick()
+            self._unsub_live_tick = None
+
     async def _async_close_trip(self, now: datetime) -> None:
         active = self.current
         if active is None:
             return
+        self._cancel_live_tick()
 
         odometer_end = self._read_float(self._odometer) or active.last_seen_odometer
         soc_end = self._read_float(self._battery) or active.last_seen_soc
@@ -455,7 +479,15 @@ class EvTripLoggerCoordinator:
             if energy is not None and distance > 0
             else None
         )
-        avg_speed = (distance / (duration_min / 60.0)) if duration_min > 0 else None
+        avg_speed = (
+            (distance / (duration_min / 60.0))
+            if duration_min > 0 and distance > 0
+            else None
+        )
+        if avg_speed is not None and avg_speed > 300:
+            # Sub-second time deltas produce nonsense (e.g. 40 000 km/h when
+            # you bump the odometer slider just after turning on). Cap it.
+            avg_speed = None
         avg_temp = (
             sum(active.temp_samples) / len(active.temp_samples)
             if active.temp_samples
@@ -608,6 +640,44 @@ class EvTripLoggerCoordinator:
         self._notify_trip_log_listeners()
         return record
 
+    async def async_set_last_charge_price_service(
+        self,
+        *,
+        price_per_kwh: float | None = None,
+        total_cost: float | None = None,
+        location: str | None = None,
+        notes: str | None = None,
+    ) -> ChargeRecord | None:
+        """Override price / location of the last charge already in storage.
+
+        Use case: auto-detect logged a charge with the home default price, but
+        you actually paid a public-charger rate. Pass price_per_kwh or
+        total_cost (one of them) and the kWh + timestamp stay; price + cost
+        are recomputed.
+        """
+        updated = await self.storage.async_update_last_charge(
+            price_per_kwh=price_per_kwh,
+            total_cost=total_cost,
+            location=location,
+            notes=notes,
+        )
+        if updated is None:
+            _LOGGER.warning("set_last_charge_price: no charge in storage to update")
+            return None
+        self.last_charge = updated
+        self.hass.bus.async_fire(
+            EVENT_CHARGE_LOGGED,
+            {"entry_id": self.entry_id, **updated.to_dict()},
+        )
+        _LOGGER.debug(
+            "Updated charge #%s: price=%.4f, total=%.2f, location=%s",
+            updated.charge_id, updated.price_per_kwh, updated.total_cost,
+            updated.location,
+        )
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
+        return updated
+
     async def async_delete_last_charge_service(self) -> bool:
         deleted = await self.storage.async_delete_last_charge()
         if deleted:
@@ -672,7 +742,15 @@ class EvTripLoggerCoordinator:
             if energy is not None and distance > 0
             else None
         )
-        avg_speed = (distance / (duration_min / 60.0)) if duration_min > 0 else None
+        avg_speed = (
+            (distance / (duration_min / 60.0))
+            if duration_min > 0 and distance > 0
+            else None
+        )
+        if avg_speed is not None and avg_speed > 300:
+            # Sub-second time deltas produce nonsense (e.g. 40 000 km/h when
+            # you bump the odometer slider just after turning on). Cap it.
+            avg_speed = None
         price_per_kwh = (
             self.last_charge.price_per_kwh
             if self.last_charge is not None
@@ -783,9 +861,17 @@ class EvTripLoggerCoordinator:
             if energy is not None and distance > 0
             else None
         )
+        # Need at least ~1 minute of trip before avg_speed is meaningful;
+        # otherwise tiny time deltas produce 40 000 km/h-level nonsense.
         avg_speed = (
-            (distance / (duration_min / 60.0)) if duration_min > 0 else None
+            (distance / (duration_min / 60.0))
+            if duration_min > 0 and distance > 0
+            else None
         )
+        if avg_speed is not None and avg_speed > 300:
+            # Sub-second time deltas produce nonsense (e.g. 40 000 km/h when
+            # you bump the odometer slider just after turning on). Cap it.
+            avg_speed = None
         avg_temp = (
             sum(active.temp_samples) / len(active.temp_samples)
             if active.temp_samples
