@@ -346,11 +346,13 @@ class AggregateSensor(_BaseTripSensor):
         "avg_consumption_kwh_100km": "avg_consumption",
     }
 
-    # HA rejects state_class=measurement for device_class=monetary, so cost stays None.
+    # monetary device_class accepts `total` (with optional last_reset). Using
+    # total_increasing on monetary is rejected by HA, but plain `total` works
+    # and lets statistics-graph plot monthly bars over time.
     _STATE_CLASS_BY_KEY: dict[str, SensorStateClass | None] = {
         "distance_km": SensorStateClass.TOTAL_INCREASING,
         "energy_kwh": SensorStateClass.TOTAL_INCREASING,
-        "cost": None,
+        "cost": SensorStateClass.TOTAL,
         "count": SensorStateClass.MEASUREMENT,
         "avg_consumption_kwh_100km": SensorStateClass.MEASUREMENT,
     }
@@ -886,7 +888,7 @@ class ChargesAggregateSensor(_BaseTripSensor):
         },
         "total_cost": {
             "device_class": SensorDeviceClass.MONETARY,
-            "state_class": None,
+            "state_class": SensorStateClass.TOTAL,
             "precision": 2,
             "slug": "spent_charging",
         },
