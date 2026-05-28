@@ -87,8 +87,16 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
             _optional(
                 CONF_LOCATION,
-                EntitySelector(EntitySelectorConfig(domain="device_tracker")),
-            ): EntitySelector(EntitySelectorConfig(domain="device_tracker")),
+                EntitySelector(
+                    EntitySelectorConfig(
+                        domain=["device_tracker", "person", "input_select", "sensor"]
+                    )
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(
+                    domain=["device_tracker", "person", "input_select", "sensor"]
+                )
+            ),
             _optional(
                 CONF_TEMP,
                 EntitySelector(

@@ -17,7 +17,7 @@
         "data": {
           "power_sensor": "Power sensor (kW)",
           "charge_sensor": "Charging binary sensor (for auto-detect)",
-          "location_tracker": "Location tracker",
+          "location_tracker": "Location entity (device_tracker, person, input_select…)",
           "exterior_temp_sensor": "Exterior temperature sensor",
           "battery_capacity_kwh": "Battery capacity (kWh)",
           "min_trip_distance_km": "Minimum trip distance (km)",

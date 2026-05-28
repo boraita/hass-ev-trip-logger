@@ -47,6 +47,17 @@ input_boolean:
   ev_vehicle_on:
     name: Sim Vehicle On
 
+input_select:
+  ev_location:
+    name: Sim Car Location
+    options:
+      - home
+      - work
+      - shops
+      - gym
+      - not_home
+    initial: home
+
 # Template wrappers expose the right device_class so the config flow
 # entity-selectors actually list them.
 template:
