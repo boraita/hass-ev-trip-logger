@@ -15,6 +15,7 @@ from .const import (
     SERVICE_END_TRIP,
     SERVICE_EXPORT_CSV,
     SERVICE_LOG_CHARGE,
+    SERVICE_LOG_MANUAL_TRIP,
     SERVICE_START_TRIP,
 )
 from .coordinator import EvTripLoggerCoordinator
@@ -48,6 +49,23 @@ _SCHEMA_LOG_CHARGE = vol.All(
         }
     ),
     _has_price_or_total,
+)
+
+
+_SCHEMA_LOG_MANUAL_TRIP = _SCHEMA_ENTRY.extend(
+    {
+        vol.Required("started_at"): cv.datetime,
+        vol.Required("ended_at"): cv.datetime,
+        vol.Optional("distance_km"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+        vol.Optional("odometer_start"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+        vol.Optional("odometer_end"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+        vol.Optional("soc_start"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("soc_end"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("max_power_kw"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+        vol.Optional("avg_temp_c"): vol.Coerce(float),
+        vol.Optional("origin"): cv.string,
+        vol.Optional("destination"): cv.string,
+    }
 )
 
 
@@ -99,6 +117,22 @@ def async_register_services(hass: HomeAssistant) -> None:
         for c in _resolve_coordinators(hass, call):
             await c.async_delete_last_charge_service()
 
+    async def _log_manual_trip(call: ServiceCall) -> None:
+        for c in _resolve_coordinators(hass, call):
+            await c.async_log_manual_trip_service(
+                started_at=call.data["started_at"],
+                ended_at=call.data["ended_at"],
+                distance_km=call.data.get("distance_km"),
+                odometer_start=call.data.get("odometer_start"),
+                odometer_end=call.data.get("odometer_end"),
+                soc_start=call.data.get("soc_start"),
+                soc_end=call.data.get("soc_end"),
+                max_power_kw=call.data.get("max_power_kw"),
+                avg_temp_c=call.data.get("avg_temp_c"),
+                origin=call.data.get("origin"),
+                destination=call.data.get("destination"),
+            )
+
     hass.services.async_register(DOMAIN, SERVICE_START_TRIP, _start, schema=_SCHEMA_ENTRY)
     hass.services.async_register(DOMAIN, SERVICE_END_TRIP, _end, schema=_SCHEMA_ENTRY)
     hass.services.async_register(
@@ -113,6 +147,9 @@ def async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, SERVICE_DELETE_LAST_CHARGE, _delete_last_charge, schema=_SCHEMA_ENTRY
     )
+    hass.services.async_register(
+        DOMAIN, SERVICE_LOG_MANUAL_TRIP, _log_manual_trip, schema=_SCHEMA_LOG_MANUAL_TRIP
+    )
 
 
 @callback
@@ -125,6 +162,7 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_EXPORT_CSV,
         SERVICE_LOG_CHARGE,
         SERVICE_DELETE_LAST_CHARGE,
+        SERVICE_LOG_MANUAL_TRIP,
     ):
         if hass.services.has_service(DOMAIN, name):
             hass.services.async_remove(DOMAIN, name)

@@ -111,3 +111,104 @@ delete_last_charge:
       description: Restrict the action to a specific config entry.
       selector:
         text:
+
+log_manual_trip:
+  name: Log manual trip
+  description: >-
+    Backfill a trip that the live detector missed. Required: started_at,
+    ended_at and either distance_km or both odometer bounds. Everything else
+    is derived using the same formulas as a normal trip close.
+  fields:
+    started_at:
+      name: Started at
+      description: Local datetime when the trip started.
+      required: true
+      selector:
+        datetime:
+    ended_at:
+      name: Ended at
+      description: Local datetime when the trip ended.
+      required: true
+      selector:
+        datetime:
+    distance_km:
+      name: Distance (km)
+      description: Trip distance. Either this or odometer bounds are required.
+      selector:
+        number:
+          min: 0
+          max: 5000
+          step: 0.1
+          mode: box
+          unit_of_measurement: km
+    odometer_start:
+      name: Odometer at start (km)
+      description: Use this when you know both odometer readings; distance is derived.
+      selector:
+        number:
+          min: 0
+          max: 1000000
+          step: 0.1
+          mode: box
+          unit_of_measurement: km
+    odometer_end:
+      name: Odometer at end (km)
+      description: Pair with odometer_start; distance = end − start.
+      selector:
+        number:
+          min: 0
+          max: 1000000
+          step: 0.1
+          mode: box
+          unit_of_measurement: km
+    soc_start:
+      name: Battery at start (%)
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          mode: box
+          unit_of_measurement: "%"
+    soc_end:
+      name: Battery at end (%)
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          mode: box
+          unit_of_measurement: "%"
+    max_power_kw:
+      name: Max power (kW)
+      selector:
+        number:
+          min: 0
+          max: 1000
+          step: 0.1
+          mode: box
+          unit_of_measurement: kW
+    avg_temp_c:
+      name: Avg. exterior temperature (°C)
+      selector:
+        number:
+          min: -40
+          max: 60
+          step: 0.1
+          mode: box
+          unit_of_measurement: "°C"
+    origin:
+      name: Origin
+      description: Free-text location label (e.g. home, work).
+      selector:
+        text:
+    destination:
+      name: Destination
+      description: Free-text location label.
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Restrict the action to a specific config entry.
+      selector:
+        text:

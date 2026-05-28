@@ -607,6 +607,103 @@ class EvTripLoggerCoordinator:
             self._notify_trip_log_listeners()
         return deleted
 
+    async def async_log_manual_trip_service(
+        self,
+        *,
+        started_at: datetime,
+        ended_at: datetime,
+        distance_km: float | None = None,
+        odometer_start: float | None = None,
+        odometer_end: float | None = None,
+        soc_start: float | None = None,
+        soc_end: float | None = None,
+        max_power_kw: float | None = None,
+        avg_temp_c: float | None = None,
+        origin: str | None = None,
+        destination: str | None = None,
+    ) -> TripRecord:
+        """Backfill a trip that the live detector missed.
+
+        Required: started_at, ended_at, and one of distance_km / odometer
+        bounds. Everything else is derived when possible (soc_used → energy →
+        cost → consumption, duration → avg_speed) using the same formulas as
+        the live close path.
+        """
+        if distance_km is None:
+            if odometer_start is None or odometer_end is None:
+                raise ValueError(
+                    "Provide either distance_km or both odometer_start and odometer_end"
+                )
+            distance_km = float(odometer_end) - float(odometer_start)
+        distance = float(distance_km)
+        if distance < 0:
+            raise ValueError("distance must be non-negative")
+
+        duration_min = max(0.0, (ended_at - started_at).total_seconds() / 60.0)
+        soc_used = (
+            float(soc_start) - float(soc_end)
+            if soc_start is not None and soc_end is not None
+            else None
+        )
+        energy = (
+            (soc_used / 100.0) * self._battery_capacity
+            if soc_used is not None and soc_used > 0
+            else None
+        )
+        consumption = (
+            (energy / distance * 100.0)
+            if energy is not None and distance > 0
+            else None
+        )
+        avg_speed = (distance / (duration_min / 60.0)) if duration_min > 0 else None
+        price_per_kwh = (
+            self.last_charge.price_per_kwh
+            if self.last_charge is not None
+            else self._energy_price
+        )
+        cost_currency = (
+            self.last_charge.currency
+            if self.last_charge is not None and self.last_charge.currency
+            else self._currency
+        )
+        cost = energy * price_per_kwh if energy is not None and energy > 0 else None
+
+        record = TripRecord(
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_min=duration_min,
+            distance_km=distance,
+            odometer_start=float(odometer_start) if odometer_start is not None else None,
+            odometer_end=float(odometer_end) if odometer_end is not None else None,
+            soc_start=float(soc_start) if soc_start is not None else None,
+            soc_end=float(soc_end) if soc_end is not None else None,
+            soc_used_pct=soc_used,
+            energy_kwh=energy,
+            consumption_kwh_100km=consumption,
+            avg_speed_kmh=avg_speed,
+            max_power_kw=float(max_power_kw) if max_power_kw is not None else None,
+            avg_temp_c=float(avg_temp_c) if avg_temp_c is not None else None,
+            origin=origin,
+            destination=destination,
+            cost=cost,
+            currency=cost_currency if cost is not None else None,
+        )
+
+        trip_id = await self.storage.async_insert(record)
+        record.trip_id = trip_id
+
+        self.last_trip = record
+        self.hass.bus.async_fire(
+            EVENT_TRIP_ENDED,
+            {"entry_id": self.entry_id, **record.to_dict()},
+        )
+        _LOGGER.info(
+            "Manual trip #%s logged: %.2f km / %.1f min", trip_id, distance, duration_min
+        )
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
+        return record
+
     def _read_state(self, entity_id: str | None) -> str | None:
         if not entity_id:
             return None
