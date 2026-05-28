@@ -1,0 +1,78 @@
+# Minimal HA config for developing ev_trip_logger.
+# The custom component is mounted from ../custom_components/ev_trip_logger via docker-compose.
+default_config:
+
+# Dev only: don't ban the browser after a few wrong-password tries.
+http:
+  ip_ban_enabled: false
+  login_attempts_threshold: -1
+
+logger:
+  default: info
+  logs:
+    custom_components.ev_trip_logger: debug
+
+# Knobs you can twist from the UI to drive the integration.
+input_number:
+  ev_odometer:
+    name: Sim Odometer
+    min: 0
+    max: 999999
+    step: 0.1
+    unit_of_measurement: km
+    initial: 10000.0
+  ev_battery:
+    name: Sim Battery
+    min: 0
+    max: 100
+    step: 0.1
+    unit_of_measurement: "%"
+    initial: 80
+  ev_power:
+    name: Sim Power
+    min: -100
+    max: 200
+    step: 0.1
+    unit_of_measurement: kW
+    initial: 0
+  ev_temp:
+    name: Sim Exterior Temperature
+    min: -30
+    max: 50
+    step: 0.1
+    unit_of_measurement: "°C"
+    initial: 18
+
+input_boolean:
+  ev_vehicle_on:
+    name: Sim Vehicle On
+
+# Template wrappers expose the right device_class so the config flow
+# entity-selectors actually list them.
+template:
+  - sensor:
+      - name: "Sim EV Odometer"
+        unique_id: sim_ev_odometer
+        unit_of_measurement: km
+        device_class: distance
+        state_class: total_increasing
+        state: "{{ states('input_number.ev_odometer') }}"
+      - name: "Sim EV Battery"
+        unique_id: sim_ev_battery
+        unit_of_measurement: "%"
+        device_class: battery
+        state: "{{ states('input_number.ev_battery') }}"
+      - name: "Sim EV Power"
+        unique_id: sim_ev_power
+        unit_of_measurement: kW
+        device_class: power
+        state: "{{ states('input_number.ev_power') }}"
+      - name: "Sim EV Temperature"
+        unique_id: sim_ev_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: "{{ states('input_number.ev_temp') }}"
+    binary_sensor:
+      - name: "Sim EV Vehicle On"
+        unique_id: sim_ev_vehicle_on
+        state: "{{ is_state('input_boolean.ev_vehicle_on', 'on') }}"

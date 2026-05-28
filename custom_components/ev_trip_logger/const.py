@@ -12,7 +12,7 @@ CONF_ODOMETER: Final = "odometer_sensor"
 CONF_BATTERY: Final = "battery_sensor"
 CONF_VEHICLE_ON: Final = "vehicle_on_sensor"
 CONF_POWER: Final = "power_sensor"
-CONF_RANGE: Final = "range_sensor"
+CONF_CHARGE_SENSOR: Final = "charge_sensor"
 CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
 
@@ -30,10 +30,13 @@ DEFAULT_CURRENCY: Final = "EUR"
 
 EVENT_TRIP_STARTED: Final = f"{DOMAIN}_trip_started"
 EVENT_TRIP_ENDED: Final = f"{DOMAIN}_trip_ended"
+EVENT_CHARGE_LOGGED: Final = f"{DOMAIN}_charge_logged"
 
 SERVICE_START_TRIP: Final = "start_trip"
 SERVICE_END_TRIP: Final = "end_trip"
 SERVICE_DELETE_LAST_TRIP: Final = "delete_last_trip"
 SERVICE_EXPORT_CSV: Final = "export_csv"
+SERVICE_LOG_CHARGE: Final = "log_charge"
+SERVICE_DELETE_LAST_CHARGE: Final = "delete_last_charge"
 
 STORAGE_FILENAME_TEMPLATE: Final = "ev_trip_logger.{entry_id}.db"

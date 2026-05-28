@@ -23,6 +23,7 @@ from homeassistant.helpers.selector import (
 from .const import (
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
+    CONF_CHARGE_SENSOR,
     CONF_CURRENCY,
     CONF_ENERGY_PRICE,
     CONF_IDLE_TIMEOUT,
@@ -31,7 +32,6 @@ from .const import (
     CONF_NAME,
     CONF_ODOMETER,
     CONF_POWER,
-    CONF_RANGE,
     CONF_TEMP,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
@@ -80,11 +80,9 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 EntitySelector(EntitySelectorConfig(domain="sensor", device_class="power")),
             ): EntitySelector(EntitySelectorConfig(domain="sensor", device_class="power")),
             _optional(
-                CONF_RANGE,
-                EntitySelector(EntitySelectorConfig(domain="sensor", device_class="distance")),
-            ): EntitySelector(
-                EntitySelectorConfig(domain="sensor", device_class="distance")
-            ),
+                CONF_CHARGE_SENSOR,
+                EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
+            ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
             _optional(
                 CONF_LOCATION,
                 EntitySelector(EntitySelectorConfig(domain="device_tracker")),

@@ -3,7 +3,6 @@
   "name": "EV Trip Logger",
   "codeowners": ["@boraita"],
   "config_flow": true,
-  "dependencies": ["recorder"],
   "documentation": "https://github.com/boraita/hass-ev-trip-logger",
   "integration_type": "service",
   "iot_class": "calculated",

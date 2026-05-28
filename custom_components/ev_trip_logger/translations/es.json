@@ -16,13 +16,13 @@
         "description": "Elige los sensores opcionales y configura los parámetros del vehículo.",
         "data": {
           "power_sensor": "Sensor de potencia (kW)",
-          "range_sensor": "Sensor de autonomía",
+          "charge_sensor": "Binary sensor de carga (para auto-detección)",
           "location_tracker": "Tracker de ubicación",
           "exterior_temp_sensor": "Sensor de temperatura exterior",
           "battery_capacity_kwh": "Capacidad de batería (kWh)",
           "min_trip_distance_km": "Distancia mínima por viaje (km)",
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
-          "energy_price_kwh": "Precio de energía por kWh",
+          "energy_price_kwh": "Precio en casa por kWh (default cuando no hay carga registrada)",
           "currency": "Moneda"
         }
       },
@@ -43,7 +43,7 @@
           "battery_capacity_kwh": "Capacidad de batería (kWh)",
           "min_trip_distance_km": "Distancia mínima por viaje (km)",
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
-          "energy_price_kwh": "Precio de energía por kWh",
+          "energy_price_kwh": "Precio en casa por kWh (default cuando no hay carga registrada)",
           "currency": "Moneda"
         }
       }
@@ -65,6 +65,14 @@
     "export_csv": {
       "name": "Exportar CSV",
       "description": "Vuelca el historial completo de viajes a un fichero CSV."
+    },
+    "log_charge": {
+      "name": "Registrar carga",
+      "description": "Registra una sesión de carga: kWh + precio €/kWh o coste total."
+    },
+    "delete_last_charge": {
+      "name": "Eliminar última carga",
+      "description": "Borra la última carga registrada."
     }
   },
   "entity": {
@@ -85,6 +93,8 @@
       "last_consumption": { "name": "Consumo del último viaje" },
       "last_avg_temperature": { "name": "Temperatura media del último viaje" },
       "last_max_power": { "name": "Potencia máxima del último viaje" },
+      "last_trip_cost": { "name": "Coste del último viaje" },
+      "last_trip_score": { "name": "Score del último viaje" },
       "total_today_distance": { "name": "Distancia hoy" },
       "total_week_distance": { "name": "Distancia esta semana" },
       "total_month_distance": { "name": "Distancia este mes" },
@@ -92,7 +102,17 @@
       "total_month_energy": { "name": "Energía este mes" },
       "total_month_cost": { "name": "Coste este mes" },
       "total_month_count": { "name": "Viajes este mes" },
-      "total_30d_avg_consumption": { "name": "Consumo medio (30 días)" }
+      "total_30d_avg_consumption": { "name": "Consumo medio (30 días)" },
+      "last_charge_kwh": { "name": "Energía de la última carga" },
+      "last_charge_cost": { "name": "Coste de la última carga" },
+      "last_charge_price": { "name": "Precio por kWh de la última carga" },
+      "charged_energy_this_month": { "name": "Energía cargada este mes" },
+      "spent_charging_this_month": { "name": "Gastado en cargar este mes" },
+      "charges_this_month": { "name": "Cargas este mes" },
+      "avg_charge_price_30d": { "name": "Precio medio de carga (30 días)" },
+      "recent_trips": { "name": "Viajes recientes" },
+      "recent_charges": { "name": "Cargas recientes" },
+      "charge_in_progress": { "name": "Carga en curso" }
     }
   }
 }

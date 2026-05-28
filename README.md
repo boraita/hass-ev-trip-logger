@@ -8,132 +8,132 @@
 [![GitHub Release](https://img.shields.io/github/v/release/boraita/hass-ev-trip-logger?include_prereleases)](https://github.com/boraita/hass-ev-trip-logger/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Vehicle-agnostic trip logger for electric vehicles in Home Assistant.
+A trip logger for any electric vehicle in Home Assistant.
 
-Plug in **any** odometer / battery / vehicle-on sensors you already have (BYD, Tesla, Kia, Hyundai, MG, Volvo, BMW, custom ESPHome — it doesn't matter), and the integration takes care of detecting trips, computing live and historical statistics, and storing the full session log.
+## What it does
 
-## Why
+Your HA already shows odometer, battery and "vehicle on/off" from whatever integration runs your car. On their own, those numbers don't tell you anything. This integration sits on top and turns them into trip data:
 
-The HA ecosystem has plenty of vehicle integrations, but trip logging is fragmented:
+- **Each drive becomes a trip** — date, distance, energy used, consumption (kWh/100km), cost, score 0–10.
+- **Each charge is logged** — kWh added, what you paid, where, with auto-detection if your car exposes a "charging" sensor.
+- **Monthly totals** — kilometres, energy, money spent on charging, estimated cost of the driving.
+- **History** — the last 10 drives and charges as a list you can drop straight into a Lovelace card.
 
-- GPS-only loggers (Movement, blueprints) don't know about battery / energy.
-- EV trip *planners* plan future trips but don't log past ones.
-- Vehicle-specific integrations (Tesla, BMW, Kia, etc.) lock you in.
+It is **vehicle-agnostic**: BYD, Tesla, Kia, Hyundai, MG, ESPHome — anything that exposes the right sensors in HA.
 
-This integration sits **above** any of those: it consumes the entities they expose and gives you a proper trip log — independent of the vehicle.
+## Try it locally before installing
 
-## Features
+The repo ships with a one-command dev environment: a Docker Home Assistant with fake EV sensors you can poke from the dashboard.
 
-- **Live trip sensors** while driving — distance, duration, avg speed, battery used, energy consumed (kWh), kWh/100km, avg temperature.
-- **Last completed trip** — same metrics, frozen at trip end.
-- **Aggregations** — today / week / month / year totals (distance, energy, cost, count).
-- **Persistent history** — SQLite-backed trip log, queryable, exportable to CSV.
-- **Events** — `ev_trip_logger_trip_started` / `ev_trip_logger_trip_ended` for your own automations.
-- **Reconfigurable** — swap a sensor without losing history.
-- **Multi-vehicle** — one entry per car.
+```bash
+git clone https://github.com/boraita/hass-ev-trip-logger
+cd hass-ev-trip-logger
+docker compose up -d
+```
 
-## Installation
+Then open **http://localhost:8124**, create a throwaway admin user, and:
 
-### HACS (custom repository)
+1. Settings → Devices → **Add Integration** → search **EV Trip Logger**.
+2. Pick the simulated sensors that come with the dev container:
+   - Odometer: `sensor.sim_ev_odometer`
+   - Battery: `sensor.sim_ev_battery`
+   - Vehicle on: `binary_sensor.sim_ev_vehicle_on`
+3. Drop the idle timeout to **1 minute** so trips close fast while testing.
 
-1. Open HACS in Home Assistant.
-2. Menu (⋮) → **Custom repositories**.
-3. Add `https://github.com/boraita/hass-ev-trip-logger` with category **Integration**.
-4. Install **EV Trip Logger**, restart HA.
-5. Settings → Devices & Services → **Add Integration** → search **EV Trip Logger**.
+Now simulate a drive from Developer Tools (or any dashboard with sliders):
+
+- Toggle `input_boolean.ev_vehicle_on` to **on**.
+- Move `input_number.ev_odometer` from `10000` to `10015` (+15 km).
+- Move `input_number.ev_battery` from `80` to `70` (-10%).
+- Toggle vehicle on **off** — after ~1 minute the trip closes and `sensor.<your_device>_last_trip_distance`, `_energy`, `_cost`, `_score`… all show real numbers.
+
+To wipe the dev HA and start over: `docker compose down && rm -rf .dev/config/.storage && docker compose up -d`.
+
+## Install in your real HA
+
+### HACS (recommended)
+
+1. HACS → ⋮ → **Custom repositories** → add `https://github.com/boraita/hass-ev-trip-logger` as **Integration**.
+2. Search and install **EV Trip Logger**, restart HA.
+3. Settings → Devices → **Add Integration** → search "EV Trip Logger".
 
 ### Manual
 
-Copy `custom_components/ev_trip_logger/` into your HA `config/custom_components/` directory and restart.
+Copy `custom_components/ev_trip_logger/` into your HA `config/custom_components/` and restart.
 
-## Configuration
+## What it asks during setup
 
-Configured entirely via the UI. You'll be asked for:
+Three required sensors:
 
-**Required sensors:**
+- An **odometer** sensor (km or mi).
+- A **battery level** sensor (%).
+- A **vehicle-on** binary sensor (anything that goes `on` when the car is in use).
 
-| Field | What to pick |
-|---|---|
-| Odometer sensor | A `sensor` with `device_class: distance` and unit km/mi |
-| Battery level sensor | A `sensor` with `device_class: battery` (%) |
-| Vehicle-on binary sensor | A `binary_sensor` that goes `on` when the car is in use |
+Plus a handful of optional ones that unlock more metrics:
 
-**Optional sensors** (each one unlocks more metrics):
+- **Power** sensor — for max power per trip.
+- **Charging** binary sensor — enables automatic charge logging.
+- **Device tracker** — fills in trip origin/destination and tags charges with the zone (home, work, etc.).
+- **Exterior temperature** — for consumption correlation.
+- Battery capacity (kWh), minimum trip distance, idle timeout, **home charge price** (€/kWh), and currency.
 
-- Power sensor (kW) — instantaneous power
-- Range sensor (km/mi) — remaining range
-- Location tracker (`device_tracker`) — origin/destination
-- Exterior temperature sensor — for consumption correlation
+## What you get
 
-**Vehicle parameters:**
+A vehicle device with around 30 sensors, grouped:
 
-- Battery capacity (kWh) — default 75
-- Minimum trip distance (km) — trips shorter than this are discarded; default 0.5
-- Idle timeout (minutes) — wait this long before closing a trip after vehicle-off; default 2
-- Energy price (€/kWh or your currency) — for cost estimation
+- **Current trip** — live while driving (distance, battery used, energy, kWh/100km, average speed, max power, average temperature).
+- **Last trip** — same metrics frozen at trip end, plus **cost** and a **score 0–10** matched to BYD's app curve.
+- **Monthly aggregates** — distance (today/week/month/year), energy, estimated cost, trip count, average consumption (30 days).
+- **Charges** — last charge (kWh, cost, €/kWh), monthly totals (kWh charged, money spent, charge count, average €/kWh).
+- **`recent_trips` / `recent_charges`** — count as state, last 10 entries as attributes for Lovelace cards.
+- **`charge_in_progress`** — `charging` / `idle` so you can see at a glance whether the integration is already tracking a session.
 
-## Provided entities
+## Logging a charge
 
-Once configured, the integration exposes the following sensors. Entity IDs are prefixed with the device name you chose in the config flow — examples below assume a device called **"My EV"** (`sensor.my_ev_*`).
+If you set a **charging binary sensor** in the config, every charge is detected automatically while the car is plugged in. The default price comes from your config; the location comes from the device tracker.
 
-### Live (during a trip)
-
-- `sensor.my_ev_current_trip_distance`
-- `sensor.my_ev_current_trip_duration`
-- `sensor.my_ev_current_trip_average_speed`
-- `sensor.my_ev_current_trip_battery_used`
-- `sensor.my_ev_current_trip_energy`
-- `sensor.my_ev_current_trip_consumption`
-- `sensor.my_ev_current_trip_avg_temperature`
-- `sensor.my_ev_current_trip_max_power` *(only if you configured a power sensor)*
-
-### Last completed trip
-
-Same set, with `current` replaced by `last` (e.g. `sensor.my_ev_last_trip_distance`).
-
-### Aggregations
-
-- `sensor.my_ev_distance_today` / `_this_week` / `_this_month` / `_this_year`
-- `sensor.my_ev_energy_this_month`
-- `sensor.my_ev_cost_this_month`
-- `sensor.my_ev_trips_this_month`
-- `sensor.my_ev_avg_consumption_30_days`
-
-## Events
+For chargers with a different price (public, work, friends'…), log them manually:
 
 ```yaml
-# Triggered when vehicle_on goes from off → on (after debounce)
-ev_trip_logger_trip_started:
-  entry_id: <config_entry_id>
-  started_at: 2026-05-28T08:21:34+02:00
-  odometer_start: 12345.6
-  soc_start: 78
-  location_start: home
-
-# Triggered when vehicle_on goes from on → off (after idle_timeout)
-ev_trip_logger_trip_ended:
-  entry_id: <config_entry_id>
-  trip_id: 42
-  started_at: ...
-  ended_at: ...
-  distance_km: 23.4
-  duration_min: 31
-  avg_speed_kmh: 45.3
-  soc_used_pct: 12
-  energy_kwh: 9.6
-  consumption_kwh_100km: 41.0
-  avg_temp_c: 18.5
-  origin: home
-  destination: work
-  cost: 1.25
+service: ev_trip_logger.log_charge
+data:
+  kwh: 35.4
+  total_cost: 12.40            # or: price_per_kwh: 0.45
+  location: Iberdrola Móstoles  # optional — defaults to device tracker zone
 ```
+
+You can also pass only `kwh`; the integration uses the home price you configured.
+
+## Lovelace example
+
+Markdown card (no HACS needed) that renders a trip list similar to the BYD app:
+
+```yaml
+type: markdown
+content: |
+  ## Last trips ({{ states('sensor.my_ev_recent_trips') }})
+  {%- for t in state_attr('sensor.my_ev_recent_trips', 'trips') or [] %}
+
+  **{{ as_timestamp(t.ended_at) | timestamp_custom('%d/%m/%Y · %H:%M') }}**
+  | Distancia | Consumo | Eficiencia | Coste | Score |
+  |---:|---:|---:|---:|---:|
+  | {{ t.distance_km }} km | {{ t.energy_kwh }} kWh | {{ t.consumption_kwh_100km }} kWh/100km | {{ t.cost }} {{ t.currency }} | **{{ t.score }}** |
+  {%- endfor %}
+```
+
+Replace `sensor.my_ev_*` with whatever you named your device.
 
 ## Services
 
-- `ev_trip_logger.start_trip` — manually open a trip
-- `ev_trip_logger.end_trip` — manually close a trip
-- `ev_trip_logger.delete_last_trip` — recover from an accidental detection
-- `ev_trip_logger.export_csv` — dump full history to a path
+- `ev_trip_logger.start_trip` / `end_trip` — manual control.
+- `ev_trip_logger.log_charge` / `delete_last_charge`.
+- `ev_trip_logger.delete_last_trip`.
+- `ev_trip_logger.export_csv` — dump all trips to a CSV path.
+
+## Events for automations
+
+- `ev_trip_logger_trip_started` / `ev_trip_logger_trip_ended` — fires with full trip data.
+- `ev_trip_logger_charge_logged` — fires when a charge is recorded (manual or auto).
 
 ## License
 

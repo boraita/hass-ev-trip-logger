@@ -16,13 +16,13 @@
         "description": "Pick any optional sensors and set your vehicle parameters.",
         "data": {
           "power_sensor": "Power sensor (kW)",
-          "range_sensor": "Range sensor",
+          "charge_sensor": "Charging binary sensor (for auto-detect)",
           "location_tracker": "Location tracker",
           "exterior_temp_sensor": "Exterior temperature sensor",
           "battery_capacity_kwh": "Battery capacity (kWh)",
           "min_trip_distance_km": "Minimum trip distance (km)",
           "idle_timeout_minutes": "Idle timeout (min)",
-          "energy_price_kwh": "Energy price per kWh",
+          "energy_price_kwh": "Home charge price per kWh (default when no charge logged)",
           "currency": "Currency"
         }
       },
@@ -43,7 +43,7 @@
           "battery_capacity_kwh": "Battery capacity (kWh)",
           "min_trip_distance_km": "Minimum trip distance (km)",
           "idle_timeout_minutes": "Idle timeout (min)",
-          "energy_price_kwh": "Energy price per kWh",
+          "energy_price_kwh": "Home charge price per kWh (default when no charge logged)",
           "currency": "Currency"
         }
       }
@@ -65,6 +65,14 @@
     "export_csv": {
       "name": "Export CSV",
       "description": "Dump the full trip history to a CSV file."
+    },
+    "log_charge": {
+      "name": "Log charge",
+      "description": "Record a charging session by kWh + price or total cost."
+    },
+    "delete_last_charge": {
+      "name": "Delete last charge",
+      "description": "Remove the most recently logged charge."
     }
   },
   "entity": {
@@ -85,6 +93,8 @@
       "last_consumption": { "name": "Last trip consumption" },
       "last_avg_temperature": { "name": "Last trip avg. temperature" },
       "last_max_power": { "name": "Last trip max power" },
+      "last_trip_cost": { "name": "Last trip cost" },
+      "last_trip_score": { "name": "Last trip score" },
       "total_today_distance": { "name": "Distance today" },
       "total_week_distance": { "name": "Distance this week" },
       "total_month_distance": { "name": "Distance this month" },
@@ -92,7 +102,17 @@
       "total_month_energy": { "name": "Energy this month" },
       "total_month_cost": { "name": "Cost this month" },
       "total_month_count": { "name": "Trips this month" },
-      "total_30d_avg_consumption": { "name": "Avg. consumption (30 days)" }
+      "total_30d_avg_consumption": { "name": "Avg. consumption (30 days)" },
+      "last_charge_kwh": { "name": "Last charge energy" },
+      "last_charge_cost": { "name": "Last charge cost" },
+      "last_charge_price": { "name": "Last charge price per kWh" },
+      "charged_energy_this_month": { "name": "Energy charged this month" },
+      "spent_charging_this_month": { "name": "Spent on charging this month" },
+      "charges_this_month": { "name": "Charges this month" },
+      "avg_charge_price_30d": { "name": "Avg. charge price (30 days)" },
+      "recent_trips": { "name": "Recent trips" },
+      "recent_charges": { "name": "Recent charges" },
+      "charge_in_progress": { "name": "Charge in progress" }
     }
   }
 }

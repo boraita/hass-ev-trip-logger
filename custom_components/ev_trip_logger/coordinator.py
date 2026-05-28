@@ -7,14 +7,28 @@ from datetime import datetime
 from typing import Any, Callable
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant, callback
+from homeassistant.const import (
+    EVENT_HOMEASSISTANT_STARTED,
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    CoreState,
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    callback,
+)
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
+    CONF_CHARGE_SENSOR,
     CONF_CURRENCY,
     CONF_ENERGY_PRICE,
     CONF_IDLE_TIMEOUT,
@@ -22,7 +36,6 @@ from .const import (
     CONF_MIN_TRIP_DISTANCE,
     CONF_ODOMETER,
     CONF_POWER,
-    CONF_RANGE,
     CONF_TEMP,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
@@ -30,10 +43,11 @@ from .const import (
     DEFAULT_ENERGY_PRICE,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_MIN_TRIP_DISTANCE,
+    EVENT_CHARGE_LOGGED,
     EVENT_TRIP_ENDED,
     EVENT_TRIP_STARTED,
 )
-from .storage import TripRecord, TripStorage
+from .storage import ChargeRecord, TripRecord, TripStorage
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,6 +65,15 @@ class TripInProgress:
     temp_samples: list[float] = field(default_factory=list)
     max_power: float = 0.0
     last_seen_odometer: float | None = None
+    last_seen_soc: float | None = None
+
+
+@dataclass
+class ChargeInProgress:
+    """In-memory accumulator for an active (auto-detected) charging session."""
+
+    started_at: datetime
+    soc_start: float | None
     last_seen_soc: float | None = None
 
 
@@ -72,7 +95,7 @@ class EvTripLoggerCoordinator:
         self._battery = merged[CONF_BATTERY]
         self._vehicle_on = merged[CONF_VEHICLE_ON]
         self._power = merged.get(CONF_POWER)
-        self._range = merged.get(CONF_RANGE)
+        self._charge_sensor = merged.get(CONF_CHARGE_SENSOR)
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
 
@@ -88,13 +111,18 @@ class EvTripLoggerCoordinator:
 
         self.current: TripInProgress | None = None
         self.last_trip: TripRecord | None = None
+        self.last_charge: ChargeRecord | None = None
+        self.current_charge: ChargeInProgress | None = None
 
         self._unsub_state: CALLBACK_TYPE | None = None
+        self._unsub_metrics: CALLBACK_TYPE | None = None
         self._unsub_power: CALLBACK_TYPE | None = None
         self._unsub_temp: CALLBACK_TYPE | None = None
+        self._unsub_charge: CALLBACK_TYPE | None = None
         self._unsub_idle: CALLBACK_TYPE | None = None
 
         self._listeners: list[Callable[[], None]] = []
+        self._trip_log_listeners: list[Callable[[], None]] = []
 
     @property
     def entry_id(self) -> str:
@@ -122,12 +150,32 @@ class EvTripLoggerCoordinator:
         for listener in list(self._listeners):
             listener()
 
+    def async_add_trip_log_listener(
+        self, update: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Subscribe to changes in the persisted trip log (close / delete)."""
+        self._trip_log_listeners.append(update)
+
+        def _remove() -> None:
+            self._trip_log_listeners.remove(update)
+
+        return _remove
+
+    @callback
+    def _notify_trip_log_listeners(self) -> None:
+        for listener in list(self._trip_log_listeners):
+            listener()
+
     async def async_start(self) -> None:
         """Wire up state listeners and seed from existing storage."""
         self.last_trip = await self.storage.async_get_last()
+        self.last_charge = await self.storage.async_get_last_charge()
 
         self._unsub_state = async_track_state_change_event(
             self.hass, [self._vehicle_on], self._async_vehicle_on_changed
+        )
+        self._unsub_metrics = async_track_state_change_event(
+            self.hass, [self._odometer, self._battery], self._async_metric_changed
         )
         if self._power:
             self._unsub_power = async_track_state_change_event(
@@ -137,20 +185,67 @@ class EvTripLoggerCoordinator:
             self._unsub_temp = async_track_state_change_event(
                 self.hass, [self._temp], self._async_temp_changed
             )
+        if self._charge_sensor:
+            self._unsub_charge = async_track_state_change_event(
+                self.hass, [self._charge_sensor], self._async_charge_sensor_changed
+            )
 
-        if self._read_bool(self._vehicle_on) is True:
-            self._open_trip(dt_util.now())
+        if self.hass.state == CoreState.running:
+            self._maybe_resume_trip()
+        else:
+            self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED, self._async_on_ha_started
+            )
+
+    @callback
+    def _async_on_ha_started(self, _event: Event) -> None:
+        self._maybe_resume_trip()
+
+    def _maybe_resume_trip(self) -> None:
+        """Open a trip at startup only when vehicle_on=on AND odo/soc are readable.
+
+        Why: at startup, sensors restored from history may still report unknown
+        before the integration loads. Opening a trip then would record a wrong
+        odometer_start. We skip and rely on the next vehicle_on transition.
+        """
+        if self.current is not None:
+            return
+        if self._read_bool(self._vehicle_on) is not True:
+            return
+        if (
+            self._read_float(self._odometer) is None
+            or self._read_float(self._battery) is None
+        ):
+            _LOGGER.warning(
+                "Vehicle is on at startup but odometer/battery are not ready; "
+                "skipping auto-open to avoid recording a bogus trip"
+            )
+            return
+        self._open_trip(dt_util.now())
 
     async def async_stop(self) -> None:
-        for unsub in (self._unsub_state, self._unsub_power, self._unsub_temp, self._unsub_idle):
+        for unsub in (
+            self._unsub_state,
+            self._unsub_metrics,
+            self._unsub_power,
+            self._unsub_temp,
+            self._unsub_charge,
+            self._unsub_idle,
+        ):
             if unsub:
                 unsub()
-        self._unsub_state = self._unsub_power = self._unsub_temp = self._unsub_idle = None
+        self._unsub_state = self._unsub_metrics = None
+        self._unsub_power = self._unsub_temp = self._unsub_idle = None
+        self._unsub_charge = None
 
     @callback
     def _async_vehicle_on_changed(self, event: Event[EventStateChangedData]) -> None:
+        old_state = event.data.get("old_state")
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _INVALID_STATES:
+            return
+        if old_state is None or old_state.state in _INVALID_STATES:
+            # Startup / restoration handled by _maybe_resume_trip, not here.
             return
         is_on = new_state.state == STATE_ON
         now = dt_util.now()
@@ -162,6 +257,17 @@ class EvTripLoggerCoordinator:
             self._schedule_close(now)
 
     @callback
+    def _async_metric_changed(self, event: Event[EventStateChangedData]) -> None:
+        """Re-render live sensors whenever odometer / battery move during a trip or charge."""
+        if self.current_charge is not None:
+            soc = self._read_float(self._battery)
+            if soc is not None:
+                self.current_charge.last_seen_soc = soc
+        if self.current is None and self.current_charge is None:
+            return
+        self._notify_listeners()
+
+    @callback
     def _async_power_changed(self, event: Event[EventStateChangedData]) -> None:
         if self.current is None:
             return
@@ -170,6 +276,62 @@ class EvTripLoggerCoordinator:
             return
         self.current.max_power = max(self.current.max_power, abs(value))
         self._notify_listeners()
+
+    _AUTO_CHARGE_DEDUP_WINDOW_S = 300  # 5 min — skip auto if a manual charge just logged
+
+    @callback
+    def _async_charge_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state in _INVALID_STATES:
+            return
+        if old_state is None or old_state.state in _INVALID_STATES:
+            # Startup / restoration: not a real off↔on transition.
+            return
+        is_charging = new_state.state == STATE_ON
+        now = dt_util.now()
+        if is_charging:
+            if self.current_charge is not None:
+                return
+            soc = self._read_float(self._battery)
+            self.current_charge = ChargeInProgress(
+                started_at=now, soc_start=soc, last_seen_soc=soc
+            )
+            _LOGGER.debug("Charge session opened at %s, soc=%s", now, soc)
+            self._notify_listeners()
+        elif self.current_charge is not None:
+            self.hass.async_create_task(self._async_close_auto_charge(now))
+
+    async def _async_close_auto_charge(self, now: datetime) -> None:
+        active = self.current_charge
+        if active is None:
+            return
+        self.current_charge = None
+        soc_end = self._read_float(self._battery) or active.last_seen_soc
+        if active.soc_start is None or soc_end is None or soc_end <= active.soc_start:
+            _LOGGER.debug("Discarding auto-charge: SoC delta not positive")
+            self._notify_listeners()
+            return
+
+        if self.last_charge is not None:
+            elapsed = (now - self.last_charge.ended_at).total_seconds()
+            if elapsed < self._AUTO_CHARGE_DEDUP_WINDOW_S:
+                _LOGGER.debug(
+                    "Skipping auto-charge: a charge was logged %.0fs ago (likely manual)",
+                    elapsed,
+                )
+                self._notify_listeners()
+                return
+
+        kwh = (soc_end - active.soc_start) / 100.0 * self._battery_capacity
+        # Location comes from the configured device_tracker (e.g. zone "home"); falls
+        # back to "auto" so we can still tell auto-detected charges apart in the log.
+        location = self._read_str(self._location) if self._location else None
+        await self.async_log_charge_service(
+            kwh=kwh,
+            location=location or "auto",
+            notes=f"auto-detected from {self._charge_sensor}",
+        )
 
     @callback
     def _async_temp_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -273,8 +435,18 @@ class EvTripLoggerCoordinator:
             if active.temp_samples
             else None
         )
+        price_per_kwh = (
+            self.last_charge.price_per_kwh
+            if self.last_charge is not None
+            else self._energy_price
+        )
+        cost_currency = (
+            self.last_charge.currency
+            if self.last_charge is not None and self.last_charge.currency
+            else self._currency
+        )
         cost = (
-            energy * self._energy_price
+            energy * price_per_kwh
             if energy is not None and energy > 0
             else None
         )
@@ -297,7 +469,7 @@ class EvTripLoggerCoordinator:
             origin=active.location_start,
             destination=location_end,
             cost=cost,
-            currency=self._currency if cost is not None else None,
+            currency=cost_currency if cost is not None else None,
         )
 
         trip_id = await self.storage.async_insert(record)
@@ -312,6 +484,7 @@ class EvTripLoggerCoordinator:
         )
         _LOGGER.debug("Trip #%s closed: %.2f km / %.1f min", trip_id, distance, duration_min)
         self._notify_listeners()
+        self._notify_trip_log_listeners()
 
     async def async_start_trip_service(self) -> None:
         if self.current is None:
@@ -322,11 +495,76 @@ class EvTripLoggerCoordinator:
         if self.current is not None:
             await self._async_close_trip(dt_util.now())
 
+    async def async_log_charge_service(
+        self,
+        *,
+        kwh: float,
+        price_per_kwh: float | None = None,
+        total_cost: float | None = None,
+        currency: str | None = None,
+        location: str | None = None,
+        notes: str | None = None,
+    ) -> ChargeRecord:
+        """Persist a charge session.
+
+        Provide one of: total_cost, price_per_kwh. If neither, falls back to
+        the configured home price. The missing one is derived from kwh.
+        Location defaults to the configured device_tracker's state.
+        """
+        now = dt_util.now()
+        kwh = float(kwh)
+        if total_cost is not None:
+            total_cost = float(total_cost)
+            price_per_kwh = total_cost / kwh if kwh else 0.0
+        else:
+            if price_per_kwh is None:
+                price_per_kwh = self._energy_price
+            price_per_kwh = float(price_per_kwh)
+            total_cost = kwh * price_per_kwh
+
+        if location is None and self._location:
+            location = self._read_str(self._location)
+
+        record = ChargeRecord(
+            ended_at=now,
+            kwh=kwh,
+            price_per_kwh=price_per_kwh,
+            total_cost=total_cost,
+            currency=currency or self._currency,
+            soc_end=self._read_float(self._battery),
+            location=location,
+            notes=notes,
+        )
+        charge_id = await self.storage.async_insert_charge(record)
+        record.charge_id = charge_id
+        self.last_charge = record
+
+        self.hass.bus.async_fire(
+            EVENT_CHARGE_LOGGED,
+            {"entry_id": self.entry_id, **record.to_dict()},
+        )
+        _LOGGER.debug(
+            "Charge #%s logged: %.2f kWh @ %.4f = %.2f",
+            charge_id, record.kwh, record.price_per_kwh, record.total_cost,
+        )
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
+        return record
+
+    async def async_delete_last_charge_service(self) -> bool:
+        deleted = await self.storage.async_delete_last_charge()
+        if deleted:
+            self.last_charge = await self.storage.async_get_last_charge()
+            self._notify_listeners()
+            self._notify_trip_log_listeners()
+        return deleted
+
     async def async_delete_last_trip_service(self) -> bool:
         deleted = await self.storage.async_delete_last()
         if deleted:
             self.last_trip = await self.storage.async_get_last()
             self._notify_listeners()
+            self._notify_trip_log_listeners()
         return deleted
 
     def _read_state(self, entity_id: str | None) -> str | None:

@@ -37,6 +37,21 @@ CREATE TABLE IF NOT EXISTS trips (
     currency TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
+
+CREATE TABLE IF NOT EXISTS charges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT,
+    ended_at TEXT NOT NULL,
+    kwh REAL NOT NULL,
+    price_per_kwh REAL NOT NULL,
+    total_cost REAL NOT NULL,
+    currency TEXT,
+    soc_start REAL,
+    soc_end REAL,
+    location TEXT,
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_charges_ended_at ON charges(ended_at);
 """
 
 
@@ -64,6 +79,18 @@ class TripRecord:
     currency: str | None = None
     trip_id: int | None = field(default=None, compare=False)
 
+    @property
+    def score(self) -> float | None:
+        """Efficiency rating 0–10 derived from kWh/100km.
+
+        Matches the BYD app curve: 14.5 kWh/100km ≈ 10, slope 0.6 per excess kWh.
+        Returns None when we don't have a consumption figure.
+        """
+        e = self.consumption_kwh_100km
+        if e is None or e <= 0:
+            return None
+        return max(0.0, min(10.0, 10.0 - max(0.0, e - 14.5) * 0.6))
+
     def to_dict(self) -> dict[str, Any]:
         """Serialise for events / export."""
         return {
@@ -86,6 +113,38 @@ class TripRecord:
             "destination": self.destination,
             "cost": self.cost,
             "currency": self.currency,
+        }
+
+
+@dataclass(slots=True)
+class ChargeRecord:
+    """A charging session."""
+
+    ended_at: datetime
+    kwh: float
+    price_per_kwh: float
+    total_cost: float
+    started_at: datetime | None = None
+    currency: str | None = None
+    soc_start: float | None = None
+    soc_end: float | None = None
+    location: str | None = None
+    notes: str | None = None
+    charge_id: int | None = field(default=None, compare=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "charge_id": self.charge_id,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "ended_at": self.ended_at.isoformat(),
+            "kwh": self.kwh,
+            "price_per_kwh": self.price_per_kwh,
+            "total_cost": self.total_cost,
+            "currency": self.currency,
+            "soc_start": self.soc_start,
+            "soc_end": self.soc_end,
+            "location": self.location,
+            "notes": self.notes,
         }
 
 
@@ -170,6 +229,28 @@ class TripStorage:
             ).fetchone()
         return _row_to_record(row) if row else None
 
+    async def async_recent_trips(self, limit: int = 10) -> list[TripRecord]:
+        return await self._hass.async_add_executor_job(self._recent_trips, limit)
+
+    def _recent_trips(self, limit: int) -> list[TripRecord]:
+        with sqlite3.connect(self._path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM trips ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [_row_to_record(r) for r in rows]
+
+    async def async_recent_charges(self, limit: int = 10) -> list[ChargeRecord]:
+        return await self._hass.async_add_executor_job(self._recent_charges, limit)
+
+    def _recent_charges(self, limit: int) -> list[ChargeRecord]:
+        with sqlite3.connect(self._path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM charges ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [_row_to_charge(r) for r in rows]
+
     async def async_aggregates_since(self, since: datetime) -> dict[str, float | int]:
         """Aggregate distance / energy / cost / count from `since`."""
         return await self._hass.async_add_executor_job(self._aggregates_since, since)
@@ -195,6 +276,84 @@ class TripStorage:
             "cost": float(cost),
             "count": int(count),
             "avg_consumption_kwh_100km": float(avg_consumption),
+        }
+
+    async def async_insert_charge(self, record: ChargeRecord) -> int:
+        return await self._hass.async_add_executor_job(self._insert_charge, record)
+
+    def _insert_charge(self, record: ChargeRecord) -> int:
+        with sqlite3.connect(self._path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO charges (
+                    started_at, ended_at, kwh, price_per_kwh, total_cost,
+                    currency, soc_start, soc_end, location, notes
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    record.started_at.isoformat() if record.started_at else None,
+                    record.ended_at.isoformat(),
+                    record.kwh,
+                    record.price_per_kwh,
+                    record.total_cost,
+                    record.currency,
+                    record.soc_start,
+                    record.soc_end,
+                    record.location,
+                    record.notes,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    async def async_get_last_charge(self) -> ChargeRecord | None:
+        return await self._hass.async_add_executor_job(self._get_last_charge)
+
+    def _get_last_charge(self) -> ChargeRecord | None:
+        with sqlite3.connect(self._path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM charges ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return _row_to_charge(row) if row else None
+
+    async def async_delete_last_charge(self) -> bool:
+        return await self._hass.async_add_executor_job(self._delete_last_charge)
+
+    def _delete_last_charge(self) -> bool:
+        with sqlite3.connect(self._path) as conn:
+            cur = conn.execute("SELECT id FROM charges ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            if not row:
+                return False
+            conn.execute("DELETE FROM charges WHERE id = ?", (row[0],))
+            return True
+
+    async def async_charges_aggregates_since(
+        self, since: datetime
+    ) -> dict[str, float | int]:
+        return await self._hass.async_add_executor_job(
+            self._charges_aggregates_since, since
+        )
+
+    def _charges_aggregates_since(self, since: datetime) -> dict[str, float | int]:
+        with sqlite3.connect(self._path) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(kwh), 0) AS kwh,
+                    COALESCE(SUM(total_cost), 0) AS cost,
+                    COUNT(*) AS count
+                FROM charges WHERE ended_at >= ?
+                """,
+                (since.isoformat(),),
+            ).fetchone()
+        kwh, cost, count = row
+        avg_price = (cost / kwh) if kwh else 0.0
+        return {
+            "kwh": float(kwh),
+            "total_cost": float(cost),
+            "count": int(count),
+            "avg_price_per_kwh": float(avg_price),
         }
 
     async def async_export_csv(self, path: str) -> int:
@@ -239,6 +398,22 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         destination=row["destination"],
         cost=row["cost"],
         currency=row["currency"],
+    )
+
+
+def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
+    return ChargeRecord(
+        charge_id=row["id"],
+        started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+        ended_at=datetime.fromisoformat(row["ended_at"]),
+        kwh=row["kwh"],
+        price_per_kwh=row["price_per_kwh"],
+        total_cost=row["total_cost"],
+        currency=row["currency"],
+        soc_start=row["soc_start"],
+        soc_end=row["soc_end"],
+        location=row["location"],
+        notes=row["notes"],
     )
 
 

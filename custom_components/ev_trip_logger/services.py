@@ -10,9 +10,11 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import (
     DOMAIN,
+    SERVICE_DELETE_LAST_CHARGE,
     SERVICE_DELETE_LAST_TRIP,
     SERVICE_END_TRIP,
     SERVICE_EXPORT_CSV,
+    SERVICE_LOG_CHARGE,
     SERVICE_START_TRIP,
 )
 from .coordinator import EvTripLoggerCoordinator
@@ -25,6 +27,28 @@ _SCHEMA_ENTRY = vol.Schema(
 )
 
 _SCHEMA_EXPORT = _SCHEMA_ENTRY.extend({vol.Required("path"): cv.string})
+
+def _has_price_or_total(value: dict[str, Any]) -> dict[str, Any]:
+    """Require one of: price_per_kwh, total_cost. None means 'use home default'."""
+    if "price_per_kwh" in value and "total_cost" in value:
+        # Both supplied: total_cost wins; we'll re-derive price.
+        pass
+    return value
+
+
+_SCHEMA_LOG_CHARGE = vol.All(
+    _SCHEMA_ENTRY.extend(
+        {
+            vol.Required("kwh"): vol.All(vol.Coerce(float), vol.Range(min=0.001)),
+            vol.Optional("price_per_kwh"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            vol.Optional("total_cost"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            vol.Optional("currency"): cv.string,
+            vol.Optional("location"): cv.string,
+            vol.Optional("notes"): cv.string,
+        }
+    ),
+    _has_price_or_total,
+)
 
 
 def _resolve_coordinators(
@@ -60,6 +84,21 @@ def async_register_services(hass: HomeAssistant) -> None:
         for c in _resolve_coordinators(hass, call):
             await c.storage.async_export_csv(call.data["path"])
 
+    async def _log_charge(call: ServiceCall) -> None:
+        for c in _resolve_coordinators(hass, call):
+            await c.async_log_charge_service(
+                kwh=call.data["kwh"],
+                price_per_kwh=call.data.get("price_per_kwh"),
+                total_cost=call.data.get("total_cost"),
+                currency=call.data.get("currency"),
+                location=call.data.get("location"),
+                notes=call.data.get("notes"),
+            )
+
+    async def _delete_last_charge(call: ServiceCall) -> None:
+        for c in _resolve_coordinators(hass, call):
+            await c.async_delete_last_charge_service()
+
     hass.services.async_register(DOMAIN, SERVICE_START_TRIP, _start, schema=_SCHEMA_ENTRY)
     hass.services.async_register(DOMAIN, SERVICE_END_TRIP, _end, schema=_SCHEMA_ENTRY)
     hass.services.async_register(
@@ -67,6 +106,12 @@ def async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_EXPORT_CSV, _export, schema=_SCHEMA_EXPORT
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_LOG_CHARGE, _log_charge, schema=_SCHEMA_LOG_CHARGE
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_DELETE_LAST_CHARGE, _delete_last_charge, schema=_SCHEMA_ENTRY
     )
 
 
@@ -78,6 +123,8 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_END_TRIP,
         SERVICE_DELETE_LAST_TRIP,
         SERVICE_EXPORT_CSV,
+        SERVICE_LOG_CHARGE,
+        SERVICE_DELETE_LAST_CHARGE,
     ):
         if hass.services.has_service(DOMAIN, name):
             hass.services.async_remove(DOMAIN, name)

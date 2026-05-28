@@ -1,0 +1,21 @@
+services:
+  homeassistant:
+    container_name: ev-trip-logger-dev-ha
+    image: ghcr.io/home-assistant/home-assistant:stable
+    restart: unless-stopped
+    ports:
+      - "8124:8123"
+    volumes:
+      - ./.dev/config:/config
+      - ./custom_components/ev_trip_logger:/config/custom_components/ev_trip_logger:ro
+      # Sibling repos mounted for live editing
+      - ../hass-byd-vehicle/custom_components/byd_vehicle:/config/custom_components/byd_vehicle:ro
+      - ../pyBYD:/opt/pybyd
+    # Pre-install local pyBYD so HA's requirements check finds it already
+    # satisfied and skips the git-URL fetch in the byd_vehicle manifest.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "pip install --quiet --no-deps /opt/pybyd && exec /init"
+    environment:
+      - TZ=Europe/Madrid

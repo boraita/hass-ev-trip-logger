@@ -23,3 +23,20 @@ jobs:
         with:
           category: integration
           ignore: brands
+
+  test:
+    name: Pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/requirements.txt
+      - name: Run tests
+        run: pytest -v
