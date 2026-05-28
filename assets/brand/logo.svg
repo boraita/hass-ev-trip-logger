@@ -1,29 +1,64 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" fill="none">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#0f766e"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d9488"/>
       <stop offset="100%" stop-color="#064e3b"/>
     </linearGradient>
+    <radialGradient id="targetGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#a7f3d0" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#a7f3d0" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+      <feOffset dx="0" dy="3"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
   </defs>
 
-  <g transform="translate(20, 20)">
-    <rect width="280" height="280" rx="64" fill="url(#bg)"/>
-    <path d="M 65 192
-             L 127 124
-             L 127 155
-             L 215 90"
+  <g transform="translate(20, 20) scale(0.547)">
+    <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+
+    <g stroke="#ffffff" opacity="0.06" stroke-width="1.5">
+      <line x1="64"  y1="128" x2="448" y2="128"/>
+      <line x1="64"  y1="256" x2="448" y2="256"/>
+      <line x1="64"  y1="384" x2="448" y2="384"/>
+      <line x1="128" y1="64"  x2="128" y2="448"/>
+      <line x1="256" y1="64"  x2="256" y2="448"/>
+      <line x1="384" y1="64"  x2="384" y2="448"/>
+    </g>
+
+    <circle cx="432" cy="104" r="80" fill="url(#targetGlow)"/>
+
+    <path d="M 80 408 C 180 360, 200 320, 248 286 S 360 200, 432 104"
           stroke="#ffffff"
-          stroke-width="13"
+          stroke-width="24"
           stroke-linecap="round"
-          stroke-linejoin="round"
-          fill="none"/>
-    <circle cx="65" cy="192" r="12" fill="#a7f3d0"/>
-    <circle cx="65" cy="192" r="5" fill="#0f766e"/>
-    <circle cx="215" cy="90" r="12" fill="#a7f3d0"/>
-    <circle cx="215" cy="90" r="5" fill="#0f766e"/>
+          fill="none"
+          opacity="0.96"
+          filter="url(#softShadow)"/>
+
+    <circle cx="170" cy="362" r="13" fill="#0f172a"/>
+    <circle cx="170" cy="362" r="8"  fill="#a7f3d0"/>
+    <circle cx="252" cy="284" r="13" fill="#0f172a"/>
+    <circle cx="252" cy="284" r="8"  fill="#a7f3d0"/>
+    <circle cx="340" cy="208" r="13" fill="#0f172a"/>
+    <circle cx="340" cy="208" r="8"  fill="#a7f3d0"/>
+
+    <circle cx="80" cy="408" r="32" fill="#a7f3d0"/>
+    <circle cx="80" cy="408" r="20" fill="#0f172a"/>
+    <circle cx="80" cy="408" r="8"  fill="#a7f3d0"/>
+
+    <circle cx="432" cy="104" r="38" fill="#a7f3d0"/>
+    <circle cx="432" cy="104" r="26" fill="#0f172a"/>
+    <circle cx="432" cy="104" r="14" fill="#5eead4"/>
+    <circle cx="432" cy="104" r="5"  fill="#0f172a"/>
   </g>
 
-  <text x="345" y="195" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="96" letter-spacing="-3">
-    <tspan font-weight="700" fill="#0f172a">EV Trip</tspan><tspan font-weight="300" fill="#0f766e" dx="22">Logger</tspan>
+  <text x="345" y="200" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="100" letter-spacing="-3">
+    <tspan font-weight="700" fill="#0f172a">EV Trip</tspan><tspan font-weight="300" fill="#0d9488" dx="22">Logger</tspan>
   </text>
 </svg>
