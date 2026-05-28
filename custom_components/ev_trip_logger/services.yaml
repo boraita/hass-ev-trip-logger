@@ -127,7 +127,7 @@ set_last_charge_price:
         number:
           min: 0
           max: 5
-          step: 0.0001
+          step: 0.001
           mode: box
     total_cost:
       name: Total cost
