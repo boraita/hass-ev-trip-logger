@@ -302,10 +302,21 @@ class EvTripLoggerCoordinator:
     def _async_metric_changed(self, event: Event[EventStateChangedData]) -> None:
         """Notify listeners on odometer / battery change, even when idle.
 
-        Idle notifications matter for battery-derived sensors
-        (current_battery_kwh, energy_to_full) which need to update whenever
-        the source battery sensor moves, not just during trips/charges.
+        Also recovers a missed-resume: if vehicle_on is on but no trip is
+        open (because _maybe_resume_trip ran while BYD hadn't yet repopulated
+        odometer/battery after a HA restart), the first fresh metric arrival
+        opens the trip retroactively. Without this, every HA restart during
+        a real drive silently swallows the entire trip.
         """
+        if (
+            self.current is None
+            and self._read_bool(self._vehicle_on) is True
+            and self._read_float(self._odometer) is not None
+            and self._read_float(self._battery) is not None
+        ):
+            self._open_trip(dt_util.now())
+            return
+
         if self.current_charge is not None:
             soc = self._read_float(self._battery)
             if soc is not None:
