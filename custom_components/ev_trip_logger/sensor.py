@@ -816,9 +816,12 @@ class LastChargeSensor(_BaseTripSensor):
         "kwh": {
             "unit": UnitOfEnergy.KILO_WATT_HOUR,
             "device_class": SensorDeviceClass.ENERGY,
-            # HA rejects measurement for device_class=energy; last-charge is a
-            # one-shot value, not a running total — None is the right call.
-            "state_class": None,
+            # state_class=total: HA accepts it with device_class=energy AND
+            # stops warning about "no state class" after a prior measurement.
+            # Auto-reset detection treats every value replacement as a fresh
+            # period — the "change" stat equals each charge's kWh, which is
+            # exactly what we want long-term.
+            "state_class": SensorStateClass.TOTAL,
             "precision": 2,
             "slug": "last_charge_kwh",
         },
