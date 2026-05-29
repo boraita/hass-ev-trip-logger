@@ -59,6 +59,11 @@ _LOGGER = logging.getLogger(__name__)
 
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""}
 _LIVE_TICK = timedelta(seconds=30)
+# Wait this long without further odo growth before committing a synthetic
+# trip. Cloud-polling sources emit small odo deltas every ~1-2 min during a
+# drive; the window must be longer than the polling interval so we don't
+# fragment one drive into many micro-trips.
+_SYNTH_COALESCE_WINDOW_S = 300
 
 
 @dataclass
@@ -135,6 +140,13 @@ class EvTripLoggerCoordinator:
         self._unsub_charge: CALLBACK_TYPE | None = None
         self._unsub_idle: CALLBACK_TYPE | None = None
         self._unsub_live_tick: CALLBACK_TYPE | None = None
+        # Pending synthetic-trip finalize timer + baseline (start_t, start_odo,
+        # start_soc) of the in-progress synth trip being coalesced. When the
+        # underlying integration (e.g. BYD cloud) reports odo updates in many
+        # small increments while vehicle_on stays False, we accumulate them
+        # into one trip instead of inserting one record per polling cycle.
+        self._unsub_synth_finalize: CALLBACK_TYPE | None = None
+        self._synth_baseline: tuple[datetime, float, float | None] | None = None
 
         self._listeners: list[Callable[[], None]] = []
         self._trip_log_listeners: list[Callable[[], None]] = []
@@ -164,21 +176,19 @@ class EvTripLoggerCoordinator:
 
     @property
     def home_zone(self) -> str:
-        """Friendly name a device_tracker reports while inside the home zone.
+        """The string a device_tracker reports while inside the home zone.
+
+        HA's device_tracker uses the zone's underlying *slug* (entity_id
+        without the `zone.` prefix), NOT its friendly_name. If you rename
+        `zone.home` to 'Rafelehouse' in the UI, the friendly_name changes
+        but device_tracker still reports 'home'. So we always strip the
+        prefix and compare against that slug.
 
         Accepts both the new selector format (`zone.<id>`) and the legacy
-        free-text format (just the name). For `zone.<id>` we resolve the
-        actual friendly_name (which is what `device_tracker.state` becomes
-        when the entity is inside that zone).
+        free-text format (just the name) for backwards compatibility.
         """
         raw = self._home_zone or DEFAULT_HOME_ZONE
         if raw.startswith("zone."):
-            state = self.hass.states.get(raw)
-            if state is not None:
-                fn = state.attributes.get("friendly_name")
-                if fn:
-                    return fn
-            # Fallback: strip the prefix.
             return raw[len("zone."):]
         return raw
 
@@ -303,12 +313,15 @@ class EvTripLoggerCoordinator:
             self._unsub_charge,
             self._unsub_idle,
             self._unsub_live_tick,
+            self._unsub_synth_finalize,
         ):
             if unsub:
                 unsub()
         self._unsub_state = self._unsub_metrics = None
         self._unsub_power = self._unsub_temp = self._unsub_idle = None
         self._unsub_charge = self._unsub_live_tick = None
+        self._unsub_synth_finalize = None
+        self._synth_baseline = None
 
     @callback
     def _async_vehicle_on_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -365,26 +378,78 @@ class EvTripLoggerCoordinator:
             self.hass.async_create_task(self._async_check_odo_jump())
 
     async def _async_check_odo_jump(self) -> None:
-        """If the odo jumped > min_distance while idle, backfill a trip.
+        """Coalesce consecutive odo growth into ONE synthetic trip.
 
         Catches trips that cloud-polling integrations miss because vehicle_on
-        toggles between two polls.
+        toggles between two polls. Cloud-polling sources (e.g. BYD) typically
+        emit many small odo deltas during a drive — without coalescing we'd
+        insert one trip per polling cycle. Instead, we hold the baseline at
+        the last idle reading and (re)schedule a finalize timer; when the
+        timer fires after _SYNTH_COALESCE_WINDOW_S of no new growth, we log a
+        single trip covering the full accumulated delta.
         """
         odo = self._read_float(self._odometer)
         if odo is None:
             return
         now = dt_util.now()
         soc = self._read_float(self._battery)
+
         prev = self._last_idle_odo
-        # Refresh snapshot regardless — post-jump reading is the new baseline.
-        self._last_idle_odo = (now, odo, soc)
         if prev is None:
+            # First observation — establish baseline, don't insert anything.
+            self._last_idle_odo = (now, odo, soc)
             return
         prev_t, prev_odo, prev_soc = prev
         delta = odo - prev_odo
+
+        if delta < self._min_distance:
+            # Sub-threshold growth — keep waiting. Do NOT advance the baseline:
+            # the next reading must still be compared against the original
+            # idle snapshot, otherwise we'd lose the cumulative distance.
+            return
+
+        # Above-threshold growth detected. Adopt or keep the synth baseline
+        # (= last idle reading) and (re)schedule the finalize timer.
+        if self._synth_baseline is None:
+            self._synth_baseline = (prev_t, prev_odo, prev_soc)
+        if self._unsub_synth_finalize is not None:
+            self._unsub_synth_finalize()
+
+        @callback
+        def _finalize(_at: datetime) -> None:
+            self._unsub_synth_finalize = None
+            self.hass.async_create_task(self._async_finalize_synth_trip())
+
+        self._unsub_synth_finalize = async_call_later(
+            self.hass, _SYNTH_COALESCE_WINDOW_S, _finalize
+        )
+
+    async def _async_finalize_synth_trip(self) -> None:
+        """Commit the coalesced synthetic trip after the debounce window."""
+        baseline = self._synth_baseline
+        if baseline is None:
+            return
+        # If a real trip opened in the meantime, abort — the live trip will
+        # cover this distance and we'd double-count.
+        if self.current is not None:
+            self._synth_baseline = None
+            return
+        odo_now = self._read_float(self._odometer)
+        if odo_now is None:
+            return
+        soc_now = self._read_float(self._battery)
+        now = dt_util.now()
+        prev_t, prev_odo, prev_soc = baseline
+        delta = odo_now - prev_odo
+        # Reset state regardless of outcome — next idle reading establishes
+        # a fresh baseline.
+        self._synth_baseline = None
+        self._last_idle_odo = (now, odo_now, soc_now)
         if delta < self._min_distance:
             return
-        await self._async_log_synthetic_trip(prev_t, now, prev_odo, odo, prev_soc, soc)
+        await self._async_log_synthetic_trip(
+            prev_t, now, prev_odo, odo_now, prev_soc, soc_now
+        )
 
     async def _async_log_synthetic_trip(
         self,
@@ -555,6 +620,12 @@ class EvTripLoggerCoordinator:
         self._notify_listeners()
 
     def _open_trip(self, now: datetime) -> None:
+        # If a synth-trip finalize was pending, cancel it — the live trip
+        # will own the distance from here on.
+        if self._unsub_synth_finalize is not None:
+            self._unsub_synth_finalize()
+            self._unsub_synth_finalize = None
+        self._synth_baseline = None
         odometer = self._read_float(self._odometer)
         soc = self._read_float(self._battery)
         location = self._read_str(self._location) if self._location else None

@@ -196,7 +196,11 @@ async def test_delete_last_trip_service_removes_record(hass: HomeAssistant) -> N
 
 
 async def test_odo_jump_creates_synthetic_trip(hass: HomeAssistant) -> None:
-    """A big odometer increase without vehicle_on going to on backfills a trip."""
+    """A big odometer increase without vehicle_on going to on backfills a trip.
+
+    The insert is debounced (see _SYNTH_COALESCE_WINDOW_S) — we advance time
+    past the window to flush it.
+    """
     entry = await _setup(hass, **{CONF_MIN_TRIP_DISTANCE: 2.0})
     coordinator = hass.data[DOMAIN][entry.entry_id]
     assert coordinator.last_trip is None
@@ -208,6 +212,12 @@ async def test_odo_jump_creates_synthetic_trip(hass: HomeAssistant) -> None:
     # Cloud poll happens later: odo suddenly +18 km, battery -8% — no vehicle_on toggle.
     hass.states.async_set(ODO, "1018")
     hass.states.async_set(BAT, "72")
+    await hass.async_block_till_done()
+    # Not committed yet — still inside the coalesce window.
+    assert coordinator.last_trip is None
+
+    # Advance past the coalesce window — finalize fires.
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=6))
     await hass.async_block_till_done()
 
     assert coordinator.last_trip is not None
@@ -224,8 +234,42 @@ async def test_odo_jump_below_threshold_does_nothing(hass: HomeAssistant) -> Non
 
     hass.states.async_set(ODO, "1001")  # +1 km, below 2.0 threshold
     await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=6))
+    await hass.async_block_till_done()
 
     assert coordinator.last_trip is None
+
+
+async def test_odo_jump_coalesces_consecutive_polls(hass: HomeAssistant) -> None:
+    """Many small odo updates (cloud-polling) collapse into ONE synthetic trip.
+
+    This is the real-world regression that motivated the coalesce window:
+    BYD cloud polling emits +1 km updates every ~2 min during a drive. Without
+    coalescing, we'd insert one trip per poll. With it, we insert one trip
+    for the whole drive.
+    """
+    entry = await _setup(hass, **{CONF_MIN_TRIP_DISTANCE: 0.5})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    hass.states.async_set(BAT, "80")
+    await hass.async_block_till_done()
+
+    # Five consecutive +1 km polls 1 min apart while vehicle_on stays off.
+    for km, bat in [(1001, 79), (1002, 78), (1003, 77), (1004, 76), (1005, 75)]:
+        hass.states.async_set(ODO, str(km))
+        hass.states.async_set(BAT, str(bat))
+        await hass.async_block_till_done()
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=1))
+        await hass.async_block_till_done()
+        # Still pending — every poll bumps the timer, finalize hasn't fired.
+        assert coordinator.last_trip is None
+
+    # Now wait past the coalesce window with no more polls.
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=6))
+    await hass.async_block_till_done()
+
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.distance_km == pytest.approx(5.0)
+    assert coordinator.last_trip.soc_used_pct == pytest.approx(5.0)
 
 
 async def test_battery_energy_and_to_full_sensors(hass: HomeAssistant) -> None:
@@ -598,30 +642,42 @@ async def test_home_zone_resolves_zone_entity_to_friendly_name(
     assert coordinator.last_completed_journey_id is not None
 
 
-async def test_home_zone_comparison_is_case_insensitive(
+async def test_home_zone_uses_slug_not_friendly_name(
     hass: HomeAssistant,
 ) -> None:
-    """zone.home's friendly_name 'Home' must match device_tracker reporting 'home'."""
+    """zone.home renamed to 'Rafelehouse' must still match device_tracker reporting 'home'.
+
+    HA's device_tracker uses the zone's underlying slug (entity_id minus the
+    'zone.' prefix), not its friendly_name. If we resolved the configured
+    `zone.<id>` to its friendly_name we'd compare against the renamed label
+    and journeys would never close.
+    """
     from custom_components.ev_trip_logger.const import CONF_HOME_ZONE
+    # User renamed zone.home to 'Rafelehouse' in the UI but device_tracker
+    # still reports 'home' as state.
     hass.states.async_set(
-        "zone.home", "0", {"friendly_name": "Home", "latitude": 40, "longitude": -3}
+        "zone.home",
+        "0",
+        {"friendly_name": "Rafelehouse", "latitude": 40, "longitude": -3},
     )
-    hass.states.async_set(LOC, "home")  # lowercase, as input_select / many trackers report
+    hass.states.async_set(LOC, "home")
     entry = await _setup(hass, **{CONF_LOCATION: LOC, CONF_HOME_ZONE: "zone.home"})
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    # home_zone resolves to "Home" (capital), location_start is "home" (lower) — must still match.
-    assert coordinator.home_zone == "Home"
+    # Must resolve to the slug, NOT the friendly_name.
+    assert coordinator.home_zone == "home"
     assert coordinator._is_at_home("home")
-    assert coordinator._is_at_home("HOME")
+    assert coordinator._is_at_home("HOME")  # case-insensitive belt-and-braces
     assert coordinator._is_at_home("  home  ")
+    assert not coordinator._is_at_home("Rafelehouse")
     assert not coordinator._is_at_home("work")
 
-    # Drive a home → not_home → home cycle and verify journey opens AND closes.
+    # Drive a home → not_home → home cycle and verify journey opens AND closes
+    # even though the zone's friendly_name doesn't equal the device_tracker state.
     await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="not_home")
     assert coordinator.current_journey_id is not None
     hass.states.async_set(LOC, "not_home")
-    await _run_stage(hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="Home")
-    assert coordinator.current_journey_id is None  # closed despite case mismatch
+    await _run_stage(hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="home")
+    assert coordinator.current_journey_id is None
     assert coordinator.last_completed_journey_id is not None
 
 
