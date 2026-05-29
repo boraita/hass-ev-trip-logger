@@ -249,6 +249,34 @@ async def test_battery_energy_and_to_full_sensors(hass: HomeAssistant) -> None:
     assert float(hass.states.get(ef_id).state) == pytest.approx(0.45 * 75)   # 33.75
 
 
+async def test_current_trip_cost_and_score_live(hass: HomeAssistant) -> None:
+    """current_trip_cost and current_trip_score should update during a trip."""
+    entry = await _setup(hass)
+    registry = er.async_get(hass)
+    cost_id = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_current_trip_cost")
+    score_id = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_current_trip_score")
+    assert cost_id is not None and score_id is not None
+
+    # Idle defaults
+    assert float(hass.states.get(cost_id).state) == 0.0
+    assert hass.states.get(score_id).state == "unknown"
+
+    # Open a trip and drive 20 km, drop 10 % SoC (energy 7.5 kWh at 75 kWh capacity).
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1020")
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+
+    expected_energy = 0.10 * 75   # 7.5 kWh
+    expected_consumption = expected_energy / 20.0 * 100   # 37.5 kWh/100km
+    expected_score = max(0.0, min(10.0, 10 - max(0.0, expected_consumption - 14.5) * 0.6))
+    expected_cost = expected_energy * 0.15   # home default
+
+    assert float(hass.states.get(cost_id).state) == pytest.approx(expected_cost, abs=0.01)
+    assert float(hass.states.get(score_id).state) == pytest.approx(expected_score, abs=0.05)
+
+
 async def test_current_trip_sensors_idle_show_zero_not_unavailable(
     hass: HomeAssistant,
 ) -> None:

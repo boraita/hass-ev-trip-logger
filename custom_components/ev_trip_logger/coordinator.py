@@ -1050,6 +1050,18 @@ class EvTripLoggerCoordinator:
             else None
         )
 
+        # Live cost: use the most recent charge price if any, else the home default.
+        price_per_kwh = (
+            self.last_charge.price_per_kwh
+            if self.last_charge is not None
+            else self._energy_price
+        )
+        cost = (energy * price_per_kwh) if energy and energy > 0 else None
+        # Live score: same curve as TripRecord.score.
+        score = None
+        if consumption is not None and consumption > 0:
+            score = max(0.0, min(10.0, 10.0 - max(0.0, consumption - 14.5) * 0.6))
+
         return {
             "distance_km": distance,
             "duration_min": duration_min,
@@ -1059,4 +1071,6 @@ class EvTripLoggerCoordinator:
             "consumption_kwh_100km": consumption,
             "avg_temp_c": avg_temp,
             "max_power_kw": active.max_power or None,
+            "cost": cost,
+            "score": score,
         }

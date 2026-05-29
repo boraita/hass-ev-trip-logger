@@ -179,6 +179,7 @@ async def async_setup_entry(
 
     for key, cfg in _TRIP_FIELDS_EXTRA_LAST.items():
         entities.append(LastTripExtraSensor(coordinator, key=key, cfg=cfg))
+        entities.append(CurrentTripExtraSensor(coordinator, key=key, cfg=cfg))
 
     entities.extend(
         [
@@ -332,6 +333,43 @@ class LastTripExtraSensor(_BaseTripSensor):
         if trip is None:
             return None
         return getattr(trip, self._key, None)
+
+
+class CurrentTripExtraSensor(_BaseTripSensor):
+    """Live cost and score of the in-progress trip (mirror of LastTripExtraSensor).
+
+    cost shows 0 €/€ when idle; score is unknown until consumption is computable.
+    """
+
+    _IDLE_DEFAULTS: dict[str, float | None] = {"cost": 0.0, "score": None}
+
+    def __init__(
+        self, coordinator: EvTripLoggerCoordinator, *, key: str, cfg: dict[str, Any]
+    ) -> None:
+        super().__init__(coordinator)
+        self._key = key
+        slug = f"current_trip_{cfg['slug']}"
+        self.entity_description = SensorEntityDescription(
+            key=slug,
+            translation_key=slug,
+            native_unit_of_measurement=(
+                coordinator.currency
+                if cfg.get("device_class") == SensorDeviceClass.MONETARY
+                else cfg.get("unit")
+            ),
+            device_class=cfg.get("device_class"),
+            state_class=cfg.get("state_class"),
+            icon=cfg.get("icon"),
+            suggested_display_precision=cfg.get("precision"),
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_{slug}"
+
+    @property
+    def native_value(self) -> float | None:
+        snapshot = self._coordinator.current_snapshot()
+        if snapshot is None:
+            return self._IDLE_DEFAULTS.get(self._key)
+        return snapshot.get(self._key)
 
 
 class AggregateSensor(_BaseTripSensor):
