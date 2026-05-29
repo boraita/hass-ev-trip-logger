@@ -24,6 +24,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
@@ -53,6 +54,7 @@ def _desc(
     state_class: SensorStateClass | None = SensorStateClass.MEASUREMENT,
     icon: str | None = None,
     suggested_precision: int | None = None,
+    diagnostic: bool = False,
 ) -> SensorEntityDescription:
     return SensorEntityDescription(
         key=key,
@@ -62,6 +64,7 @@ def _desc(
         state_class=state_class,
         icon=icon,
         suggested_display_precision=suggested_precision,
+        entity_category=EntityCategory.DIAGNOSTIC if diagnostic else None,
     )
 
 
@@ -107,6 +110,7 @@ _TRIP_FIELDS: list[TripSensorMeta] = [
             unit=UnitOfSpeed.KILOMETERS_PER_HOUR,
             device_class=SensorDeviceClass.SPEED,
             suggested_precision=1,
+            diagnostic=True,
         ),
     ),
     TripSensorMeta(
@@ -144,6 +148,7 @@ _TRIP_FIELDS: list[TripSensorMeta] = [
             unit=UnitOfTemperature.CELSIUS,
             device_class=SensorDeviceClass.TEMPERATURE,
             suggested_precision=1,
+            diagnostic=True,
         ),
     ),
     TripSensorMeta(
@@ -153,6 +158,7 @@ _TRIP_FIELDS: list[TripSensorMeta] = [
             unit=UnitOfPower.KILO_WATT,
             device_class=SensorDeviceClass.POWER,
             suggested_precision=1,
+            diagnostic=True,
         ),
     ),
 ]
@@ -368,6 +374,12 @@ class AggregateSensor(_BaseTripSensor):
 
         unit, device_class, icon = self._PERIODIC_KEYS_UNITS[key]
         slug = f"{period}_{self._SLUG_BY_KEY[key]}"
+        # Secondary periods are diagnostic so the device card stays uncluttered.
+        is_diagnostic = (period, key) in {
+            ("today", "distance_km"),
+            ("week", "distance_km"),
+            ("year", "distance_km"),
+        }
         self.entity_description = SensorEntityDescription(
             key=f"total_{slug}",
             translation_key=f"total_{slug}",
@@ -378,6 +390,7 @@ class AggregateSensor(_BaseTripSensor):
             state_class=self._STATE_CLASS_BY_KEY[key],
             icon=icon,
             suggested_display_precision=0 if key == "count" else 1,
+            entity_category=EntityCategory.DIAGNOSTIC if is_diagnostic else None,
         )
         self._attr_unique_id = f"{coordinator.entry_id}_total_{slug}"
 
@@ -954,6 +967,8 @@ class ChargesAggregateSensor(_BaseTripSensor):
         self._value: float | int | None = None
 
         slug = f"{cfg['slug']}_{self._PERIOD_SUFFIX[period]}"
+        # avg_charge_price is more of a stats curiosity than a daily check.
+        is_diagnostic = key == "avg_price_per_kwh"
         self.entity_description = SensorEntityDescription(
             key=slug,
             translation_key=slug,
@@ -966,6 +981,7 @@ class ChargesAggregateSensor(_BaseTripSensor):
             state_class=cfg.get("state_class"),
             icon=cfg.get("icon"),
             suggested_display_precision=cfg.get("precision"),
+            entity_category=EntityCategory.DIAGNOSTIC if is_diagnostic else None,
         )
         self._attr_unique_id = f"{coordinator.entry_id}_{slug}"
 
