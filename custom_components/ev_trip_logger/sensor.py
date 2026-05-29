@@ -195,6 +195,7 @@ async def async_setup_entry(
     entities.append(RecentJourneysSensor(coordinator))
     entities.append(BatteryEnergySensor(coordinator))
     entities.append(EnergyToFullSensor(coordinator))
+    entities.append(BatteryPercentSensor(coordinator))
 
     entities.extend(
         [
@@ -759,6 +760,26 @@ class RecentChargesSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"charges": [_charge_to_attr(c) for c in self._charges]}
+
+
+class BatteryPercentSensor(_BaseTripSensor):
+    """Mirror of the source battery sensor — gives the device card a battery %."""
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="battery_state",
+            translation_key="battery_state",
+            native_unit_of_measurement=PERCENTAGE,
+            device_class=SensorDeviceClass.BATTERY,
+            state_class=SensorStateClass.MEASUREMENT,
+            suggested_display_precision=0,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_battery_state"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._coordinator.battery_level
 
 
 class BatteryEnergySensor(_BaseTripSensor):

@@ -123,7 +123,8 @@
       "current_journey": { "name": "Current journey" },
       "recent_journeys": { "name": "Recent journeys" },
       "battery_energy": { "name": "Battery energy" },
-      "energy_to_full": { "name": "Energy to full charge" }
+      "energy_to_full": { "name": "Energy to full charge" },
+      "battery_state": { "name": "Battery" }
     }
   }
 }
