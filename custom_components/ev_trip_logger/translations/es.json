@@ -124,7 +124,7 @@
       "recent_journeys": { "name": "Viajes recientes (completos)" },
       "battery_energy": { "name": "Energía en batería" },
       "energy_to_full": { "name": "Energía hasta el 100%" },
-      "battery_state": { "name": "Batería" }
+      "battery_state": { "name": "Porcentaje batería" }
     }
   }
 }
