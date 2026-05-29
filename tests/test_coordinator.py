@@ -598,6 +598,33 @@ async def test_home_zone_resolves_zone_entity_to_friendly_name(
     assert coordinator.last_completed_journey_id is not None
 
 
+async def test_home_zone_comparison_is_case_insensitive(
+    hass: HomeAssistant,
+) -> None:
+    """zone.home's friendly_name 'Home' must match device_tracker reporting 'home'."""
+    from custom_components.ev_trip_logger.const import CONF_HOME_ZONE
+    hass.states.async_set(
+        "zone.home", "0", {"friendly_name": "Home", "latitude": 40, "longitude": -3}
+    )
+    hass.states.async_set(LOC, "home")  # lowercase, as input_select / many trackers report
+    entry = await _setup(hass, **{CONF_LOCATION: LOC, CONF_HOME_ZONE: "zone.home"})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    # home_zone resolves to "Home" (capital), location_start is "home" (lower) — must still match.
+    assert coordinator.home_zone == "Home"
+    assert coordinator._is_at_home("home")
+    assert coordinator._is_at_home("HOME")
+    assert coordinator._is_at_home("  home  ")
+    assert not coordinator._is_at_home("work")
+
+    # Drive a home → not_home → home cycle and verify journey opens AND closes.
+    await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="not_home")
+    assert coordinator.current_journey_id is not None
+    hass.states.async_set(LOC, "not_home")
+    await _run_stage(hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="Home")
+    assert coordinator.current_journey_id is None  # closed despite case mismatch
+    assert coordinator.last_completed_journey_id is not None
+
+
 async def test_home_zone_accepts_legacy_plain_string(hass: HomeAssistant) -> None:
     """Users on the old text-field config (e.g. 'home' as string) still work."""
     from custom_components.ev_trip_logger.const import CONF_HOME_ZONE

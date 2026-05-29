@@ -79,6 +79,10 @@
     "set_last_charge_price": {
       "name": "Cambiar precio de la última carga",
       "description": "Sobrescribe precio / ubicación de la última carga sin tocar kWh ni timestamp."
+    },
+    "log_manual_trip": {
+      "name": "Registrar viaje manual",
+      "description": "Inserta un viaje que el detector live perdió. Requiere started_at, ended_at y bien distance_km o ambos extremos de odómetro."
     }
   },
   "entity": {

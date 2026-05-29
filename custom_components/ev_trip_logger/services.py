@@ -113,8 +113,17 @@ def async_register_services(hass: HomeAssistant) -> None:
             await c.async_delete_last_trip_service()
 
     async def _export(call: ServiceCall) -> None:
+        # Restrict writes to the HA-configured allowlist; rejects /etc/passwd,
+        # ../, and anything outside HA's writable directories.
+        path = call.data["path"]
+        if not hass.config.is_allowed_path(path):
+            from homeassistant.exceptions import ServiceValidationError
+            raise ServiceValidationError(
+                f"Path {path!r} is not allowed. Add the parent directory to "
+                "homeassistant.allowlist_external_dirs in configuration.yaml."
+            )
         for c in _resolve_coordinators(hass, call):
-            await c.storage.async_export_csv(call.data["path"])
+            await c.storage.async_export_csv(path)
 
     async def _log_charge(call: ServiceCall) -> None:
         for c in _resolve_coordinators(hass, call):

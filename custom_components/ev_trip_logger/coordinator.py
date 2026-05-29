@@ -151,6 +151,17 @@ class EvTripLoggerCoordinator:
     def currency(self) -> str:
         return self._currency
 
+    def _is_at_home(self, location: str | None) -> bool:
+        """Case-insensitive home check.
+
+        Device trackers report the zone's friendly_name (e.g. 'home'), but
+        the same name might be capitalised differently between sources
+        ('Home' vs 'home'). All journey comparisons go through this helper.
+        """
+        if location is None:
+            return False
+        return location.strip().casefold() == self.home_zone.strip().casefold()
+
     @property
     def home_zone(self) -> str:
         """Friendly name a device_tracker reports while inside the home zone.
@@ -216,7 +227,7 @@ class EvTripLoggerCoordinator:
         if (
             self.last_trip is not None
             and self.last_trip.journey_id is not None
-            and self.last_trip.destination != self.home_zone
+            and not self._is_at_home(self.last_trip.destination)
         ):
             self.current_journey_id = self.last_trip.journey_id
         # Seed the odo-jump snapshot from the last trip if available so we can
@@ -414,9 +425,8 @@ class EvTripLoggerCoordinator:
         cost = energy * price_per_kwh if energy and energy > 0 else None
         location_start = self.last_trip.destination if self.last_trip else None
         location_end = self._read_str(self._location) if self._location else None
-        home = self.home_zone
-        started_from_home = location_start == home
-        is_at_home_end = location_end == home
+        started_from_home = self._is_at_home(location_start)
+        is_at_home_end = self._is_at_home(location_end)
         if started_from_home and self.current_journey_id is not None:
             self.last_completed_journey_id = self.current_journey_id
             self.current_journey_id = None
@@ -683,9 +693,8 @@ class EvTripLoggerCoordinator:
         # while a journey is still open (last stage ended away), the car must
         # have come home in between — retroactively close that journey and let
         # this stage open a fresh one.
-        home = self.home_zone
-        is_at_home_end = location_end == home
-        started_from_home = active.location_start == home
+        is_at_home_end = self._is_at_home(location_end)
+        started_from_home = self._is_at_home(active.location_start)
         if started_from_home and self.current_journey_id is not None:
             _LOGGER.debug(
                 "Retroactively closing journey %s — stage opened from home",

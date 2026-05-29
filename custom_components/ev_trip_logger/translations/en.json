@@ -79,6 +79,10 @@
     "set_last_charge_price": {
       "name": "Set last charge price",
       "description": "Override price / location of the last logged charge (without changing kWh or timestamp)."
+    },
+    "log_manual_trip": {
+      "name": "Log manual trip",
+      "description": "Backfill a trip the live detector missed. Required: started_at, ended_at, and either distance_km or both odometer bounds."
     }
   },
   "entity": {
