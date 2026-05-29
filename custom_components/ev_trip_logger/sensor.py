@@ -770,7 +770,9 @@ class BatteryEnergySensor(_BaseTripSensor):
             key="battery_energy",
             translation_key="battery_energy",
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            device_class=SensorDeviceClass.ENERGY,
+            # ENERGY_STORAGE (not ENERGY) is the right device_class for "kWh
+            # currently held at a point in time" — and it accepts MEASUREMENT.
+            device_class=SensorDeviceClass.ENERGY_STORAGE,
             state_class=SensorStateClass.MEASUREMENT,
             icon="mdi:battery-charging",
             suggested_display_precision=1,
@@ -794,7 +796,9 @@ class EnergyToFullSensor(_BaseTripSensor):
             key="energy_to_full",
             translation_key="energy_to_full",
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            device_class=SensorDeviceClass.ENERGY,
+            # Same rationale as BatteryEnergySensor: this is a point-in-time
+            # "capacity headroom", not consumed energy.
+            device_class=SensorDeviceClass.ENERGY_STORAGE,
             state_class=SensorStateClass.MEASUREMENT,
             icon="mdi:battery-plus",
             suggested_display_precision=1,
