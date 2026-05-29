@@ -153,7 +153,23 @@ class EvTripLoggerCoordinator:
 
     @property
     def home_zone(self) -> str:
-        return self._home_zone
+        """Friendly name a device_tracker reports while inside the home zone.
+
+        Accepts both the new selector format (`zone.<id>`) and the legacy
+        free-text format (just the name). For `zone.<id>` we resolve the
+        actual friendly_name (which is what `device_tracker.state` becomes
+        when the entity is inside that zone).
+        """
+        raw = self._home_zone or DEFAULT_HOME_ZONE
+        if raw.startswith("zone."):
+            state = self.hass.states.get(raw)
+            if state is not None:
+                fn = state.attributes.get("friendly_name")
+                if fn:
+                    return fn
+            # Fallback: strip the prefix.
+            return raw[len("zone."):]
+        return raw
 
     @property
     def battery_level(self) -> float | None:
@@ -200,7 +216,7 @@ class EvTripLoggerCoordinator:
         if (
             self.last_trip is not None
             and self.last_trip.journey_id is not None
-            and self.last_trip.destination != self._home_zone
+            and self.last_trip.destination != self.home_zone
         ):
             self.current_journey_id = self.last_trip.journey_id
         # Seed the odo-jump snapshot from the last trip if available so we can
@@ -398,8 +414,9 @@ class EvTripLoggerCoordinator:
         cost = energy * price_per_kwh if energy and energy > 0 else None
         location_start = self.last_trip.destination if self.last_trip else None
         location_end = self._read_str(self._location) if self._location else None
-        started_from_home = location_start == self._home_zone
-        is_at_home_end = location_end == self._home_zone
+        home = self.home_zone
+        started_from_home = location_start == home
+        is_at_home_end = location_end == home
         if started_from_home and self.current_journey_id is not None:
             self.last_completed_journey_id = self.current_journey_id
             self.current_journey_id = None
@@ -666,8 +683,9 @@ class EvTripLoggerCoordinator:
         # while a journey is still open (last stage ended away), the car must
         # have come home in between — retroactively close that journey and let
         # this stage open a fresh one.
-        is_at_home_end = location_end == self._home_zone
-        started_from_home = active.location_start == self._home_zone
+        home = self.home_zone
+        is_at_home_end = location_end == home
+        started_from_home = active.location_start == home
         if started_from_home and self.current_journey_id is not None:
             _LOGGER.debug(
                 "Retroactively closing journey %s — stage opened from home",

@@ -549,6 +549,36 @@ async def test_journey_retroactively_closes_when_next_stage_starts_at_home(
     assert coordinator.current_journey_id != jid_1
 
 
+async def test_home_zone_resolves_zone_entity_to_friendly_name(
+    hass: HomeAssistant,
+) -> None:
+    """home_zone = 'zone.home' must compare against device_tracker reporting 'home'."""
+    from custom_components.ev_trip_logger.const import CONF_HOME_ZONE
+    hass.states.async_set(
+        "zone.home", "0", {"friendly_name": "home", "latitude": 40, "longitude": -3}
+    )
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(hass, **{CONF_LOCATION: LOC, CONF_HOME_ZONE: "zone.home"})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator.home_zone == "home"
+
+    # Drive a journey: home → not_home → home
+    await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="not_home")
+    hass.states.async_set(LOC, "not_home")
+    await _run_stage(hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="home")
+
+    assert coordinator.last_completed_journey_id is not None
+
+
+async def test_home_zone_accepts_legacy_plain_string(hass: HomeAssistant) -> None:
+    """Users on the old text-field config (e.g. 'home' as string) still work."""
+    from custom_components.ev_trip_logger.const import CONF_HOME_ZONE
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(hass, **{CONF_LOCATION: LOC, CONF_HOME_ZONE: "home"})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator.home_zone == "home"
+
+
 async def test_journey_zone_is_configurable(hass: HomeAssistant) -> None:
     """A custom home zone name closes journeys instead of literal 'home'."""
     from custom_components.ev_trip_logger.const import CONF_HOME_ZONE

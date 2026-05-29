@@ -24,7 +24,7 @@
           "idle_timeout_minutes": "Idle timeout (min)",
           "energy_price_kwh": "Home charge price per kWh (default when no charge logged)",
           "currency": "Currency",
-          "home_zone": "Home zone name (closes journeys when device tracker enters)"
+          "home_zone": "Home zone (closes journeys when device tracker enters)"
         }
       },
       "reconfigure": {
@@ -46,7 +46,7 @@
           "idle_timeout_minutes": "Idle timeout (min)",
           "energy_price_kwh": "Home charge price per kWh (default when no charge logged)",
           "currency": "Currency",
-          "home_zone": "Home zone name (closes journeys when device tracker enters)"
+          "home_zone": "Home zone (closes journeys when device tracker enters)"
         }
       }
     }

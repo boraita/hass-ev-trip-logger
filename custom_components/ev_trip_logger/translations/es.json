@@ -24,7 +24,7 @@
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
           "energy_price_kwh": "Precio en casa por kWh (default cuando no hay carga registrada)",
           "currency": "Moneda",
-          "home_zone": "Nombre de la zona 'casa' (cierra journeys cuando el device tracker entra)"
+          "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)"
         }
       },
       "reconfigure": {
@@ -46,7 +46,7 @@
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
           "energy_price_kwh": "Precio en casa por kWh (default cuando no hay carga registrada)",
           "currency": "Moneda",
-          "home_zone": "Nombre de la zona 'casa' (cierra journeys cuando el device tracker entra)"
+          "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)"
         }
       }
     }

@@ -143,8 +143,8 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): TextSelector(),
             vol.Required(
                 CONF_HOME_ZONE,
-                default=defaults.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE),
-            ): TextSelector(),
+                default=defaults.get(CONF_HOME_ZONE, "zone.home"),
+            ): EntitySelector(EntitySelectorConfig(domain="zone")),
         }
     )
 
@@ -259,8 +259,8 @@ class EvTripLoggerOptionsFlow(OptionsFlow):
                     ): TextSelector(),
                     vol.Required(
                         CONF_HOME_ZONE,
-                        default=defaults.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE),
-                    ): TextSelector(),
+                        default=defaults.get(CONF_HOME_ZONE, "zone.home"),
+                    ): EntitySelector(EntitySelectorConfig(domain="zone")),
                 }
             ),
         )
