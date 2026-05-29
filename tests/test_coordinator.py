@@ -195,6 +195,39 @@ async def test_delete_last_trip_service_removes_record(hass: HomeAssistant) -> N
     assert coordinator.last_trip is None
 
 
+async def test_odo_jump_creates_synthetic_trip(hass: HomeAssistant) -> None:
+    """A big odometer increase without vehicle_on going to on backfills a trip."""
+    entry = await _setup(hass, **{CONF_MIN_TRIP_DISTANCE: 2.0})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator.last_trip is None
+
+    # Baseline reading: odometer is at 1000, battery at 80 (from _setup)
+    hass.states.async_set(BAT, "80")  # bump to refresh snapshot
+    await hass.async_block_till_done()
+
+    # Cloud poll happens later: odo suddenly +18 km, battery -8% — no vehicle_on toggle.
+    hass.states.async_set(ODO, "1018")
+    hass.states.async_set(BAT, "72")
+    await hass.async_block_till_done()
+
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.distance_km == pytest.approx(18.0)
+    assert coordinator.last_trip.soc_used_pct == pytest.approx(8.0)
+    assert coordinator.last_trip.energy_kwh == pytest.approx(8.0 / 100 * 75)  # 6.0
+
+
+async def test_odo_jump_below_threshold_does_nothing(hass: HomeAssistant) -> None:
+    """Tiny odo movement (under min_trip_distance) does NOT create a synthetic trip."""
+    entry = await _setup(hass, **{CONF_MIN_TRIP_DISTANCE: 2.0})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    await hass.async_block_till_done()
+
+    hass.states.async_set(ODO, "1001")  # +1 km, below 2.0 threshold
+    await hass.async_block_till_done()
+
+    assert coordinator.last_trip is None
+
+
 async def test_battery_energy_and_to_full_sensors(hass: HomeAssistant) -> None:
     """Battery-derived sensors track the source SoC live, even when idle."""
     entry = await _setup(hass)

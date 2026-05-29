@@ -123,6 +123,10 @@ class EvTripLoggerCoordinator:
         self.current_charge: ChargeInProgress | None = None
         self.current_journey_id: int | None = None
         self.last_completed_journey_id: int | None = None
+        # Snapshot of (timestamp, odo, soc) at the last reading while no trip
+        # was open. Used to recover trips that cloud-polling integrations miss
+        # because `vehicle_on` flips on and off between polls.
+        self._last_idle_odo: tuple[datetime, float, float | None] | None = None
 
         self._unsub_state: CALLBACK_TYPE | None = None
         self._unsub_metrics: CALLBACK_TYPE | None = None
@@ -199,6 +203,14 @@ class EvTripLoggerCoordinator:
             and self.last_trip.destination != self._home_zone
         ):
             self.current_journey_id = self.last_trip.journey_id
+        # Seed the odo-jump snapshot from the last trip if available so we can
+        # detect missed trips that happened while HA was down.
+        if self.last_trip is not None and self.last_trip.odometer_end is not None:
+            self._last_idle_odo = (
+                self.last_trip.ended_at,
+                self.last_trip.odometer_end,
+                self.last_trip.soc_end,
+            )
         self.last_completed_journey_id = (
             await self.storage.async_last_completed_journey_id(self.current_journey_id)
         )
@@ -322,6 +334,126 @@ class EvTripLoggerCoordinator:
             if soc is not None:
                 self.current_charge.last_seen_soc = soc
         self._notify_listeners()
+        if self.current is None:
+            self.hass.async_create_task(self._async_check_odo_jump())
+
+    async def _async_check_odo_jump(self) -> None:
+        """If the odo jumped > min_distance while idle, backfill a trip.
+
+        Catches trips that cloud-polling integrations miss because vehicle_on
+        toggles between two polls.
+        """
+        odo = self._read_float(self._odometer)
+        if odo is None:
+            return
+        now = dt_util.now()
+        soc = self._read_float(self._battery)
+        prev = self._last_idle_odo
+        # Refresh snapshot regardless — post-jump reading is the new baseline.
+        self._last_idle_odo = (now, odo, soc)
+        if prev is None:
+            return
+        prev_t, prev_odo, prev_soc = prev
+        delta = odo - prev_odo
+        if delta < self._min_distance:
+            return
+        await self._async_log_synthetic_trip(prev_t, now, prev_odo, odo, prev_soc, soc)
+
+    async def _async_log_synthetic_trip(
+        self,
+        started_at: datetime,
+        ended_at: datetime,
+        odo_s: float,
+        odo_e: float,
+        soc_s: float | None,
+        soc_e: float | None,
+    ) -> None:
+        distance = odo_e - odo_s
+        duration_min = max(0.1, (ended_at - started_at).total_seconds() / 60.0)
+        soc_used = (
+            soc_s - soc_e
+            if soc_s is not None and soc_e is not None and soc_s > soc_e
+            else None
+        )
+        energy = (
+            (soc_used / 100.0) * self._battery_capacity
+            if soc_used is not None
+            else None
+        )
+        consumption = (
+            (energy / distance * 100.0) if energy and distance > 0 else None
+        )
+        avg_speed = (
+            (distance / (duration_min / 60.0))
+            if duration_min > 0 and distance > 0
+            else None
+        )
+        if avg_speed is not None and avg_speed > 300:
+            avg_speed = None
+        price_per_kwh = (
+            self.last_charge.price_per_kwh
+            if self.last_charge is not None
+            else self._energy_price
+        )
+        cost = energy * price_per_kwh if energy and energy > 0 else None
+        location_start = self.last_trip.destination if self.last_trip else None
+        location_end = self._read_str(self._location) if self._location else None
+        started_from_home = location_start == self._home_zone
+        is_at_home_end = location_end == self._home_zone
+        if started_from_home and self.current_journey_id is not None:
+            self.last_completed_journey_id = self.current_journey_id
+            self.current_journey_id = None
+        if self.current_journey_id is not None:
+            journey_id: int | None = self.current_journey_id
+        elif started_from_home:
+            journey_id = await self.storage.async_next_journey_id()
+        else:
+            journey_id = None
+
+        record = TripRecord(
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_min=duration_min,
+            distance_km=distance,
+            odometer_start=odo_s,
+            odometer_end=odo_e,
+            soc_start=soc_s,
+            soc_end=soc_e,
+            soc_used_pct=soc_used,
+            energy_kwh=energy,
+            consumption_kwh_100km=consumption,
+            avg_speed_kmh=avg_speed,
+            avg_temp_c=None,
+            origin=location_start,
+            destination=location_end,
+            cost=cost,
+            currency=self._currency if cost is not None else None,
+            journey_id=journey_id,
+        )
+        trip_id = await self.storage.async_insert(record)
+        record.trip_id = trip_id
+        self.last_trip = record
+        if is_at_home_end and journey_id is not None:
+            self.last_completed_journey_id = journey_id
+            self.current_journey_id = None
+        else:
+            self.current_journey_id = journey_id
+
+        self.hass.bus.async_fire(
+            EVENT_TRIP_ENDED,
+            {
+                "entry_id": self.entry_id,
+                **record.to_dict(),
+                "synthetic": True,
+                "reason": "odometer jump (vehicle_on never reported on)",
+            },
+        )
+        _LOGGER.info(
+            "Synthetic trip #%s from odo jump: %.2f km / %.1f min",
+            trip_id, distance, duration_min,
+        )
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
 
     @callback
     def _async_power_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -591,6 +723,9 @@ class EvTripLoggerCoordinator:
             {"entry_id": self.entry_id, **record.to_dict()},
         )
         _LOGGER.debug("Trip #%s closed: %.2f km / %.1f min", trip_id, distance, duration_min)
+        # Reset odo-jump baseline to the trip-end values so the next idle
+        # reading doesn't compare against a stale snapshot.
+        self._last_idle_odo = (now, odometer_end, soc_end) if odometer_end is not None else None
         self._notify_listeners()
         self._notify_trip_log_listeners()
 
