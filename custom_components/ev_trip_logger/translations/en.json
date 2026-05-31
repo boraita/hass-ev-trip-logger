@@ -95,6 +95,10 @@
       "current_consumption": { "name": "Current trip consumption" },
       "current_avg_temperature": { "name": "Current trip avg. temperature" },
       "current_max_power": { "name": "Current trip max power" },
+      "current_max_speed": { "name": "Current trip max speed" },
+      "current_regen_energy": { "name": "Current trip regen energy" },
+      "last_max_speed": { "name": "Last trip max speed" },
+      "last_regen_energy": { "name": "Last trip regen energy" },
       "last_distance": { "name": "Last trip distance" },
       "last_duration": { "name": "Last trip duration" },
       "last_avg_speed": { "name": "Last trip average speed" },
@@ -122,6 +126,8 @@
       "spent_charging_this_month": { "name": "Spent on charging this month" },
       "charges_this_month": { "name": "Charges this month" },
       "avg_charge_price_30d": { "name": "Avg. charge price (30 days)" },
+      "avg_ac_charge_price_30d": { "name": "Avg. AC charge price (30 days)" },
+      "avg_dc_charge_price_30d": { "name": "Avg. DC fast-charge price (30 days)" },
       "recent_trips": { "name": "Recent trips" },
       "recent_charges": { "name": "Recent charges" },
       "charge_in_progress": { "name": "Charge in progress" },
@@ -130,7 +136,9 @@
       "recent_journeys": { "name": "Recent journeys" },
       "battery_energy": { "name": "Battery energy" },
       "energy_to_full": { "name": "Energy to full charge" },
-      "battery_state": { "name": "Battery percent" }
+      "battery_state": { "name": "Battery percent" },
+      "range_at_recent_efficiency": { "name": "Range at recent efficiency" },
+      "consumption_by_temp_bucket": { "name": "Consumption by temperature" }
     }
   }
 }

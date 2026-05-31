@@ -161,6 +161,27 @@ _TRIP_FIELDS: list[TripSensorMeta] = [
             diagnostic=True,
         ),
     ),
+    TripSensorMeta(
+        key="max_speed_kmh",
+        description=_desc(
+            "max_speed",
+            unit=UnitOfSpeed.KILOMETERS_PER_HOUR,
+            device_class=SensorDeviceClass.SPEED,
+            suggested_precision=0,
+            diagnostic=True,
+        ),
+    ),
+    TripSensorMeta(
+        key="regen_kwh",
+        description=_desc(
+            "regen_energy",
+            unit=UnitOfEnergy.KILO_WATT_HOUR,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL,
+            suggested_precision=2,
+            diagnostic=True,
+        ),
+    ),
 ]
 
 
@@ -203,6 +224,8 @@ async def async_setup_entry(
     entities.append(BatteryEnergySensor(coordinator))
     entities.append(EnergyToFullSensor(coordinator))
     entities.append(BatteryPercentSensor(coordinator))
+    entities.append(RangeAtRecentEfficiencySensor(coordinator))
+    entities.append(ConsumptionByTempBucketSensor(coordinator))
 
     entities.extend(
         [
@@ -213,6 +236,8 @@ async def async_setup_entry(
             ChargesAggregateSensor(coordinator, period="month", key="total_cost"),
             ChargesAggregateSensor(coordinator, period="month", key="count"),
             ChargesAggregateSensor(coordinator, period="30d", key="avg_price_per_kwh"),
+            ChargesAggregateSensor(coordinator, period="30d", key="avg_ac_price_per_kwh"),
+            ChargesAggregateSensor(coordinator, period="30d", key="avg_dc_price_per_kwh"),
         ]
     )
 
@@ -985,6 +1010,20 @@ class ChargesAggregateSensor(_BaseTripSensor):
             "precision": 4,
             "slug": "avg_charge_price",
         },
+        "avg_ac_price_per_kwh": {
+            "device_class": SensorDeviceClass.MONETARY,
+            "state_class": None,
+            "icon": "mdi:home-lightning-bolt",
+            "precision": 4,
+            "slug": "avg_ac_charge_price",
+        },
+        "avg_dc_price_per_kwh": {
+            "device_class": SensorDeviceClass.MONETARY,
+            "state_class": None,
+            "icon": "mdi:ev-station",
+            "precision": 4,
+            "slug": "avg_dc_charge_price",
+        },
     }
 
     _PERIOD_SUFFIX = {
@@ -1005,8 +1044,12 @@ class ChargesAggregateSensor(_BaseTripSensor):
         self._value: float | int | None = None
 
         slug = f"{cfg['slug']}_{self._PERIOD_SUFFIX[period]}"
-        # avg_charge_price is more of a stats curiosity than a daily check.
-        is_diagnostic = key == "avg_price_per_kwh"
+        # avg_*_price_per_kwh are stats curiosities, not daily checks.
+        is_diagnostic = key in (
+            "avg_price_per_kwh",
+            "avg_ac_price_per_kwh",
+            "avg_dc_price_per_kwh",
+        )
         self.entity_description = SensorEntityDescription(
             key=slug,
             translation_key=slug,
@@ -1045,3 +1088,146 @@ class ChargesAggregateSensor(_BaseTripSensor):
     @property
     def native_value(self) -> float | int | None:
         return self._value
+
+
+class RangeAtRecentEfficiencySensor(_BaseTripSensor):
+    """Estimated remaining range from current battery energy and 30-day consumption.
+
+    Formula:  range_km = battery_energy_kwh / (avg_consumption_30d / 100)
+
+    More honest than the car dash's WLTP/EPA estimate because it uses *your*
+    actual recent driving efficiency, including HVAC and temperature.
+    """
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="range_at_recent_efficiency",
+            translation_key="range_at_recent_efficiency",
+            native_unit_of_measurement=UnitOfLength.KILOMETERS,
+            device_class=SensorDeviceClass.DISTANCE,
+            state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:map-marker-distance",
+            suggested_display_precision=0,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_range_at_recent_efficiency"
+        self._value: float | None = None
+        self._based_on_kwh_per_100km: float | None = None
+        self._sample_count: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_listener(self._on_listener)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _on_listener(self) -> None:
+        # Battery moves → re-derive without hitting storage.
+        soc = self._coordinator.battery_level
+        if soc is None or self._based_on_kwh_per_100km is None:
+            return
+        battery_energy = soc / 100.0 * self._coordinator.battery_capacity
+        if self._based_on_kwh_per_100km > 0:
+            self._value = round(
+                battery_energy / (self._based_on_kwh_per_100km / 100.0), 1
+            )
+            self.async_write_ha_state()
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        since = period_start(dt_util.now(), "30d")
+        agg = await self._coordinator.storage.async_aggregates_since(since)
+        cons = agg.get("avg_consumption_kwh_100km") or 0.0
+        self._sample_count = int(agg.get("count") or 0)
+        self._based_on_kwh_per_100km = cons if cons > 0 else None
+        self._on_listener()  # write_ha_state via the same path
+        if self._value is None:
+            self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "based_on_kwh_per_100km": self._based_on_kwh_per_100km,
+            "sample_count": self._sample_count,
+        }
+
+
+class ConsumptionByTempBucketSensor(_BaseTripSensor):
+    """Consumption (kWh/100km) bucketed by outdoor temperature over the last 90 days.
+
+    State = the consumption for the bucket the *current* outside temperature
+    falls into, so the value flips between e.g. "winter consumption" and
+    "summer consumption" automatically. The full bucket map is exposed in
+    attributes for dashboard charts.
+    """
+
+    _BUCKET_SIZE_C = 5.0
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="consumption_by_temp_bucket",
+            translation_key="consumption_by_temp_bucket",
+            native_unit_of_measurement="kWh/100km",
+            icon="mdi:thermometer-lines",
+            suggested_display_precision=1,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_consumption_by_temp_bucket"
+        self._buckets: dict[str, float] = {}
+        self._sample_count: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        since = dt_util.now() - timedelta(days=90)
+        result = await self._coordinator.storage.async_consumption_by_temp_bucket(
+            since, self._BUCKET_SIZE_C
+        )
+        self._buckets = result.get("by_bucket", {})
+        self._sample_count = int(result.get("sample_count", 0))
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        """The kWh/100km of the bucket the current outside temp falls into."""
+        if not self._buckets:
+            return None
+        temp = self._coordinator.exterior_temp
+        if temp is None:
+            return None
+        bucket = int((temp // self._BUCKET_SIZE_C) * self._BUCKET_SIZE_C)
+        return self._buckets.get(str(bucket))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "by_bucket": self._buckets,
+            "bucket_size_c": self._BUCKET_SIZE_C,
+            "sample_count": self._sample_count,
+        }

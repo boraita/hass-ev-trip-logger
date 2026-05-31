@@ -132,6 +132,10 @@ Replace `sensor.my_ev_*` with whatever you named your device.
 - `ev_trip_logger.delete_last_trip`.
 - `ev_trip_logger.export_csv` — dump all trips to a CSV path.
 
+## Pairing with ABRP (A Better Routeplanner)
+
+This integration **logs and summarises** trips after the fact — it is *not* a live telemetry pusher. If you want ABRP to predict routes using your car, install the dedicated **ABRP Telemetry** HACS integration (`iternio/abrp-telemetry`) alongside this one. Point it at the same `power`, `battery`, `device_tracker` and `exterior_temp_sensor` entities you configured here and it'll handle the 5-second live push. The two integrations are complementary: ABRP for routing, this one for history and per-trip insight.
+
 ## Events for automations
 
 - `ev_trip_logger_trip_started` / `ev_trip_logger_trip_ended` — fires with full trip data.

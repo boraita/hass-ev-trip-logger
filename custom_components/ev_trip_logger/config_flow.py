@@ -33,6 +33,7 @@ from .const import (
     CONF_NAME,
     CONF_ODOMETER,
     CONF_POWER,
+    CONF_SPEED,
     CONF_TEMP,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
@@ -104,6 +105,14 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="temperature")
+            ),
+            _optional(
+                CONF_SPEED,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="speed")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="speed")
             ),
             vol.Required(
                 CONF_BATTERY_CAPACITY,

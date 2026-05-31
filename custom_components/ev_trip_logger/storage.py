@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS trips (
     consumption_kwh_100km REAL,
     avg_speed_kmh REAL,
     max_power_kw REAL,
+    max_speed_kmh REAL,
+    regen_kwh REAL,
     avg_temp_c REAL,
     origin TEXT,
     destination TEXT,
@@ -50,7 +52,8 @@ CREATE TABLE IF NOT EXISTS charges (
     soc_start REAL,
     soc_end REAL,
     location TEXT,
-    notes TEXT
+    notes TEXT,
+    is_dcfc INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_charges_ended_at ON charges(ended_at);
 """
@@ -73,6 +76,8 @@ class TripRecord:
     consumption_kwh_100km: float | None = None
     avg_speed_kmh: float | None = None
     max_power_kw: float | None = None
+    max_speed_kmh: float | None = None
+    regen_kwh: float | None = None
     avg_temp_c: float | None = None
     origin: str | None = None
     destination: str | None = None
@@ -110,6 +115,8 @@ class TripRecord:
             "consumption_kwh_100km": self.consumption_kwh_100km,
             "avg_speed_kmh": self.avg_speed_kmh,
             "max_power_kw": self.max_power_kw,
+            "max_speed_kmh": self.max_speed_kmh,
+            "regen_kwh": self.regen_kwh,
             "avg_temp_c": self.avg_temp_c,
             "origin": self.origin,
             "destination": self.destination,
@@ -132,6 +139,7 @@ class ChargeRecord:
     soc_end: float | None = None
     location: str | None = None
     notes: str | None = None
+    is_dcfc: bool | None = None
     charge_id: int | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -147,6 +155,7 @@ class ChargeRecord:
             "soc_end": self.soc_end,
             "location": self.location,
             "notes": self.notes,
+            "is_dcfc": self.is_dcfc,
         }
 
 
@@ -172,13 +181,24 @@ class TripStorage:
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
         """Apply additive migrations on existing databases."""
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()}
-        if "journey_id" not in cols:
+        trip_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()
+        }
+        if "journey_id" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN journey_id INTEGER")
+        if "regen_kwh" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN regen_kwh REAL")
+        if "max_speed_kmh" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN max_speed_kmh REAL")
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
         )
+        charge_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(charges)").fetchall()
+        }
+        if "is_dcfc" not in charge_cols:
+            conn.execute("ALTER TABLE charges ADD COLUMN is_dcfc INTEGER")
 
     async def async_insert(self, record: TripRecord) -> int:
         """Persist a completed trip, return its id."""
@@ -192,8 +212,9 @@ class TripStorage:
                     started_at, ended_at, duration_min, distance_km,
                     odometer_start, odometer_end, soc_start, soc_end, soc_used_pct,
                     energy_kwh, consumption_kwh_100km, avg_speed_kmh, max_power_kw,
+                    max_speed_kmh, regen_kwh,
                     avg_temp_c, origin, destination, cost, currency, journey_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -209,6 +230,8 @@ class TripStorage:
                     record.consumption_kwh_100km,
                     record.avg_speed_kmh,
                     record.max_power_kw,
+                    record.max_speed_kmh,
+                    record.regen_kwh,
                     record.avg_temp_c,
                     record.origin,
                     record.destination,
@@ -439,8 +462,8 @@ class TripStorage:
                 """
                 INSERT INTO charges (
                     started_at, ended_at, kwh, price_per_kwh, total_cost,
-                    currency, soc_start, soc_end, location, notes
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    currency, soc_start, soc_end, location, notes, is_dcfc
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat() if record.started_at else None,
@@ -453,6 +476,7 @@ class TripStorage:
                     record.soc_end,
                     record.location,
                     record.notes,
+                    int(record.is_dcfc) if record.is_dcfc is not None else None,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -543,18 +567,76 @@ class TripStorage:
                 SELECT
                     COALESCE(SUM(kwh), 0) AS kwh,
                     COALESCE(SUM(total_cost), 0) AS cost,
-                    COUNT(*) AS count
+                    COUNT(*) AS count,
+                    COALESCE(SUM(CASE WHEN is_dcfc = 1 THEN kwh ELSE 0 END), 0) AS dc_kwh,
+                    COALESCE(SUM(CASE WHEN is_dcfc = 1 THEN total_cost ELSE 0 END), 0) AS dc_cost,
+                    COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN kwh ELSE 0 END), 0) AS ac_kwh,
+                    COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN total_cost ELSE 0 END), 0) AS ac_cost
                 FROM charges WHERE ended_at >= ?
                 """,
                 (since.isoformat(),),
             ).fetchone()
-        kwh, cost, count = row
+        kwh, cost, count, dc_kwh, dc_cost, ac_kwh, ac_cost = row
         avg_price = (cost / kwh) if kwh else 0.0
         return {
             "kwh": float(kwh),
             "total_cost": float(cost),
             "count": int(count),
             "avg_price_per_kwh": float(avg_price),
+            "ac_kwh": float(ac_kwh),
+            "ac_total_cost": float(ac_cost),
+            "avg_ac_price_per_kwh": float(ac_cost / ac_kwh) if ac_kwh else 0.0,
+            "dc_kwh": float(dc_kwh),
+            "dc_total_cost": float(dc_cost),
+            "avg_dc_price_per_kwh": float(dc_cost / dc_kwh) if dc_kwh else 0.0,
+        }
+
+    async def async_consumption_by_temp_bucket(
+        self, since: datetime, bucket_size_c: float = 5.0
+    ) -> dict[str, float | int]:
+        """Mean kWh/100km grouped by avg_temp_c bins (size `bucket_size_c`).
+
+        Returns: {"by_bucket": {bucket_label: avg_consumption}, "bucket_size_c": float}.
+        Trips without avg_temp_c or consumption are skipped. Buckets are
+        labelled by their lower bound (e.g. "0", "5", "10").
+        """
+        return await self._hass.async_add_executor_job(
+            self._consumption_by_temp_bucket, since, bucket_size_c
+        )
+
+    def _consumption_by_temp_bucket(
+        self, since: datetime, bucket_size_c: float
+    ) -> dict[str, Any]:
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                """
+                SELECT avg_temp_c, consumption_kwh_100km, distance_km
+                FROM trips
+                WHERE started_at >= ?
+                  AND avg_temp_c IS NOT NULL
+                  AND consumption_kwh_100km IS NOT NULL
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+        # Distance-weighted mean per bucket so a 5-km commute doesn't
+        # outweigh a 200-km motorway leg at the same temperature.
+        sums: dict[int, float] = {}
+        dists: dict[int, float] = {}
+        for temp, cons, dist in rows:
+            if dist is None or dist <= 0:
+                continue
+            bucket = int((temp // bucket_size_c) * bucket_size_c)
+            sums[bucket] = sums.get(bucket, 0.0) + cons * dist
+            dists[bucket] = dists.get(bucket, 0.0) + dist
+        by_bucket = {
+            str(b): round(sums[b] / dists[b], 2)
+            for b in sorted(sums)
+            if dists[b] > 0
+        }
+        return {
+            "by_bucket": by_bucket,
+            "bucket_size_c": bucket_size_c,
+            "sample_count": len(rows),
         }
 
     async def async_export_csv(self, path: str) -> int:
@@ -594,6 +676,8 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         consumption_kwh_100km=row["consumption_kwh_100km"],
         avg_speed_kmh=row["avg_speed_kmh"],
         max_power_kw=row["max_power_kw"],
+        max_speed_kmh=row["max_speed_kmh"] if "max_speed_kmh" in row.keys() else None,
+        regen_kwh=row["regen_kwh"] if "regen_kwh" in row.keys() else None,
         avg_temp_c=row["avg_temp_c"],
         origin=row["origin"],
         destination=row["destination"],
@@ -604,6 +688,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
 
 
 def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
+    is_dcfc_raw = row["is_dcfc"] if "is_dcfc" in row.keys() else None
     return ChargeRecord(
         charge_id=row["id"],
         started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
@@ -616,6 +701,7 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
         soc_end=row["soc_end"],
         location=row["location"],
         notes=row["notes"],
+        is_dcfc=bool(is_dcfc_raw) if is_dcfc_raw is not None else None,
     )
 
 

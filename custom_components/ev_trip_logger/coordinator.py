@@ -41,10 +41,13 @@ from .const import (
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
     CONF_ODOMETER,
+    CONF_DCFC_THRESHOLD_KW,
     CONF_POWER,
+    CONF_SPEED,
     CONF_TEMP,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_DCFC_THRESHOLD_KW,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
     DEFAULT_HOME_ZONE,
@@ -81,6 +84,13 @@ class TripInProgress:
     location_start: str | None
     temp_samples: list[float] = field(default_factory=list)
     max_power: float = 0.0
+    max_speed_kmh: float = 0.0
+    # Trapezoidal-integrated negative-side battery power (kWh recovered via
+    # regenerative braking). Updated on every power-sensor change while the
+    # trip is open.
+    regen_kwh: float = 0.0
+    last_power_kw: float | None = None
+    last_power_ts: datetime | None = None
     last_seen_odometer: float | None = None
     last_seen_soc: float | None = None
 
@@ -115,9 +125,13 @@ class EvTripLoggerCoordinator:
         self._charge_sensor = merged.get(CONF_CHARGE_SENSOR)
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
+        self._speed = merged.get(CONF_SPEED)
 
         self._battery_capacity = float(
             merged.get(CONF_BATTERY_CAPACITY, DEFAULT_BATTERY_CAPACITY)
+        )
+        self._dcfc_threshold_kw = float(
+            merged.get(CONF_DCFC_THRESHOLD_KW, DEFAULT_DCFC_THRESHOLD_KW)
         )
         self._min_distance = float(
             merged.get(CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE)
@@ -142,6 +156,7 @@ class EvTripLoggerCoordinator:
         self._unsub_metrics: CALLBACK_TYPE | None = None
         self._unsub_power: CALLBACK_TYPE | None = None
         self._unsub_temp: CALLBACK_TYPE | None = None
+        self._unsub_speed: CALLBACK_TYPE | None = None
         self._unsub_charge: CALLBACK_TYPE | None = None
         self._unsub_idle: CALLBACK_TYPE | None = None
         self._unsub_live_tick: CALLBACK_TYPE | None = None
@@ -202,6 +217,11 @@ class EvTripLoggerCoordinator:
     def battery_level(self) -> float | None:
         """Current SoC % from the configured battery sensor, None if unreadable."""
         return self._read_float(self._battery)
+
+    @property
+    def exterior_temp(self) -> float | None:
+        """Configured outside-temperature sensor value, None if unset/unreadable."""
+        return self._read_float(self._temp) if self._temp else None
 
     def async_add_listener(self, update: Callable[[], None]) -> Callable[[], None]:
         """Subscribe a sensor to coordinator updates."""
@@ -272,6 +292,10 @@ class EvTripLoggerCoordinator:
             self._unsub_temp = async_track_state_change_event(
                 self.hass, [self._temp], self._async_temp_changed
             )
+        if self._speed:
+            self._unsub_speed = async_track_state_change_event(
+                self.hass, [self._speed], self._async_speed_changed
+            )
         if self._charge_sensor:
             self._unsub_charge = async_track_state_change_event(
                 self.hass, [self._charge_sensor], self._async_charge_sensor_changed
@@ -320,6 +344,7 @@ class EvTripLoggerCoordinator:
             self._unsub_metrics,
             self._unsub_power,
             self._unsub_temp,
+            self._unsub_speed,
             self._unsub_charge,
             self._unsub_idle,
             self._unsub_live_tick,
@@ -330,6 +355,7 @@ class EvTripLoggerCoordinator:
                 unsub()
         self._unsub_state = self._unsub_metrics = None
         self._unsub_power = self._unsub_temp = self._unsub_idle = None
+        self._unsub_speed = None
         self._unsub_charge = self._unsub_live_tick = None
         self._unsub_synth_finalize = None
         self._unsub_location = None
@@ -624,6 +650,38 @@ class EvTripLoggerCoordinator:
         if value is None:
             return
         self.current.max_power = max(self.current.max_power, abs(value))
+        # Trapezoidal regen integration: when the prior sample was negative
+        # (battery discharging in reverse → regen) we accumulate the area
+        # under that half of the curve. Convention here: discharge power
+        # is positive (BYD reports it that way), so regen = -power values.
+        now = dt_util.now()
+        prev_kw = self.current.last_power_kw
+        prev_ts = self.current.last_power_ts
+        if prev_kw is not None and prev_ts is not None:
+            dt_h = (now - prev_ts).total_seconds() / 3600.0
+            if 0 < dt_h < 1.0:  # sanity-bound: skip samples with >1h gap
+                # Take the negative portion of each endpoint (regen only).
+                a = -min(prev_kw, 0.0)
+                b = -min(value, 0.0)
+                self.current.regen_kwh += (a + b) / 2.0 * dt_h
+        self.current.last_power_kw = value
+        self.current.last_power_ts = now
+        self._notify_listeners()
+
+    @callback
+    def _async_speed_changed(self, event: Event[EventStateChangedData]) -> None:
+        if self.current is None:
+            return
+        value = self._read_float(self._speed)
+        if value is None:
+            return
+        # Sanity cap — BYD has occasionally reported sub-second odo jumps as
+        # nonsense speeds elsewhere; the speed sensor is direct but still
+        # bound it to a physically plausible ceiling.
+        if value > 300:
+            return
+        if value > self.current.max_speed_kmh:
+            self.current.max_speed_kmh = value
         self._notify_listeners()
 
     _AUTO_CHARGE_DEDUP_WINDOW_S = 300  # 5 min — skip auto if a manual charge just logged
@@ -676,6 +734,7 @@ class EvTripLoggerCoordinator:
             kwh=kwh,
             location=location or "auto",
             notes=f"auto-detected from {self._charge_sensor}",
+            started_at=active.started_at,
         )
 
     @callback
@@ -864,6 +923,8 @@ class EvTripLoggerCoordinator:
             consumption_kwh_100km=consumption,
             avg_speed_kmh=avg_speed,
             max_power_kw=active.max_power or None,
+            max_speed_kmh=active.max_speed_kmh or None,
+            regen_kwh=active.regen_kwh or None,
             avg_temp_c=avg_temp,
             origin=active.location_start,
             destination=location_end,
@@ -914,12 +975,18 @@ class EvTripLoggerCoordinator:
         currency: str | None = None,
         location: str | None = None,
         notes: str | None = None,
+        started_at: datetime | None = None,
+        is_dcfc: bool | None = None,
     ) -> ChargeRecord:
         """Persist a charge session.
 
         Provide one of: total_cost, price_per_kwh. If neither, falls back to
         the configured home price. The missing one is derived from kwh.
         Location defaults to the configured device_tracker's state.
+
+        `is_dcfc` defaults to a duration-based heuristic: when `started_at`
+        is provided and avg power > _dcfc_threshold_kw, the session is
+        classified as DC fast-charge. Callers can override explicitly.
         """
         now = dt_util.now()
         kwh = float(kwh)
@@ -935,7 +1002,14 @@ class EvTripLoggerCoordinator:
         if location is None and self._location:
             location = self._read_str(self._location)
 
+        if is_dcfc is None and started_at is not None:
+            duration_h = (now - started_at).total_seconds() / 3600.0
+            if duration_h > 0:
+                avg_kw = kwh / duration_h
+                is_dcfc = avg_kw > self._dcfc_threshold_kw
+
         record = ChargeRecord(
+            started_at=started_at,
             ended_at=now,
             kwh=kwh,
             price_per_kwh=price_per_kwh,
@@ -944,6 +1018,7 @@ class EvTripLoggerCoordinator:
             soc_end=self._read_float(self._battery),
             location=location,
             notes=notes,
+            is_dcfc=is_dcfc,
         )
         charge_id = await self.storage.async_insert_charge(record)
         record.charge_id = charge_id
@@ -1220,6 +1295,8 @@ class EvTripLoggerCoordinator:
             "consumption_kwh_100km": consumption,
             "avg_temp_c": avg_temp,
             "max_power_kw": active.max_power or None,
+            "max_speed_kmh": active.max_speed_kmh or None,
+            "regen_kwh": active.regen_kwh or None,
             "cost": cost,
             "score": score,
         }

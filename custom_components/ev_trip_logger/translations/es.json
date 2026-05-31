@@ -95,6 +95,10 @@
       "current_consumption": { "name": "Consumo del viaje actual" },
       "current_avg_temperature": { "name": "Temperatura media del viaje actual" },
       "current_max_power": { "name": "Potencia máxima del viaje actual" },
+      "current_max_speed": { "name": "Velocidad máxima del viaje actual" },
+      "current_regen_energy": { "name": "Energía regenerada (viaje actual)" },
+      "last_max_speed": { "name": "Velocidad máxima del último viaje" },
+      "last_regen_energy": { "name": "Energía regenerada (último viaje)" },
       "last_distance": { "name": "Distancia del último viaje" },
       "last_duration": { "name": "Duración del último viaje" },
       "last_avg_speed": { "name": "Velocidad media del último viaje" },
@@ -122,6 +126,8 @@
       "spent_charging_this_month": { "name": "Gastado en cargar este mes" },
       "charges_this_month": { "name": "Cargas este mes" },
       "avg_charge_price_30d": { "name": "Precio medio de carga (30 días)" },
+      "avg_ac_charge_price_30d": { "name": "Precio medio carga AC (30 días)" },
+      "avg_dc_charge_price_30d": { "name": "Precio medio carga DC rápida (30 días)" },
       "recent_trips": { "name": "Viajes recientes" },
       "recent_charges": { "name": "Cargas recientes" },
       "charge_in_progress": { "name": "Carga en curso" },
@@ -130,7 +136,9 @@
       "recent_journeys": { "name": "Viajes recientes (completos)" },
       "battery_energy": { "name": "Energía en batería" },
       "energy_to_full": { "name": "Energía hasta el 100%" },
-      "battery_state": { "name": "Porcentaje batería" }
+      "battery_state": { "name": "Porcentaje batería" },
+      "range_at_recent_efficiency": { "name": "Autonomía según consumo reciente" },
+      "consumption_by_temp_bucket": { "name": "Consumo por temperatura" }
     }
   }
 }

@@ -22,6 +22,8 @@ from custom_components.ev_trip_logger.const import (
     CONF_MIN_TRIP_DISTANCE,
     CONF_NAME,
     CONF_ODOMETER,
+    CONF_POWER,
+    CONF_SPEED,
     CONF_VEHICLE_ON,
     DOMAIN,
     SERVICE_DELETE_LAST_CHARGE,
@@ -36,6 +38,8 @@ LOC = "device_tracker.byd_location"
 ODO = "sensor.odometer"
 BAT = "sensor.battery"
 VOK = "binary_sensor.vehicle_on"
+POW = "sensor.power"
+SPD = "sensor.speed"
 
 
 def _seed_states(hass: HomeAssistant, *, odo: float, bat: float, on: bool) -> None:
@@ -974,3 +978,118 @@ async def test_today_aggregate_sensor_refreshes_on_trip_close(
     refreshed = hass.states.get(today_distance_id)
     assert refreshed is not None
     assert float(refreshed.state) == pytest.approx(12.5)
+
+
+async def test_trip_record_persists_regen_and_max_speed(hass: HomeAssistant) -> None:
+    """Storage round-trips regen_kwh and max_speed_kmh on a TripRecord."""
+    from custom_components.ev_trip_logger.storage import TripRecord, TripStorage
+
+    entry = await _setup(hass)
+    storage: TripStorage = hass.data[DOMAIN][entry.entry_id].storage
+    record = TripRecord(
+        started_at=dt_util.now() - timedelta(minutes=30),
+        ended_at=dt_util.now(),
+        duration_min=30.0,
+        distance_km=22.0,
+        max_speed_kmh=118.5,
+        regen_kwh=1.84,
+    )
+    trip_id = await storage.async_insert(record)
+    assert trip_id > 0
+
+    fetched = await storage.async_get_last()
+    assert fetched is not None
+    assert fetched.regen_kwh == pytest.approx(1.84)
+    assert fetched.max_speed_kmh == pytest.approx(118.5)
+
+
+async def test_charge_record_persists_is_dcfc_flag(hass: HomeAssistant) -> None:
+    """Storage round-trips the is_dcfc flag on a ChargeRecord."""
+    from custom_components.ev_trip_logger.storage import ChargeRecord, TripStorage
+
+    entry = await _setup(hass)
+    storage: TripStorage = hass.data[DOMAIN][entry.entry_id].storage
+    dc_charge = ChargeRecord(
+        ended_at=dt_util.now(),
+        kwh=30.0,
+        price_per_kwh=0.40,
+        total_cost=12.0,
+        is_dcfc=True,
+    )
+    ac_charge = ChargeRecord(
+        ended_at=dt_util.now() + timedelta(seconds=1),
+        kwh=12.0,
+        price_per_kwh=0.07,
+        total_cost=0.84,
+        is_dcfc=False,
+    )
+    await storage.async_insert_charge(dc_charge)
+    await storage.async_insert_charge(ac_charge)
+
+    recent = await storage.async_recent_charges(limit=10)
+    flags = {c.kwh: c.is_dcfc for c in recent}
+    assert flags[30.0] is True
+    assert flags[12.0] is False
+
+
+async def test_charges_aggregates_segment_by_ac_dc(hass: HomeAssistant) -> None:
+    """Aggregates expose AC vs DC totals + avg prices separately."""
+    from custom_components.ev_trip_logger.storage import ChargeRecord, TripStorage
+
+    entry = await _setup(hass)
+    storage: TripStorage = hass.data[DOMAIN][entry.entry_id].storage
+    now = dt_util.now()
+    # Two AC sessions @ €0.07/kWh, one DC session @ €0.40/kWh.
+    await storage.async_insert_charge(ChargeRecord(
+        ended_at=now - timedelta(days=3), kwh=10.0, price_per_kwh=0.07,
+        total_cost=0.70, is_dcfc=False,
+    ))
+    await storage.async_insert_charge(ChargeRecord(
+        ended_at=now - timedelta(days=2), kwh=20.0, price_per_kwh=0.07,
+        total_cost=1.40, is_dcfc=False,
+    ))
+    await storage.async_insert_charge(ChargeRecord(
+        ended_at=now - timedelta(days=1), kwh=30.0, price_per_kwh=0.40,
+        total_cost=12.0, is_dcfc=True,
+    ))
+
+    agg = await storage.async_charges_aggregates_since(now - timedelta(days=30))
+    # AC: 30 kWh / €2.10 → avg €0.07/kWh
+    assert agg["ac_kwh"] == pytest.approx(30.0)
+    assert agg["avg_ac_price_per_kwh"] == pytest.approx(0.07)
+    # DC: 30 kWh / €12.00 → avg €0.40/kWh
+    assert agg["dc_kwh"] == pytest.approx(30.0)
+    assert agg["avg_dc_price_per_kwh"] == pytest.approx(0.40)
+    # Combined average is the blended €0.235/kWh — proving the segmented
+    # numbers are needed to see the truth.
+    assert agg["avg_price_per_kwh"] == pytest.approx(14.10 / 60.0)
+
+
+async def test_consumption_by_temp_bucket_groups_trips(hass: HomeAssistant) -> None:
+    """Trips bucket by avg_temp_c into 5°C bins, distance-weighted."""
+    from custom_components.ev_trip_logger.storage import TripRecord, TripStorage
+
+    entry = await _setup(hass)
+    storage: TripStorage = hass.data[DOMAIN][entry.entry_id].storage
+    base = dt_util.now() - timedelta(days=10)
+    # Winter trip: 5 °C, 20 kWh/100km, 50 km
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=30),
+        duration_min=30.0, distance_km=50.0, consumption_kwh_100km=20.0,
+        avg_temp_c=5.0,
+    ))
+    # Summer trip: 22 °C, 14 kWh/100km, 100 km
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=60),
+        duration_min=60.0, distance_km=100.0, consumption_kwh_100km=14.0,
+        avg_temp_c=22.0,
+    ))
+
+    buckets = await storage.async_consumption_by_temp_bucket(
+        base - timedelta(days=1), bucket_size_c=5.0
+    )
+    # 5 °C falls into bucket [5,10) → consumption 20.
+    assert buckets["by_bucket"]["5"] == pytest.approx(20.0)
+    # 22 °C falls into bucket [20,25) → consumption 14.
+    assert buckets["by_bucket"]["20"] == pytest.approx(14.0)
+    assert buckets["sample_count"] == 2

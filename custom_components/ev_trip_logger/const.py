@@ -15,8 +15,10 @@ CONF_POWER: Final = "power_sensor"
 CONF_CHARGE_SENSOR: Final = "charge_sensor"
 CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
+CONF_SPEED: Final = "speed_sensor"
 
 CONF_BATTERY_CAPACITY: Final = "battery_capacity_kwh"
+CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"
 CONF_MIN_TRIP_DISTANCE: Final = "min_trip_distance_km"
 CONF_IDLE_TIMEOUT: Final = "idle_timeout_minutes"
 CONF_ENERGY_PRICE: Final = "energy_price_kwh"
@@ -29,6 +31,10 @@ DEFAULT_IDLE_TIMEOUT: Final = 2
 DEFAULT_ENERGY_PRICE: Final = 0.15
 DEFAULT_CURRENCY: Final = "EUR"
 DEFAULT_HOME_ZONE: Final = "home"
+# Charges with average power above this kW threshold are classified as DC
+# fast-charge. 11 kW sits comfortably above the typical 3-phase 22 kW AC
+# floor in continental Europe (Type 2) and below any meaningful DCFC.
+DEFAULT_DCFC_THRESHOLD_KW: Final = 11.0
 
 EVENT_TRIP_STARTED: Final = f"{DOMAIN}_trip_started"
 EVENT_TRIP_ENDED: Final = f"{DOMAIN}_trip_ended"
