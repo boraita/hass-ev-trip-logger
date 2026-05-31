@@ -208,6 +208,7 @@ async def async_setup_entry(
             AggregateSensor(coordinator, period="week", key="distance_km"),
             AggregateSensor(coordinator, period="month", key="distance_km"),
             AggregateSensor(coordinator, period="year", key="distance_km"),
+            AggregateSensor(coordinator, period="today", key="count"),
             AggregateSensor(coordinator, period="month", key="energy_kwh"),
             AggregateSensor(coordinator, period="month", key="cost"),
             AggregateSensor(coordinator, period="month", key="count"),

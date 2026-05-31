@@ -83,6 +83,10 @@
     "log_manual_trip": {
       "name": "Log manual trip",
       "description": "Backfill a trip the live detector missed. Required: started_at, ended_at, and either distance_km or both odometer bounds."
+    },
+    "purge_trips": {
+      "name": "Purge trips",
+      "description": "Delete trips in a date range. Useful for cleaning up bad data from older integration versions."
     }
   },
   "entity": {
@@ -117,6 +121,7 @@
       "total_year_distance": { "name": "Distance this year" },
       "total_month_energy": { "name": "Energy this month" },
       "total_month_cost": { "name": "Cost this month" },
+      "total_today_count": { "name": "Trips today" },
       "total_month_count": { "name": "Trips this month" },
       "total_30d_avg_consumption": { "name": "Avg. consumption (30 days)" },
       "last_charge_kwh": { "name": "Last charge energy" },

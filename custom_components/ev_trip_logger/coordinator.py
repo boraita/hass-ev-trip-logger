@@ -1099,6 +1099,30 @@ class EvTripLoggerCoordinator:
             self._notify_trip_log_listeners()
         return deleted
 
+    async def async_purge_trips_service(
+        self, *, since: datetime | None = None, until: datetime | None = None
+    ) -> int:
+        """Delete every trip in [since, until]; refresh in-memory state."""
+        count = await self.storage.async_purge_trips(since=since, until=until)
+        if count:
+            self.last_trip = await self.storage.async_get_last()
+            # If the open journey's last stage is gone, reset journey state so
+            # the next stage opens a fresh one instead of attaching to a
+            # ghost id.
+            if self.last_trip is None or (
+                self.current_journey_id is not None
+                and self.last_trip.journey_id != self.current_journey_id
+            ):
+                self.current_journey_id = None
+            self.last_completed_journey_id = (
+                await self.storage.async_last_completed_journey_id(
+                    self.current_journey_id
+                )
+            )
+            self._notify_listeners()
+            self._notify_trip_log_listeners()
+        return count
+
     async def async_log_manual_trip_service(
         self,
         *,

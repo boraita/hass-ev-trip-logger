@@ -255,3 +255,26 @@ log_manual_trip:
       description: Restrict the action to a specific config entry.
       selector:
         text:
+
+purge_trips:
+  name: Purge trips
+  description: >-
+    Delete trips in a date range. At least one of `since` / `until` is required.
+    Useful for cleaning up bad data — e.g. fragmented micro-trips left over
+    from an earlier integration version.
+  fields:
+    since:
+      name: Since
+      description: Delete trips with started_at >= this datetime.
+      selector:
+        datetime:
+    until:
+      name: Until
+      description: Delete trips with started_at <= this datetime.
+      selector:
+        datetime:
+    entry_id:
+      name: Entry ID
+      description: Restrict the action to a specific config entry.
+      selector:
+        text:

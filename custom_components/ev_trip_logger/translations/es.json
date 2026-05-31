@@ -83,6 +83,10 @@
     "log_manual_trip": {
       "name": "Registrar viaje manual",
       "description": "Inserta un viaje que el detector live perdió. Requiere started_at, ended_at y bien distance_km o ambos extremos de odómetro."
+    },
+    "purge_trips": {
+      "name": "Purgar viajes",
+      "description": "Borra viajes en un rango de fechas. Útil para limpiar datos malos de versiones antiguas."
     }
   },
   "entity": {
@@ -117,6 +121,7 @@
       "total_year_distance": { "name": "Distancia este año" },
       "total_month_energy": { "name": "Energía este mes" },
       "total_month_cost": { "name": "Coste este mes" },
+      "total_today_count": { "name": "Viajes hoy" },
       "total_month_count": { "name": "Viajes este mes" },
       "total_30d_avg_consumption": { "name": "Consumo medio (30 días)" },
       "last_charge_kwh": { "name": "Energía de la última carga" },

@@ -1144,3 +1144,43 @@ async def test_current_charge_dcfc_classification_from_live_power(
     snap = coordinator.current_charge_snapshot()
     assert snap["power_kw"] == pytest.approx(90.0)
     assert snap["is_dcfc"] is True
+
+
+async def test_purge_trips_service_deletes_in_range(hass: HomeAssistant) -> None:
+    """purge_trips deletes trips by started_at range; in-memory state refreshes."""
+    from custom_components.ev_trip_logger.const import SERVICE_PURGE_TRIPS
+    from custom_components.ev_trip_logger.storage import TripRecord, TripStorage
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    storage: TripStorage = coordinator.storage
+
+    base = dt_util.now() - timedelta(days=3)
+    # 3 trips on 2 different days.
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=10),
+        duration_min=10.0, distance_km=5.0,
+    ))
+    await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=1), ended_at=base + timedelta(hours=1, minutes=10),
+        duration_min=10.0, distance_km=8.0,
+    ))
+    await storage.async_insert(TripRecord(
+        started_at=base + timedelta(days=1), ended_at=base + timedelta(days=1, minutes=10),
+        duration_min=10.0, distance_km=3.0,
+    ))
+    coordinator.last_trip = await storage.async_get_last()
+    assert coordinator.last_trip is not None
+    assert len(await storage.async_recent_trips(limit=10)) == 3
+
+    # Purge the two trips on the base day.
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_PURGE_TRIPS,
+        {"since": base - timedelta(minutes=1),
+         "until": base + timedelta(hours=2)},
+        blocking=True,
+    )
+    remaining = await storage.async_recent_trips(limit=10)
+    assert len(remaining) == 1
+    assert remaining[0].distance_km == pytest.approx(3.0)

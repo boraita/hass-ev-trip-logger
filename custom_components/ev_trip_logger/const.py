@@ -48,5 +48,6 @@ SERVICE_LOG_CHARGE: Final = "log_charge"
 SERVICE_DELETE_LAST_CHARGE: Final = "delete_last_charge"
 SERVICE_SET_LAST_CHARGE_PRICE: Final = "set_last_charge_price"
 SERVICE_LOG_MANUAL_TRIP: Final = "log_manual_trip"
+SERVICE_PURGE_TRIPS: Final = "purge_trips"
 
 STORAGE_FILENAME_TEMPLATE: Final = "ev_trip_logger.{entry_id}.db"

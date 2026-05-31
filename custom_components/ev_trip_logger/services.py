@@ -16,6 +16,7 @@ from .const import (
     SERVICE_EXPORT_CSV,
     SERVICE_LOG_CHARGE,
     SERVICE_LOG_MANUAL_TRIP,
+    SERVICE_PURGE_TRIPS,
     SERVICE_SET_LAST_CHARGE_PRICE,
     SERVICE_START_TRIP,
 )
@@ -63,6 +64,17 @@ _SCHEMA_SET_LAST_CHARGE_PRICE = vol.All(
         }
     ),
     cv.has_at_least_one_key("price_per_kwh", "total_cost", "location", "notes"),
+)
+
+
+_SCHEMA_PURGE_TRIPS = vol.All(
+    _SCHEMA_ENTRY.extend(
+        {
+            vol.Optional("since"): cv.datetime,
+            vol.Optional("until"): cv.datetime,
+        }
+    ),
+    cv.has_at_least_one_key("since", "until"),
 )
 
 
@@ -149,6 +161,16 @@ def async_register_services(hass: HomeAssistant) -> None:
                 notes=call.data.get("notes"),
             )
 
+    async def _purge_trips(call: ServiceCall) -> None:
+        since = call.data.get("since")
+        until = call.data.get("until")
+        for c in _resolve_coordinators(hass, call):
+            count = await c.async_purge_trips_service(since=since, until=until)
+            _LOGGER.info(
+                "Purged %d trip(s) in [%s, %s] for entry %s",
+                count, since, until, c.entry_id,
+            )
+
     async def _log_manual_trip(call: ServiceCall) -> None:
         for c in _resolve_coordinators(hass, call):
             await c.async_log_manual_trip_service(
@@ -185,6 +207,9 @@ def async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_LOG_MANUAL_TRIP, _log_manual_trip, schema=_SCHEMA_LOG_MANUAL_TRIP
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_PURGE_TRIPS, _purge_trips, schema=_SCHEMA_PURGE_TRIPS
     )
 
 

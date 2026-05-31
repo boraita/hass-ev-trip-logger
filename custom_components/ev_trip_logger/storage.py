@@ -263,6 +263,34 @@ class TripStorage:
                 (destination, trip_id),
             )
 
+    async def async_purge_trips(
+        self, since: datetime | None = None, until: datetime | None = None
+    ) -> int:
+        """Delete trips in [since, until]. Either bound may be None for open-ended.
+
+        Returns the number of rows deleted. The matching index is `started_at`,
+        consistent with how every other range query in this storage works.
+        """
+        return await self._hass.async_add_executor_job(
+            self._purge_trips, since, until
+        )
+
+    def _purge_trips(
+        self, since: datetime | None, until: datetime | None
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since is not None:
+            clauses.append("started_at >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("started_at <= ?")
+            params.append(until.isoformat())
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with sqlite3.connect(self._path) as conn:
+            cur = conn.execute(f"DELETE FROM trips{where}", params)
+            return int(cur.rowcount or 0)
+
     async def async_delete_last(self) -> bool:
         """Drop the most recent trip; returns True if anything was deleted."""
         return await self._hass.async_add_executor_job(self._delete_last)
