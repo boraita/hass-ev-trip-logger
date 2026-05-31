@@ -24,7 +24,8 @@
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
           "energy_price_kwh": "Precio en casa por kWh (default cuando no hay carga registrada)",
           "currency": "Moneda",
-          "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)"
+          "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)",
+          "recent_trips_limit": "Viajes recientes a guardar en listas"
         }
       },
       "reconfigure": {
@@ -46,7 +47,8 @@
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
           "energy_price_kwh": "Precio en casa por kWh (default cuando no hay carga registrada)",
           "currency": "Moneda",
-          "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)"
+          "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)",
+          "recent_trips_limit": "Viajes recientes a guardar en listas"
         }
       }
     }
@@ -142,6 +144,7 @@
       "avg_dc_charge_price_30d": { "name": "Precio medio carga DC rápida (30 días)" },
       "recent_trips": { "name": "Viajes recientes" },
       "recent_charges": { "name": "Cargas recientes" },
+      "trip_records": { "name": "Récords de viajes" },
       "charge_in_progress": { "name": "Carga en curso" },
       "last_journey": { "name": "Último viaje (completo)" },
       "current_journey": { "name": "Viaje en curso" },

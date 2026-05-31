@@ -127,6 +127,45 @@ async def test_aggregates_when_empty(storage: TripStorage) -> None:
     }
 
 
+async def test_records_returns_none_when_empty(storage: TripStorage) -> None:
+    assert await storage.async_records() is None
+
+
+async def test_records_picks_bests_and_totals(storage: TripStorage) -> None:
+    await storage.async_insert(
+        _trip(distance_km=10.0, energy_kwh=2.0, consumption_kwh_100km=20.0, cost=1.0)
+    )
+    eff_id = await storage.async_insert(
+        _trip(distance_km=8.0, energy_kwh=0.8, consumption_kwh_100km=10.0, cost=0.5)
+    )
+    long_id = await storage.async_insert(
+        _trip(distance_km=50.0, energy_kwh=12.0, consumption_kwh_100km=24.0, cost=3.0)
+    )
+    cheap_id = await storage.async_insert(
+        _trip(distance_km=5.0, energy_kwh=1.0, consumption_kwh_100km=20.0, cost=0.1)
+    )
+
+    rec = await storage.async_records()
+    assert rec is not None
+    assert rec["count"] == 4
+    # lowest consumption == most efficient == highest score
+    assert rec["most_efficient"].trip_id == eff_id
+    assert rec["longest"].trip_id == long_id
+    assert rec["cheapest"].trip_id == cheap_id
+    others = [rec["longest"].score, rec["cheapest"].score]
+    assert rec["most_efficient"].score >= max(s for s in others if s is not None)
+    assert rec["totals"]["trips"] == 4
+    assert rec["totals"]["distance_km"] == pytest.approx(73.0)
+    assert rec["totals"]["cost"] == pytest.approx(4.6)
+
+
+async def test_recent_trips_respects_limit(storage: TripStorage) -> None:
+    for i in range(6):
+        await storage.async_insert(_trip(distance_km=float(i)))
+    assert len(await storage.async_recent_trips(3)) == 3
+    assert len(await storage.async_recent_trips(100)) == 6
+
+
 async def test_export_csv_writes_all_rows(
     storage: TripStorage, tmp_path: Path
 ) -> None:

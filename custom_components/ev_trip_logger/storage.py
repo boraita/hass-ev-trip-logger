@@ -443,6 +443,49 @@ class TripStorage:
             ).fetchall()
         return [_row_to_record(r) for r in rows]
 
+    async def async_records(self) -> dict[str, Any] | None:
+        """All-time best trips + lifetime totals (None when no trips yet)."""
+        return await self._hass.async_add_executor_job(self._records)
+
+    def _records(self) -> dict[str, Any] | None:
+        with sqlite3.connect(self._path) as conn:
+            conn.row_factory = sqlite3.Row
+            tot = conn.execute(
+                "SELECT COUNT(*) AS c, COALESCE(SUM(distance_km), 0) AS d, "
+                "COALESCE(SUM(energy_kwh), 0) AS e, COALESCE(SUM(cost), 0) AS k "
+                "FROM trips"
+            ).fetchone()
+            if not tot or tot["c"] == 0:
+                return None
+            # `score` is a strictly-decreasing function of consumption, so the
+            # best-scoring trip is the most efficient one — a single indexed
+            # lookup instead of scoring every row. Tie-break by longer distance.
+            efficient = conn.execute(
+                "SELECT * FROM trips WHERE consumption_kwh_100km IS NOT NULL "
+                "AND consumption_kwh_100km > 0 "
+                "ORDER BY consumption_kwh_100km ASC, distance_km DESC LIMIT 1"
+            ).fetchone()
+            longest = conn.execute(
+                "SELECT * FROM trips WHERE distance_km IS NOT NULL "
+                "ORDER BY distance_km DESC LIMIT 1"
+            ).fetchone()
+            cheapest = conn.execute(
+                "SELECT * FROM trips WHERE cost IS NOT NULL "
+                "ORDER BY cost ASC LIMIT 1"
+            ).fetchone()
+        return {
+            "count": int(tot["c"]),
+            "totals": {
+                "trips": int(tot["c"]),
+                "distance_km": round(float(tot["d"]), 1),
+                "energy_kwh": round(float(tot["e"]), 2),
+                "cost": round(float(tot["k"]), 2),
+            },
+            "most_efficient": _row_to_record(efficient) if efficient else None,
+            "longest": _row_to_record(longest) if longest else None,
+            "cheapest": _row_to_record(cheapest) if cheapest else None,
+        }
+
     async def async_recent_charges(self, limit: int = 10) -> list[ChargeRecord]:
         return await self._hass.async_add_executor_job(self._recent_charges, limit)
 

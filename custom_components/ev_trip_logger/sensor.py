@@ -218,6 +218,7 @@ async def async_setup_entry(
 
     entities.append(RecentTripsSensor(coordinator))
     entities.append(RecentChargesSensor(coordinator))
+    entities.append(TripRecordsSensor(coordinator))
     entities.append(ChargeInProgressSensor(coordinator))
     entities.append(LastJourneySensor(coordinator))
     entities.append(CurrentJourneySensor(coordinator))
@@ -678,16 +679,15 @@ class CurrentJourneySensor(_BaseTripSensor):
 class RecentJourneysSensor(_BaseTripSensor):
     """List of the last N completed journeys for Lovelace cards."""
 
-    _LIMIT = 10
-
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
         self._journeys: list[dict[str, Any]] = []
+        # No state_class: the state is a row count, not a measurement — keeping
+        # it off avoids pushing the large JSON attribute into LTS/the recorder.
         self.entity_description = SensorEntityDescription(
             key="recent_journeys",
             translation_key="recent_journeys",
             icon="mdi:map-marker-multiple",
-            state_class=SensorStateClass.MEASUREMENT,
         )
         self._attr_unique_id = f"{coordinator.entry_id}_recent_journeys"
 
@@ -703,7 +703,7 @@ class RecentJourneysSensor(_BaseTripSensor):
 
     async def _async_refresh(self) -> None:
         self._journeys = await self._coordinator.storage.async_recent_completed_journeys(
-            self._coordinator.current_journey_id, self._LIMIT
+            self._coordinator.current_journey_id, self._coordinator.recent_limit
         )
         self.async_write_ha_state()
 
@@ -771,16 +771,14 @@ class ChargeInProgressSensor(_BaseTripSensor):
 class RecentTripsSensor(_BaseTripSensor):
     """List of the most recent trips, exposed via attributes for Lovelace cards."""
 
-    _LIMIT = 10
-
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
         self._trips: list[Any] = []
+        # No state_class: the state is a row count, not a measurement.
         self.entity_description = SensorEntityDescription(
             key="recent_trips",
             translation_key="recent_trips",
             icon="mdi:format-list-bulleted",
-            state_class=SensorStateClass.MEASUREMENT,
         )
         self._attr_unique_id = f"{coordinator.entry_id}_recent_trips"
 
@@ -795,7 +793,9 @@ class RecentTripsSensor(_BaseTripSensor):
         self.hass.async_create_task(self._async_refresh())
 
     async def _async_refresh(self) -> None:
-        self._trips = await self._coordinator.storage.async_recent_trips(self._LIMIT)
+        self._trips = await self._coordinator.storage.async_recent_trips(
+            self._coordinator.recent_limit
+        )
         self.async_write_ha_state()
 
     @property
@@ -810,16 +810,14 @@ class RecentTripsSensor(_BaseTripSensor):
 class RecentChargesSensor(_BaseTripSensor):
     """List of the most recent charges, exposed via attributes."""
 
-    _LIMIT = 10
-
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
         self._charges: list[Any] = []
+        # No state_class: the state is a row count, not a measurement.
         self.entity_description = SensorEntityDescription(
             key="recent_charges",
             translation_key="recent_charges",
             icon="mdi:ev-station",
-            state_class=SensorStateClass.MEASUREMENT,
         )
         self._attr_unique_id = f"{coordinator.entry_id}_recent_charges"
 
@@ -834,7 +832,9 @@ class RecentChargesSensor(_BaseTripSensor):
         self.hass.async_create_task(self._async_refresh())
 
     async def _async_refresh(self) -> None:
-        self._charges = await self._coordinator.storage.async_recent_charges(self._LIMIT)
+        self._charges = await self._coordinator.storage.async_recent_charges(
+            self._coordinator.recent_limit
+        )
         self.async_write_ha_state()
 
     @property
@@ -844,6 +844,90 @@ class RecentChargesSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"charges": [_charge_to_attr(c) for c in self._charges]}
+
+
+class TripRecordsSensor(_BaseTripSensor):
+    """All-time trip records, computed over the full history in the DB.
+
+    State is the lifetime trip count. Attributes expose the record-holding
+    trips so dashboards can show 'best ever' without iterating the recent
+    window (which they can't see past). 'best_score' and 'most_efficient'
+    point at the same trip because score is a decreasing function of
+    consumption — exposed separately so cards can label them independently.
+    """
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self._records: dict[str, Any] | None = None
+        self.entity_description = SensorEntityDescription(
+            key="trip_records",
+            translation_key="trip_records",
+            icon="mdi:trophy",
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_trip_records"
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self) -> None:
+        self._records = await self._coordinator.storage.async_records()
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return int(self._records["count"]) if self._records else 0
+
+    @staticmethod
+    def _entry(trip: Any, value: float | None) -> dict[str, Any] | None:
+        if trip is None or value is None:
+            return None
+        return {
+            "value": value,
+            "trip_id": trip.trip_id,
+            "ended_at": trip.ended_at.isoformat(),
+            "distance_km": round(trip.distance_km, 1),
+            "destination": trip.destination,
+        }
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        rec = self._records
+        if not rec:
+            return None
+        eff = rec.get("most_efficient")
+        longest = rec.get("longest")
+        cheapest = rec.get("cheapest")
+        best_score = self._entry(
+            eff, round(eff.score, 1) if eff and eff.score is not None else None
+        )
+        most_efficient = self._entry(
+            eff,
+            round(eff.consumption_kwh_100km, 1)
+            if eff and eff.consumption_kwh_100km is not None
+            else None,
+        )
+        longest_e = self._entry(
+            longest, round(longest.distance_km, 1) if longest else None
+        )
+        cheapest_e = self._entry(
+            cheapest, round(cheapest.cost, 2) if cheapest and cheapest.cost is not None else None
+        )
+        if cheapest_e is not None:
+            cheapest_e["currency"] = cheapest.currency
+        return {
+            "best_score": best_score,
+            "most_efficient": most_efficient,
+            "longest": longest_e,
+            "cheapest": cheapest_e,
+            "totals": rec.get("totals"),
+        }
 
 
 class BatteryPercentSensor(_BaseTripSensor):

@@ -33,6 +33,7 @@ from .const import (
     CONF_NAME,
     CONF_ODOMETER,
     CONF_POWER,
+    CONF_RECENT_LIMIT,
     CONF_SPEED,
     CONF_TEMP,
     CONF_VEHICLE_ON,
@@ -42,6 +43,7 @@ from .const import (
     DEFAULT_HOME_ZONE,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_MIN_TRIP_DISTANCE,
+    DEFAULT_RECENT_LIMIT,
     DOMAIN,
 )
 
@@ -154,6 +156,14 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_HOME_ZONE,
                 default=defaults.get(CONF_HOME_ZONE, "zone.home"),
             ): EntitySelector(EntitySelectorConfig(domain="zone")),
+            vol.Required(
+                CONF_RECENT_LIMIT,
+                default=defaults.get(CONF_RECENT_LIMIT, DEFAULT_RECENT_LIMIT),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=5, max=200, step=5, mode=NumberSelectorMode.BOX
+                )
+            ),
         }
     )
 
@@ -270,6 +280,14 @@ class EvTripLoggerOptionsFlow(OptionsFlow):
                         CONF_HOME_ZONE,
                         default=defaults.get(CONF_HOME_ZONE, "zone.home"),
                     ): EntitySelector(EntitySelectorConfig(domain="zone")),
+                    vol.Required(
+                        CONF_RECENT_LIMIT,
+                        default=defaults.get(CONF_RECENT_LIMIT, DEFAULT_RECENT_LIMIT),
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=5, max=200, step=5, mode=NumberSelectorMode.BOX
+                        )
+                    ),
                 }
             ),
         )

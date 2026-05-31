@@ -45,6 +45,7 @@ from .const import (
     CONF_POWER,
     CONF_SPEED,
     CONF_TEMP,
+    CONF_RECENT_LIMIT,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_DCFC_THRESHOLD_KW,
@@ -53,6 +54,7 @@ from .const import (
     DEFAULT_HOME_ZONE,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_MIN_TRIP_DISTANCE,
+    DEFAULT_RECENT_LIMIT,
     EVENT_CHARGE_LOGGED,
     EVENT_TRIP_ENDED,
     EVENT_TRIP_STARTED,
@@ -141,6 +143,7 @@ class EvTripLoggerCoordinator:
             merged.get(CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE)
         )
         self._idle_timeout = int(merged.get(CONF_IDLE_TIMEOUT, DEFAULT_IDLE_TIMEOUT))
+        self._recent_limit = max(1, int(merged.get(CONF_RECENT_LIMIT, DEFAULT_RECENT_LIMIT)))
         self._energy_price = float(merged.get(CONF_ENERGY_PRICE, DEFAULT_ENERGY_PRICE))
         self._currency = merged.get(CONF_CURRENCY, DEFAULT_CURRENCY)
         self._home_zone = merged.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE)
@@ -183,6 +186,11 @@ class EvTripLoggerCoordinator:
     @property
     def battery_capacity(self) -> float:
         return self._battery_capacity
+
+    @property
+    def recent_limit(self) -> int:
+        """How many rows the recent_* list sensors expose."""
+        return self._recent_limit
 
     @property
     def currency(self) -> str:
