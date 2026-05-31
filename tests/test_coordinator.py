@@ -121,7 +121,8 @@ async def test_vehicle_on_opens_trip(hass: HomeAssistant) -> None:
     assert coordinator.current.soc_start == 80.0
 
 
-async def test_idle_timeout_closes_and_persists_trip(hass: HomeAssistant) -> None:
+async def test_vehicle_off_closes_trip_immediately(hass: HomeAssistant) -> None:
+    """Each on/off cycle is one trip — closes the moment vehicle_on flips off."""
     entry = await _setup(hass)
     coordinator = hass.data[DOMAIN][entry.entry_id]
 
@@ -134,10 +135,8 @@ async def test_idle_timeout_closes_and_persists_trip(hass: HomeAssistant) -> Non
 
     hass.states.async_set(VOK, STATE_OFF)
     await hass.async_block_till_done()
-    assert coordinator.current is not None  # still inside idle window
 
-    await _advance(hass, 2)  # idle_timeout = 1 min
-
+    # No idle window — closed immediately.
     assert coordinator.current is None
     assert coordinator.last_trip is not None
     assert coordinator.last_trip.distance_km == pytest.approx(15.0)
@@ -679,6 +678,52 @@ async def test_home_zone_uses_slug_not_friendly_name(
     await _run_stage(hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="home")
     assert coordinator.current_journey_id is None
     assert coordinator.last_completed_journey_id is not None
+
+
+async def test_late_home_arrival_closes_journey_and_amends_destination(
+    hass: HomeAssistant,
+) -> None:
+    """If device_tracker reports 'home' AFTER vehicle_on=off, close the journey.
+
+    Cloud-polling integrations lag the geofence by 1-3 min. A trip that ends
+    in the home driveway closes with destination='not_home' because location
+    hasn't updated yet. When the location finally flips to 'home', we
+    retroactively (a) amend the trip's destination, (b) close the open
+    journey.
+    """
+    from custom_components.ev_trip_logger.const import CONF_HOME_ZONE
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(
+        hass, **{CONF_LOCATION: LOC, CONF_HOME_ZONE: "zone.home"}
+    )
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Drive home → not_home (journey 1 stays open).
+    await _run_stage(
+        hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="not_home"
+    )
+    assert coordinator.current_journey_id is not None
+    assert coordinator.last_trip.destination == "not_home"
+
+    # Drive back. Vehicle turns off but location sensor STILL says not_home
+    # (geofence lag). Trip closes with destination='not_home'.
+    hass.states.async_set(LOC, "not_home")
+    await _run_stage(
+        hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="not_home"
+    )
+    assert coordinator.current_journey_id is not None  # still open
+    assert coordinator.last_trip.destination == "not_home"
+    assert coordinator.last_trip.trip_id is not None
+
+    # 90 seconds later, device_tracker finally flips to 'home'.
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=90))
+    hass.states.async_set(LOC, "home")
+    await hass.async_block_till_done()
+
+    # Journey closed retroactively, destination amended.
+    assert coordinator.current_journey_id is None
+    assert coordinator.last_completed_journey_id is not None
+    assert coordinator.last_trip.destination == "home"
 
 
 async def test_home_zone_accepts_legacy_plain_string(hass: HomeAssistant) -> None:

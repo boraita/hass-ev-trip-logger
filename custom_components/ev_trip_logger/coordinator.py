@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -64,6 +64,10 @@ _LIVE_TICK = timedelta(seconds=30)
 # drive; the window must be longer than the polling interval so we don't
 # fragment one drive into many micro-trips.
 _SYNTH_COALESCE_WINDOW_S = 300
+# How long after a trip closes we still accept a late device_tracker → home
+# transition as "the trip ended at home" (and use it to close the journey
+# and amend the trip's destination).
+_HOME_ARRIVAL_GRACE_S = 600
 
 
 @dataclass
@@ -147,6 +151,7 @@ class EvTripLoggerCoordinator:
         # into one trip instead of inserting one record per polling cycle.
         self._unsub_synth_finalize: CALLBACK_TYPE | None = None
         self._synth_baseline: tuple[datetime, float, float | None] | None = None
+        self._unsub_location: CALLBACK_TYPE | None = None
 
         self._listeners: list[Callable[[], None]] = []
         self._trip_log_listeners: list[Callable[[], None]] = []
@@ -270,6 +275,10 @@ class EvTripLoggerCoordinator:
             self._unsub_charge = async_track_state_change_event(
                 self.hass, [self._charge_sensor], self._async_charge_sensor_changed
             )
+        if self._location:
+            self._unsub_location = async_track_state_change_event(
+                self.hass, [self._location], self._async_location_changed
+            )
 
         if self.hass.state == CoreState.running:
             self._maybe_resume_trip()
@@ -314,6 +323,7 @@ class EvTripLoggerCoordinator:
             self._unsub_idle,
             self._unsub_live_tick,
             self._unsub_synth_finalize,
+            self._unsub_location,
         ):
             if unsub:
                 unsub()
@@ -321,6 +331,7 @@ class EvTripLoggerCoordinator:
         self._unsub_power = self._unsub_temp = self._unsub_idle = None
         self._unsub_charge = self._unsub_live_tick = None
         self._unsub_synth_finalize = None
+        self._unsub_location = None
         self._synth_baseline = None
 
     @callback
@@ -348,7 +359,12 @@ class EvTripLoggerCoordinator:
                     return
                 self._open_trip(now)
         elif self.current is not None:
-            self._schedule_close(now)
+            # Close immediately: each on/off cycle is one trip. Trip stats
+            # (avg_speed, energy_kwh, consumption) are computed from the
+            # actual on→off interval. The legacy idle_timeout debounce was
+            # merging consecutive cycles (e.g. a home→work + work→shops
+            # pair) into a single "trip" with bogus aggregate stats.
+            self.hass.async_create_task(self._async_close_trip(now))
 
     @callback
     def _async_metric_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -376,6 +392,50 @@ class EvTripLoggerCoordinator:
         self._notify_listeners()
         if self.current is None:
             self.hass.async_create_task(self._async_check_odo_jump())
+
+    @callback
+    def _async_location_changed(self, event: Event[EventStateChangedData]) -> None:
+        """Close an open journey (and amend last trip) on home arrival.
+
+        Device trackers lag vehicle_on=off by 1–3 minutes in cloud-polling
+        integrations. Without this handler, a trip closing the moment the
+        car parks at home gets `destination='not_home'` (because location
+        hasn't flipped yet), the journey stays open forever, and stats
+        diverge from reality. We watch the location entity directly and
+        retroactively fix both.
+        """
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state in _INVALID_STATES:
+            return
+        if not self._is_at_home(new_state.state):
+            return
+        # While a trip is in progress, let normal close handle it.
+        if self.current is not None:
+            return
+        # Nothing to fix if no journey is open.
+        if self.current_journey_id is None:
+            return
+        self.hass.async_create_task(self._async_close_journey_on_home_arrival(new_state.last_updated))
+
+    async def _async_close_journey_on_home_arrival(self, now: datetime) -> None:
+        if self.current is not None or self.current_journey_id is None:
+            return
+        # If the last trip ended within the grace window (BYD location lag),
+        # also amend its destination so history reflects "arrived home".
+        if self.last_trip is not None and self.last_trip.trip_id is not None:
+            delta_s = (now - self.last_trip.ended_at).total_seconds()
+            if 0 <= delta_s <= _HOME_ARRIVAL_GRACE_S and not self._is_at_home(
+                self.last_trip.destination
+            ):
+                home = self.home_zone
+                await self.storage.async_update_trip_destination(
+                    self.last_trip.trip_id, home
+                )
+                self.last_trip = replace(self.last_trip, destination=home)
+        self.last_completed_journey_id = self.current_journey_id
+        self.current_journey_id = None
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
 
     async def _async_check_odo_jump(self) -> None:
         """Coalesce consecutive odo growth into ONE synthetic trip.

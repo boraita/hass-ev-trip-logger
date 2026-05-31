@@ -219,6 +219,27 @@ class TripStorage:
             )
             return int(cur.lastrowid or 0)
 
+    async def async_update_trip_destination(
+        self, trip_id: int, destination: str
+    ) -> None:
+        """Amend a trip's destination after the fact.
+
+        Used when the device_tracker lags vehicle_on=off and reports the
+        home transition a few minutes after the trip already closed — we
+        retroactively correct the destination so journey-close logic and
+        history both reflect reality.
+        """
+        await self._hass.async_add_executor_job(
+            self._update_trip_destination, trip_id, destination
+        )
+
+    def _update_trip_destination(self, trip_id: int, destination: str) -> None:
+        with sqlite3.connect(self._path) as conn:
+            conn.execute(
+                "UPDATE trips SET destination = ? WHERE id = ?",
+                (destination, trip_id),
+            )
+
     async def async_delete_last(self) -> bool:
         """Drop the most recent trip; returns True if anything was deleted."""
         return await self._hass.async_add_executor_job(self._delete_last)
