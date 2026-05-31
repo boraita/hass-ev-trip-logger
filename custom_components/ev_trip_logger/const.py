@@ -24,6 +24,7 @@ CONF_IDLE_TIMEOUT: Final = "idle_timeout_minutes"
 CONF_ENERGY_PRICE: Final = "energy_price_kwh"
 CONF_CURRENCY: Final = "currency"
 CONF_HOME_ZONE: Final = "home_zone"
+CONF_RECENT_LIMIT: Final = "recent_trips_limit"
 
 DEFAULT_BATTERY_CAPACITY: Final = 75.0
 DEFAULT_MIN_TRIP_DISTANCE: Final = 0.5
@@ -31,6 +32,10 @@ DEFAULT_IDLE_TIMEOUT: Final = 2
 DEFAULT_ENERGY_PRICE: Final = 0.15
 DEFAULT_CURRENCY: Final = "EUR"
 DEFAULT_HOME_ZONE: Final = "home"
+# How many recent trips/charges/journeys to expose in the list sensors'
+# attributes for dashboards. Bounded so one state attribute stays well under
+# the recorder's per-state size limit.
+DEFAULT_RECENT_LIMIT: Final = 50
 # Charges with average power above this kW threshold are classified as DC
 # fast-charge. 11 kW sits comfortably above the typical 3-phase 22 kW AC
 # floor in continental Europe (Type 2) and below any meaningful DCFC.
