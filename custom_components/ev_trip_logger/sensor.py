@@ -232,6 +232,13 @@ async def async_setup_entry(
             LastChargeSensor(coordinator, key="kwh"),
             LastChargeSensor(coordinator, key="total_cost"),
             LastChargeSensor(coordinator, key="price_per_kwh"),
+            LastChargeSensor(coordinator, key="is_dcfc"),
+            CurrentChargeSensor(coordinator, key="kwh"),
+            CurrentChargeSensor(coordinator, key="total_cost"),
+            CurrentChargeSensor(coordinator, key="price_per_kwh"),
+            CurrentChargeSensor(coordinator, key="power_kw"),
+            CurrentChargeSensor(coordinator, key="duration_min"),
+            CurrentChargeSensor(coordinator, key="is_dcfc"),
             ChargesAggregateSensor(coordinator, period="month", key="kwh"),
             ChargesAggregateSensor(coordinator, period="month", key="total_cost"),
             ChargesAggregateSensor(coordinator, period="month", key="count"),
@@ -910,61 +917,97 @@ class EnergyToFullSensor(_BaseTripSensor):
         return round(max(0.0, (100.0 - soc) / 100.0 * self._coordinator.battery_capacity), 2)
 
 
+_CHARGE_FIELD_CONFIG: dict[str, dict[str, Any]] = {
+    "kwh": {
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "device_class": SensorDeviceClass.ENERGY,
+        # state_class=total: HA accepts it with device_class=energy AND stops
+        # warning about "no state class" after a prior measurement. Auto-reset
+        # detection treats every value replacement as a fresh period — the
+        # "change" stat equals each charge's kWh, which is what we want.
+        "state_class": SensorStateClass.TOTAL,
+        "precision": 2,
+        "slug_last": "last_charge_kwh",
+        "slug_current": "current_charge_kwh",
+    },
+    "total_cost": {
+        "use_currency": True,
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": None,
+        "precision": 2,
+        "slug_last": "last_charge_cost",
+        "slug_current": "current_charge_cost",
+    },
+    "price_per_kwh": {
+        "use_currency": True,
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": None,
+        "precision": 4,
+        "icon": "mdi:cash",
+        "slug_last": "last_charge_price",
+        "slug_current": "current_charge_price",
+    },
+    "power_kw": {  # current-only — last completed charges don't carry power
+        "unit": UnitOfPower.KILO_WATT,
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "slug_current": "current_charge_power",
+    },
+    "duration_min": {  # current-only
+        "unit": UnitOfTime.MINUTES,
+        "device_class": SensorDeviceClass.DURATION,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 0,
+        "slug_current": "current_charge_duration",
+    },
+    "is_dcfc": {  # enum label so it's readable in cards
+        "options": ["AC", "DC", "unknown"],
+        "device_class": SensorDeviceClass.ENUM,
+        "icon": "mdi:ev-plug-type2",
+        "slug_last": "last_charge_type",
+        "slug_current": "current_charge_type",
+    },
+}
+
+
+def _is_dcfc_label(value: bool | None) -> str:
+    if value is True:
+        return "DC"
+    if value is False:
+        return "AC"
+    return "unknown"
+
+
 class LastChargeSensor(_BaseTripSensor):
     """Metric from the most recently logged charge session."""
 
-    _CONFIG: dict[str, dict[str, Any]] = {
-        "kwh": {
-            "unit": UnitOfEnergy.KILO_WATT_HOUR,
-            "device_class": SensorDeviceClass.ENERGY,
-            # state_class=total: HA accepts it with device_class=energy AND
-            # stops warning about "no state class" after a prior measurement.
-            # Auto-reset detection treats every value replacement as a fresh
-            # period — the "change" stat equals each charge's kWh, which is
-            # exactly what we want long-term.
-            "state_class": SensorStateClass.TOTAL,
-            "precision": 2,
-            "slug": "last_charge_kwh",
-        },
-        "total_cost": {
-            "device_class": SensorDeviceClass.MONETARY,
-            "state_class": None,
-            "precision": 2,
-            "slug": "last_charge_cost",
-        },
-        "price_per_kwh": {
-            "device_class": SensorDeviceClass.MONETARY,
-            "state_class": None,
-            "precision": 4,
-            "icon": "mdi:cash",
-            "slug": "last_charge_price",
-        },
-    }
-
     def __init__(self, coordinator: EvTripLoggerCoordinator, *, key: str) -> None:
         super().__init__(coordinator)
-        cfg = self._CONFIG[key]
+        cfg = _CHARGE_FIELD_CONFIG[key]
         self._key = key
+        slug = cfg["slug_last"]
         self.entity_description = SensorEntityDescription(
-            key=cfg["slug"],
-            translation_key=cfg["slug"],
+            key=slug,
+            translation_key=slug,
             native_unit_of_measurement=(
-                cfg.get("unit")
-                if key == "kwh"
-                else coordinator.currency
+                coordinator.currency if cfg.get("use_currency") else cfg.get("unit")
             ),
             device_class=cfg.get("device_class"),
             state_class=cfg.get("state_class"),
             icon=cfg.get("icon"),
             suggested_display_precision=cfg.get("precision"),
+            options=cfg.get("options"),
         )
-        self._attr_unique_id = f"{coordinator.entry_id}_{cfg['slug']}"
+        self._attr_unique_id = f"{coordinator.entry_id}_{slug}"
 
     @property
-    def native_value(self) -> float | None:
+    def native_value(self) -> float | str | None:
         charge = self._coordinator.last_charge
         if charge is None:
             return None
+        if self._key == "is_dcfc":
+            return _is_dcfc_label(charge.is_dcfc)
         return getattr(charge, self._key, None)
 
     @property
@@ -977,6 +1020,41 @@ class LastChargeSensor(_BaseTripSensor):
             "location": charge.location,
             "notes": charge.notes,
         }
+
+
+class CurrentChargeSensor(_BaseTripSensor):
+    """Live metrics for an in-progress charging session (mirror of LastChargeSensor)."""
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator, *, key: str) -> None:
+        super().__init__(coordinator)
+        cfg = _CHARGE_FIELD_CONFIG[key]
+        self._key = key
+        slug = cfg["slug_current"]
+        self.entity_description = SensorEntityDescription(
+            key=slug,
+            translation_key=slug,
+            native_unit_of_measurement=(
+                coordinator.currency if cfg.get("use_currency") else cfg.get("unit")
+            ),
+            device_class=cfg.get("device_class"),
+            state_class=cfg.get("state_class"),
+            icon=cfg.get("icon"),
+            suggested_display_precision=cfg.get("precision"),
+            options=cfg.get("options"),
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_{slug}"
+
+    @property
+    def native_value(self) -> float | str | None:
+        snap = self._coordinator.current_charge_snapshot()
+        if snap is None:
+            # No active charge → show "unknown" for the enum, None for numerics
+            # so HA renders "unknown" instead of stale data.
+            return _is_dcfc_label(None) if self._key == "is_dcfc" else None
+        value = snap.get(self._key)
+        if self._key == "is_dcfc":
+            return _is_dcfc_label(value)
+        return value
 
 
 class ChargesAggregateSensor(_BaseTripSensor):

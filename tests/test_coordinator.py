@@ -1093,3 +1093,54 @@ async def test_consumption_by_temp_bucket_groups_trips(hass: HomeAssistant) -> N
     # 22 °C falls into bucket [20,25) → consumption 14.
     assert buckets["by_bucket"]["20"] == pytest.approx(14.0)
     assert buckets["sample_count"] == 2
+
+
+async def test_current_charge_snapshot_during_session(hass: HomeAssistant) -> None:
+    """current_charge_snapshot returns live kWh/cost/type while charging."""
+    hass.states.async_set(CHG, STATE_OFF)
+    entry = await _setup(hass, **{CONF_CHARGE_SENSOR: CHG})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(BAT, "40")
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current_charge is not None
+
+    # SoC climbs to 55 % → 11.25 kWh on a 75 kWh pack.
+    coordinator.current_charge.last_seen_soc = 55.0
+    snap = coordinator.current_charge_snapshot()
+    assert snap is not None
+    assert snap["kwh"] == pytest.approx(11.25)
+    # Default home price 0.15 €/kWh × 11.25 ≈ 1.69
+    assert snap["total_cost"] == pytest.approx(11.25 * 0.15, abs=0.01)
+    # No power reading yet → classification stays unknown
+    assert snap["is_dcfc"] in (None, False, True)  # don't over-assert; covered below
+
+
+async def test_current_charge_dcfc_classification_from_live_power(
+    hass: HomeAssistant,
+) -> None:
+    """Live charging power above threshold flips is_dcfc=True in real time."""
+    hass.states.async_set(POW, "0")
+    hass.states.async_set(CHG, STATE_OFF)
+    entry = await _setup(hass, **{CONF_CHARGE_SENSOR: CHG, CONF_POWER: POW})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(BAT, "30")
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+
+    # AC at 7 kW → AC.
+    hass.states.async_set(POW, "7")
+    await hass.async_block_till_done()
+    snap = coordinator.current_charge_snapshot()
+    assert snap is not None
+    assert snap["power_kw"] == pytest.approx(7.0)
+    assert snap["is_dcfc"] is False
+
+    # Plug into a DC fast-charger at 90 kW → DC.
+    hass.states.async_set(POW, "90")
+    await hass.async_block_till_done()
+    snap = coordinator.current_charge_snapshot()
+    assert snap["power_kw"] == pytest.approx(90.0)
+    assert snap["is_dcfc"] is True

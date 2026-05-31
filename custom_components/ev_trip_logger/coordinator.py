@@ -102,6 +102,10 @@ class ChargeInProgress:
     started_at: datetime
     soc_start: float | None
     last_seen_soc: float | None = None
+    # Most-recent absolute power reading from the configured power sensor,
+    # surfaced by the current_charge_* sensors so the dashboard can show
+    # "charging at 7.2 kW right now". Captured even when no trip is active.
+    last_power_kw: float | None = None
 
 
 class EvTripLoggerCoordinator:
@@ -644,10 +648,15 @@ class EvTripLoggerCoordinator:
 
     @callback
     def _async_power_changed(self, event: Event[EventStateChangedData]) -> None:
-        if self.current is None:
-            return
         value = self._read_float(self._power)
         if value is None:
+            return
+        # Charge tracking: capture live power so current_charge sensors can
+        # display "charging at X kW right now". Runs even with no trip open.
+        if self.current_charge is not None:
+            self.current_charge.last_power_kw = abs(value)
+            self._notify_listeners()
+        if self.current is None:
             return
         self.current.max_power = max(self.current.max_power, abs(value))
         # Trapezoidal regen integration: when the prior sample was negative
@@ -1299,4 +1308,39 @@ class EvTripLoggerCoordinator:
             "regen_kwh": active.regen_kwh or None,
             "cost": cost,
             "score": score,
+        }
+
+    def current_charge_snapshot(self) -> dict[str, Any] | None:
+        """Live charging metrics — mirror of LastChargeSensor while charging."""
+        active = self.current_charge
+        if active is None:
+            return None
+        soc_now = active.last_seen_soc if active.last_seen_soc is not None else active.soc_start
+        if soc_now is None or active.soc_start is None or soc_now <= active.soc_start:
+            kwh_so_far: float | None = 0.0
+        else:
+            kwh_so_far = (soc_now - active.soc_start) / 100.0 * self._battery_capacity
+        # Live price: the user can correct it post-hoc on the last completed
+        # charge; while in progress we project the configured home tariff.
+        price_per_kwh = self._energy_price
+        total_cost = kwh_so_far * price_per_kwh if kwh_so_far else 0.0
+        duration_min = max(0.0, (dt_util.now() - active.started_at).total_seconds() / 60.0)
+        # is_dcfc classification: while charging we compare last_power_kw if
+        # available, falling back to running avg (kwh / hours). NULL until
+        # we have enough signal to be confident.
+        is_dcfc: bool | None = None
+        if active.last_power_kw is not None:
+            is_dcfc = active.last_power_kw > self._dcfc_threshold_kw
+        elif duration_min > 1 and kwh_so_far and kwh_so_far > 0:
+            avg_kw = kwh_so_far / (duration_min / 60.0)
+            is_dcfc = avg_kw > self._dcfc_threshold_kw
+        return {
+            "kwh": round(kwh_so_far, 2) if kwh_so_far else 0.0,
+            "total_cost": round(total_cost, 2),
+            "price_per_kwh": price_per_kwh,
+            "power_kw": active.last_power_kw,
+            "duration_min": duration_min,
+            "is_dcfc": is_dcfc,
+            "soc_start": active.soc_start,
+            "soc_now": soc_now,
         }
