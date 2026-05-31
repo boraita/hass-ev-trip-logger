@@ -9,6 +9,7 @@ from typing import Any, Callable
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     EVENT_HOMEASSISTANT_STARTED,
+    STATE_NOT_HOME,
     STATE_OFF,
     STATE_ON,
     STATE_UNAVAILABLE,
@@ -395,45 +396,53 @@ class EvTripLoggerCoordinator:
 
     @callback
     def _async_location_changed(self, event: Event[EventStateChangedData]) -> None:
-        """Close an open journey (and amend last trip) on home arrival.
+        """React to late device_tracker zone transitions.
 
-        Device trackers lag vehicle_on=off by 1–3 minutes in cloud-polling
-        integrations. Without this handler, a trip closing the moment the
-        car parks at home gets `destination='not_home'` (because location
-        hasn't flipped yet), the journey stays open forever, and stats
-        diverge from reality. We watch the location entity directly and
-        retroactively fix both.
+        Cloud-polling integrations lag the geofence by 1–3 min: a trip that
+        ends parked anywhere (home, work, gym, etc.) closes with whatever
+        location was visible at vehicle_on=off — typically `not_home`. When
+        the tracker finally settles on the real zone, we:
+
+        1. Amend the last trip's destination to that zone (any known zone,
+           not just home) so history matches reality.
+        2. Specifically on `home` arrival, close the open journey too —
+           home is the natural journey terminator; other zones aren't.
         """
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _INVALID_STATES:
             return
-        if not self._is_at_home(new_state.state):
+        loc = new_state.state
+        # `not_home` means "outside every known zone" — not informative.
+        if loc == STATE_NOT_HOME:
             return
-        # While a trip is in progress, let normal close handle it.
+        # While a trip is active, normal close will pick this up later.
         if self.current is not None:
             return
-        # Nothing to fix if no journey is open.
-        if self.current_journey_id is None:
-            return
-        self.hass.async_create_task(self._async_close_journey_on_home_arrival(new_state.last_updated))
+        self.hass.async_create_task(
+            self._async_handle_late_zone_arrival(loc, new_state.last_updated)
+        )
 
-    async def _async_close_journey_on_home_arrival(self, now: datetime) -> None:
-        if self.current is not None or self.current_journey_id is None:
+    async def _async_handle_late_zone_arrival(
+        self, location: str, when: datetime
+    ) -> None:
+        if self.current is not None:
             return
-        # If the last trip ended within the grace window (BYD location lag),
-        # also amend its destination so history reflects "arrived home".
+        # 1) Amend the last trip's destination if within the grace window
+        #    AND the recorded destination isn't already this zone.
         if self.last_trip is not None and self.last_trip.trip_id is not None:
-            delta_s = (now - self.last_trip.ended_at).total_seconds()
-            if 0 <= delta_s <= _HOME_ARRIVAL_GRACE_S and not self._is_at_home(
-                self.last_trip.destination
+            delta_s = (when - self.last_trip.ended_at).total_seconds()
+            if (
+                0 <= delta_s <= _HOME_ARRIVAL_GRACE_S
+                and self.last_trip.destination != location
             ):
-                home = self.home_zone
                 await self.storage.async_update_trip_destination(
-                    self.last_trip.trip_id, home
+                    self.last_trip.trip_id, location
                 )
-                self.last_trip = replace(self.last_trip, destination=home)
-        self.last_completed_journey_id = self.current_journey_id
-        self.current_journey_id = None
+                self.last_trip = replace(self.last_trip, destination=location)
+        # 2) Home arrival also closes the open journey.
+        if self._is_at_home(location) and self.current_journey_id is not None:
+            self.last_completed_journey_id = self.current_journey_id
+            self.current_journey_id = None
         self._notify_listeners()
         self._notify_trip_log_listeners()
 

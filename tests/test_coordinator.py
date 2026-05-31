@@ -726,6 +726,43 @@ async def test_late_home_arrival_closes_journey_and_amends_destination(
     assert coordinator.last_trip.destination == "home"
 
 
+async def test_late_zone_arrival_amends_destination_without_closing_journey(
+    hass: HomeAssistant,
+) -> None:
+    """Arriving at a non-home zone (work, gym, etc.) amends destination only.
+
+    Home is the natural journey terminator; arriving at 'Trabajo' should
+    update the trip's destination so history reads correctly but must NOT
+    close the journey — the user is still away from home.
+    """
+    from custom_components.ev_trip_logger.const import CONF_HOME_ZONE
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(
+        hass, **{CONF_LOCATION: LOC, CONF_HOME_ZONE: "zone.home"}
+    )
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Drive home → work, but location still says not_home when engine turns off.
+    hass.states.async_set(LOC, "home")
+    await _run_stage(
+        hass, odo_start=1000, odo_end=1015, soc_end=75, location_end="not_home"
+    )
+    journey_before = coordinator.current_journey_id
+    assert journey_before is not None
+    assert coordinator.last_trip.destination == "not_home"
+
+    # Geofence lag — 90 seconds later, device_tracker flips to 'Trabajo ele '
+    # (custom zone with a trailing space, as the user's real HA reports it).
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=90))
+    hass.states.async_set(LOC, "Trabajo ele ")
+    await hass.async_block_till_done()
+
+    # Destination amended.
+    assert coordinator.last_trip.destination == "Trabajo ele "
+    # Journey stays OPEN — non-home zone is not a terminator.
+    assert coordinator.current_journey_id == journey_before
+
+
 async def test_home_zone_accepts_legacy_plain_string(hass: HomeAssistant) -> None:
     """Users on the old text-field config (e.g. 'home' as string) still work."""
     from custom_components.ev_trip_logger.const import CONF_HOME_ZONE
