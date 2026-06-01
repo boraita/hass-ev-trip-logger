@@ -41,7 +41,13 @@
     "step": {
       "init": {
         "title": "EV Trip Logger options",
+        "description": "Add or change optional sensors (power, speed, temperature, …) and adjust parameters. History is preserved.",
         "data": {
+          "power_sensor": "Power sensor (kW) — enables regen, max_power, live charging power",
+          "charge_sensor": "Charging binary sensor — enables auto-detected charges",
+          "location_tracker": "Location entity (device_tracker, person, input_select…) — origin/destination + journey close on home",
+          "exterior_temp_sensor": "Outside temperature sensor — enables avg_temp and consumption-by-temp",
+          "speed_sensor": "Speed sensor (km/h) — enables max_speed",
           "battery_capacity_kwh": "Battery capacity (kWh)",
           "min_trip_distance_km": "Minimum trip distance (km)",
           "idle_timeout_minutes": "Idle timeout (min)",
