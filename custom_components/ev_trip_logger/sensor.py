@@ -490,37 +490,62 @@ class AggregateSensor(_BaseTripSensor):
         return self._value
 
 
+def _r(value: float | None, ndigits: int) -> float | None:
+    return round(value, ndigits) if value is not None else None
+
+
 def _trip_to_attr(trip: Any) -> dict[str, Any]:
+    """Serialise a TripRecord for sensor attributes.
+
+    Exposes every field we capture so any Lovelace card / template can use
+    them. Keeps both `id` (the new v0.4.3 short alias) and `trip_id`
+    (the historical key dashboards have been using since v0.1) for
+    backwards compatibility — both point at the same DB primary key.
+    """
     return {
         "id": trip.trip_id,
+        "trip_id": trip.trip_id,
         "journey_id": trip.journey_id,
         "started_at": trip.started_at.isoformat(),
         "ended_at": trip.ended_at.isoformat(),
-        "distance_km": round(trip.distance_km, 1),
-        "duration_min": round(trip.duration_min, 1),
-        "energy_kwh": round(trip.energy_kwh, 2) if trip.energy_kwh is not None else None,
-        "consumption_kwh_100km": (
-            round(trip.consumption_kwh_100km, 1)
-            if trip.consumption_kwh_100km is not None
-            else None
-        ),
-        "cost": round(trip.cost, 2) if trip.cost is not None else None,
+        "distance_km": _r(trip.distance_km, 1),
+        "duration_min": _r(trip.duration_min, 1),
+        "odometer_start": _r(trip.odometer_start, 1),
+        "odometer_end": _r(trip.odometer_end, 1),
+        "soc_start": _r(trip.soc_start, 1),
+        "soc_end": _r(trip.soc_end, 1),
+        "soc_used_pct": _r(trip.soc_used_pct, 1),
+        "energy_kwh": _r(trip.energy_kwh, 2),
+        "consumption_kwh_100km": _r(trip.consumption_kwh_100km, 1),
+        "avg_speed_kmh": _r(trip.avg_speed_kmh, 1),
+        "max_speed_kmh": _r(trip.max_speed_kmh, 0),
+        "max_power_kw": _r(trip.max_power_kw, 1),
+        "regen_kwh": _r(trip.regen_kwh, 2),
+        "avg_temp_c": _r(trip.avg_temp_c, 1),
+        "cost": _r(trip.cost, 2),
         "currency": trip.currency,
-        "score": round(trip.score, 1) if trip.score is not None else None,
+        "score": _r(trip.score, 1),
         "origin": trip.origin,
         "destination": trip.destination,
     }
 
 
 def _charge_to_attr(charge: Any) -> dict[str, Any]:
+    """Serialise a ChargeRecord. Same `id`/`charge_id` dual-alias as trips."""
     return {
         "id": charge.charge_id,
+        "charge_id": charge.charge_id,
+        "started_at": charge.started_at.isoformat() if charge.started_at else None,
         "ended_at": charge.ended_at.isoformat(),
-        "kwh": round(charge.kwh, 2),
-        "price_per_kwh": round(charge.price_per_kwh, 4),
-        "total_cost": round(charge.total_cost, 2),
+        "kwh": _r(charge.kwh, 2),
+        "price_per_kwh": _r(charge.price_per_kwh, 4),
+        "total_cost": _r(charge.total_cost, 2),
         "currency": charge.currency,
+        "soc_start": _r(charge.soc_start, 1),
+        "soc_end": _r(charge.soc_end, 1),
         "location": charge.location,
+        "notes": charge.notes,
+        "is_dcfc": charge.is_dcfc,
     }
 
 

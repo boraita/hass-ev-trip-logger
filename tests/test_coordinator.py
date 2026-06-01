@@ -1184,3 +1184,97 @@ async def test_purge_trips_service_deletes_in_range(hass: HomeAssistant) -> None
     remaining = await storage.async_recent_trips(limit=10)
     assert len(remaining) == 1
     assert remaining[0].distance_km == pytest.approx(3.0)
+
+
+async def test_recent_trips_attr_exposes_full_schema(hass: HomeAssistant) -> None:
+    """Recent_trips items must expose every captured field.
+
+    Regression: v0.4.3 briefly stripped down the schema, breaking dashboards
+    that consume max_power_kw / avg_speed_kmh / regen_kwh / soc_* / etc.
+    Both `id` and `trip_id` must be present (dual alias for back-compat).
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord, TripStorage
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    storage: TripStorage = coordinator.storage
+
+    await storage.async_insert(TripRecord(
+        started_at=dt_util.now() - timedelta(minutes=30),
+        ended_at=dt_util.now(),
+        duration_min=30.0,
+        distance_km=22.0,
+        odometer_start=10000.0, odometer_end=10022.0,
+        soc_start=80.0, soc_end=72.0, soc_used_pct=8.0,
+        energy_kwh=6.0,
+        consumption_kwh_100km=27.3,
+        avg_speed_kmh=44.0,
+        max_speed_kmh=118.5,
+        max_power_kw=85.0,
+        regen_kwh=1.84,
+        avg_temp_c=17.5,
+        origin="home", destination="Trabajo ele ",
+        cost=0.42, currency="EUR",
+        journey_id=1,
+    ))
+    coordinator._notify_trip_log_listeners()
+    await hass.async_block_till_done()
+
+    state = hass.states.get(f"sensor.test_ev_recent_trips")
+    assert state is not None
+    trips = state.attributes.get("trips") or []
+    assert len(trips) >= 1
+    t = trips[0]
+
+    # Dual-alias id and trip_id
+    assert t["id"] is not None
+    assert t["trip_id"] == t["id"]
+    # Every captured field must be exposed
+    for key in (
+        "journey_id", "started_at", "ended_at",
+        "distance_km", "duration_min",
+        "odometer_start", "odometer_end",
+        "soc_start", "soc_end", "soc_used_pct",
+        "energy_kwh", "consumption_kwh_100km",
+        "avg_speed_kmh", "max_speed_kmh", "max_power_kw", "regen_kwh",
+        "avg_temp_c",
+        "origin", "destination",
+        "cost", "currency", "score",
+    ):
+        assert key in t, f"missing key: {key}"
+    assert t["max_speed_kmh"] in (118, 119)  # banker's rounding 118.5→118
+    assert t["regen_kwh"] == 1.84
+    assert t["destination"] == "Trabajo ele "
+
+
+async def test_recent_charges_attr_exposes_full_schema(hass: HomeAssistant) -> None:
+    """Recent_charges must include is_dcfc, started_at, soc_*, notes."""
+    from custom_components.ev_trip_logger.storage import ChargeRecord, TripStorage
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    storage: TripStorage = coordinator.storage
+
+    started = dt_util.now() - timedelta(minutes=20)
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=started, ended_at=dt_util.now(),
+        kwh=18.0, price_per_kwh=0.40, total_cost=7.20,
+        currency="EUR", soc_start=30.0, soc_end=54.0,
+        location="Repsol", notes="DC fast", is_dcfc=True,
+    ))
+    coordinator._notify_trip_log_listeners()
+    await hass.async_block_till_done()
+
+    state = hass.states.get(f"sensor.test_ev_recent_charges")
+    assert state is not None
+    charges = state.attributes.get("charges") or []
+    assert len(charges) >= 1
+    c = charges[0]
+
+    assert c["id"] is not None
+    assert c["charge_id"] == c["id"]
+    for key in ("started_at", "ended_at", "kwh", "price_per_kwh", "total_cost",
+                "currency", "soc_start", "soc_end", "location", "notes", "is_dcfc"):
+        assert key in c, f"missing key: {key}"
+    assert c["is_dcfc"] is True
+    assert c["location"] == "Repsol"
