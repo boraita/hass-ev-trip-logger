@@ -704,6 +704,10 @@ class CurrentJourneySensor(_BaseTripSensor):
 class RecentJourneysSensor(_BaseTripSensor):
     """List of the last N completed journeys for Lovelace cards."""
 
+    # Big JSON blob read live by dashboards; never store it in the recorder
+    # (with a large recent window it exceeds the 16 KB per-state attr limit).
+    _unrecorded_attributes = frozenset({"journeys"})
+
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
         self._journeys: list[dict[str, Any]] = []
@@ -796,6 +800,10 @@ class ChargeInProgressSensor(_BaseTripSensor):
 class RecentTripsSensor(_BaseTripSensor):
     """List of the most recent trips, exposed via attributes for Lovelace cards."""
 
+    # Big JSON blob read live by dashboards; never store it in the recorder
+    # (with a large recent window it exceeds the 16 KB per-state attr limit).
+    _unrecorded_attributes = frozenset({"trips"})
+
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
         self._trips: list[Any] = []
@@ -834,6 +842,10 @@ class RecentTripsSensor(_BaseTripSensor):
 
 class RecentChargesSensor(_BaseTripSensor):
     """List of the most recent charges, exposed via attributes."""
+
+    # Big JSON blob read live by dashboards; never store it in the recorder
+    # (with a large recent window it exceeds the 16 KB per-state attr limit).
+    _unrecorded_attributes = frozenset({"charges"})
 
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
