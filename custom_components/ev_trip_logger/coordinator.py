@@ -510,9 +510,16 @@ class EvTripLoggerCoordinator:
         delta = odo - prev_odo
 
         if delta < self._min_distance:
-            # Sub-threshold growth — keep waiting. Do NOT advance the baseline:
-            # the next reading must still be compared against the original
-            # idle snapshot, otherwise we'd lose the cumulative distance.
+            # Sub-threshold growth — the car hasn't meaningfully moved since the
+            # baseline. Keep the odometer baseline (so cumulative distance across
+            # sparse polls isn't lost) but advance its TIMESTAMP and SoC. While
+            # the car sits parked — especially while it charges overnight — the
+            # "last idle" moment moves forward and the battery refills. Freezing
+            # the original snapshot back-dated the next real drive by hours and
+            # made it inherit the pre-charge SoC, so a morning commute logged as
+            # a multi-hour trip spanning the charge with soc_start < soc_end →
+            # negative usage → no energy/cost/score. Refresh time+SoC, keep odo.
+            self._last_idle_odo = (now, prev_odo, soc)
             return
 
         # Above-threshold growth detected. Adopt or keep the synth baseline
