@@ -74,9 +74,12 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
     defaults = defaults or {}
 
     def _optional(key: str, selector: Any) -> Any:
-        if defaults.get(key) is not None:
-            return vol.Optional(key, default=defaults[key])
-        return vol.Optional(key)
+        # HA's options-flow UI hides vol.Optional fields that have no
+        # default value, so we always pass description.suggested_value
+        # (None when unset) to force the field to render. The user can
+        # then pick or clear a sensor on demand.
+        current = defaults.get(key)
+        return vol.Optional(key, description={"suggested_value": current})
 
     return vol.Schema(
         {
