@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -168,13 +170,33 @@ class TripStorage:
             entry_id=entry_id
         )
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection that is transaction-managed AND closed on exit.
+
+        ``with sqlite3.connect(...) as conn`` only commits/rolls back the
+        transaction — it does NOT close the connection, so the underlying file
+        descriptor leaks until garbage collection. Under frequent writes that
+        exhausts the process FD limit and crashes HA Core
+        (``[Errno 24] No file descriptors available``). Closing explicitly
+        every time fixes the leak. ``row_factory`` is set unconditionally so
+        callers can index rows by name or position without re-setting it.
+        """
+        conn = sqlite3.connect(self._path)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:  # commit on success / rollback on exception
+                yield conn
+        finally:
+            conn.close()
+
     async def async_init(self) -> None:
         """Create the schema if needed."""
         await self._hass.async_add_executor_job(self._init_db)
 
     def _init_db(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.executescript(_SCHEMA)
             self._migrate(conn)
 
@@ -205,7 +227,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._insert, record)
 
     def _insert(self, record: TripRecord) -> int:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO trips (
@@ -257,7 +279,7 @@ class TripStorage:
         )
 
     def _update_trip_destination(self, trip_id: int, destination: str) -> None:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 "UPDATE trips SET destination = ? WHERE id = ?",
                 (destination, trip_id),
@@ -287,7 +309,7 @@ class TripStorage:
             clauses.append("started_at <= ?")
             params.append(until.isoformat())
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(f"DELETE FROM trips{where}", params)
             return int(cur.rowcount or 0)
 
@@ -296,7 +318,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._delete_last)
 
     def _delete_last(self) -> bool:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             cur = conn.execute("SELECT id FROM trips ORDER BY id DESC LIMIT 1")
             row = cur.fetchone()
             if not row:
@@ -309,7 +331,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._get_last)
 
     def _get_last(self) -> TripRecord | None:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM trips ORDER BY id DESC LIMIT 1"
@@ -320,7 +342,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._next_journey_id)
 
     def _next_journey_id(self) -> int:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 "SELECT COALESCE(MAX(journey_id), 0) + 1 FROM trips"
             ).fetchone()
@@ -330,7 +352,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._journey_stages, journey_id)
 
     def _journey_stages(self, journey_id: int) -> list[TripRecord]:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM trips WHERE journey_id = ? ORDER BY id",
@@ -342,7 +364,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._journey_summary, journey_id)
 
     def _journey_summary(self, journey_id: int) -> dict[str, Any] | None:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT
@@ -385,7 +407,7 @@ class TripStorage:
         if current_journey_id is not None:
             excl = "AND journey_id != ?"
             params = (current_journey_id,)
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT journey_id FROM trips
@@ -419,7 +441,7 @@ class TripStorage:
         if current_journey_id is not None:
             excl = "AND journey_id != ?"
             params = (current_journey_id,)
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 f"""
                 SELECT journey_id FROM trips
@@ -436,7 +458,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._recent_trips, limit)
 
     def _recent_trips(self, limit: int) -> list[TripRecord]:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM trips ORDER BY id DESC LIMIT ?", (limit,)
@@ -448,7 +470,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._records)
 
     def _records(self) -> dict[str, Any] | None:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             tot = conn.execute(
                 "SELECT COUNT(*) AS c, COALESCE(SUM(distance_km), 0) AS d, "
@@ -490,7 +512,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._recent_charges, limit)
 
     def _recent_charges(self, limit: int) -> list[ChargeRecord]:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM charges ORDER BY id DESC LIMIT ?", (limit,)
@@ -502,7 +524,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._aggregates_since, since)
 
     def _aggregates_since(self, since: datetime) -> dict[str, float | int]:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT
@@ -528,7 +550,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._insert_charge, record)
 
     def _insert_charge(self, record: ChargeRecord) -> int:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO charges (
@@ -556,7 +578,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._get_last_charge)
 
     def _get_last_charge(self) -> ChargeRecord | None:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM charges ORDER BY id DESC LIMIT 1"
@@ -582,7 +604,7 @@ class TripStorage:
         location: str | None,
         notes: str | None,
     ) -> ChargeRecord | None:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM charges ORDER BY id DESC LIMIT 1"
@@ -616,7 +638,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._delete_last_charge)
 
     def _delete_last_charge(self) -> bool:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             cur = conn.execute("SELECT id FROM charges ORDER BY id DESC LIMIT 1")
             row = cur.fetchone()
             if not row:
@@ -632,7 +654,7 @@ class TripStorage:
         )
 
     def _charges_aggregates_since(self, since: datetime) -> dict[str, float | int]:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT
@@ -678,7 +700,7 @@ class TripStorage:
     def _consumption_by_temp_bucket(
         self, since: datetime, bucket_size_c: float
     ) -> dict[str, Any]:
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT avg_temp_c, consumption_kwh_100km, distance_km
@@ -717,7 +739,7 @@ class TripStorage:
     def _export_csv(self, path: str) -> int:
         import csv
 
-        with sqlite3.connect(self._path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT * FROM trips ORDER BY id").fetchall()
         if not rows:
