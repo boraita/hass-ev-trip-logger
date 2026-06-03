@@ -39,7 +39,11 @@ CREATE TABLE IF NOT EXISTS trips (
     destination TEXT,
     cost REAL,
     currency TEXT,
-    journey_id INTEGER
+    journey_id INTEGER,
+    start_lat REAL,
+    start_lon REAL,
+    end_lat REAL,
+    end_lon REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -96,6 +100,13 @@ class TripRecord:
     cost: float | None = None
     currency: str | None = None
     journey_id: int | None = None
+    # GPS endpoints — first and last position sampled during the trip.
+    # Populated by the live tick's sampler when a location entity is wired.
+    # Lets the dashboard build a Google-Maps route link.
+    start_lat: float | None = None
+    start_lon: float | None = None
+    end_lat: float | None = None
+    end_lon: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -222,6 +233,9 @@ class TripStorage:
             conn.execute("ALTER TABLE trips ADD COLUMN regen_kwh REAL")
         if "max_speed_kmh" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN max_speed_kmh REAL")
+        for col in ("start_lat", "start_lon", "end_lat", "end_lon"):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
@@ -261,8 +275,9 @@ class TripStorage:
                     odometer_start, odometer_end, soc_start, soc_end, soc_used_pct,
                     energy_kwh, consumption_kwh_100km, avg_speed_kmh, max_power_kw,
                     max_speed_kmh, regen_kwh,
-                    avg_temp_c, origin, destination, cost, currency, journey_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    avg_temp_c, origin, destination, cost, currency, journey_id,
+                    start_lat, start_lon, end_lat, end_lon
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -286,6 +301,10 @@ class TripStorage:
                     record.cost,
                     record.currency,
                     record.journey_id,
+                    record.start_lat,
+                    record.start_lon,
+                    record.end_lat,
+                    record.end_lon,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -1067,6 +1086,10 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         cost=row["cost"],
         currency=row["currency"],
         journey_id=row["journey_id"] if "journey_id" in row.keys() else None,
+        start_lat=row["start_lat"] if "start_lat" in row.keys() else None,
+        start_lon=row["start_lon"] if "start_lon" in row.keys() else None,
+        end_lat=row["end_lat"] if "end_lat" in row.keys() else None,
+        end_lon=row["end_lon"] if "end_lon" in row.keys() else None,
     )
 
 

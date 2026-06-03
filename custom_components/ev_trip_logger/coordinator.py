@@ -1021,6 +1021,14 @@ class EvTripLoggerCoordinator:
             cost=cost,
             currency=cost_currency if cost is not None else None,
             journey_id=journey_id,
+            # GPS endpoints picked from the live-tick sampler's buffer.
+            # When no location entity is wired (or no samples accumulated)
+            # they stay None and the dashboard falls back to text-based
+            # Google-Maps links.
+            start_lat=(active.gps_samples[0][1] if active.gps_samples else None),
+            start_lon=(active.gps_samples[0][2] if active.gps_samples else None),
+            end_lat=(active.gps_samples[-1][1] if active.gps_samples else None),
+            end_lon=(active.gps_samples[-1][2] if active.gps_samples else None),
         )
 
         trip_id = await self.storage.async_insert(record)

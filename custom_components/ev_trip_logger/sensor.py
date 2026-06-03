@@ -537,6 +537,12 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         "score": _r(trip.score, 1),
         "origin": trip.origin,
         "destination": trip.destination,
+        # GPS endpoints — populated only for trips logged after v0.5.3.
+        # Lets the dashboard build a precise Google-Maps route link.
+        "start_lat": _r(getattr(trip, "start_lat", None), 6),
+        "start_lon": _r(getattr(trip, "start_lon", None), 6),
+        "end_lat": _r(getattr(trip, "end_lat", None), 6),
+        "end_lon": _r(getattr(trip, "end_lon", None), 6),
     }
 
 
