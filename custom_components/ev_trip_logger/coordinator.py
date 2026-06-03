@@ -74,6 +74,12 @@ _SYNTH_COALESCE_WINDOW_S = 300
 # transition as "the trip ended at home" (and use it to close the journey
 # and amend the trip's destination).
 _HOME_ARRIVAL_GRACE_S = 600
+# Idle watchdog inside open trips. If neither the odometer changes nor the
+# speed sensor reports > 0 for this many seconds, the trip is force-closed
+# even if vehicle_on still reads ON. Catches cloud-polling sources (BYD, …)
+# that miss off→on cycles and leave a single bogus "trip" spanning multiple
+# real drives.
+_IDLE_INSIDE_TRIP_S = 600
 
 
 @dataclass
@@ -95,6 +101,12 @@ class TripInProgress:
     last_power_ts: datetime | None = None
     last_seen_odometer: float | None = None
     last_seen_soc: float | None = None
+    # Last observed evidence of actual movement: timestamp of either an
+    # odometer change or a speed > 0 reading. Used to force-close trips
+    # that BYD (or other cloud-polling integrations) leave hanging open
+    # because vehicle_on stays "on" through real stops. Updated on every
+    # metric-change tick; checked by the idle watchdog.
+    last_movement_ts: datetime | None = None
     # GPS samples accumulated during the trip — list of (ts, lat, lon).
     # Persisted to trip_positions on close so the dashboard can render the
     # route map. Sampled by the live-tick callback so cadence is bound to
@@ -433,6 +445,15 @@ class EvTripLoggerCoordinator:
             soc = self._read_float(self._battery)
             if soc is not None:
                 self.current_charge.last_seen_soc = soc
+
+        # Idle watchdog — any odo change while a trip is open counts as
+        # evidence the car is actually moving. New_state.entity_id checks
+        # let us ignore battery-only ticks for the odometer signal.
+        if self.current is not None:
+            new_state = event.data.get("new_state")
+            if new_state is not None and new_state.entity_id == self._odometer:
+                self.current.last_movement_ts = dt_util.now()
+
         self._notify_listeners()
         if self.current is None:
             self.hass.async_create_task(self._async_check_odo_jump())
@@ -709,6 +730,9 @@ class EvTripLoggerCoordinator:
         # bound it to a physically plausible ceiling.
         if value > 300:
             return
+        # Movement signal — any non-zero speed resets the idle watchdog.
+        if value > 0:
+            self.current.last_movement_ts = dt_util.now()
         if value > self.current.max_speed_kmh:
             self.current.max_speed_kmh = value
         self._notify_listeners()
@@ -796,6 +820,7 @@ class EvTripLoggerCoordinator:
             temp_samples=[temp] if temp is not None else [],
             last_seen_odometer=odometer,
             last_seen_soc=soc,
+            last_movement_ts=now,  # treat trip start as the first movement
         )
         _LOGGER.debug("Trip opened at %s odo=%s soc=%s", now, odometer, soc)
         # Heartbeat so duration / avg_speed tick forward even when no sensor
@@ -837,6 +862,26 @@ class EvTripLoggerCoordinator:
     def _async_live_tick(self, _now: datetime) -> None:
         if self.current is None:
             return
+        now = dt_util.now()
+
+        # Idle watchdog — force-close any trip that has stopped showing
+        # evidence of movement (no odo change, no speed > 0) for longer
+        # than _IDLE_INSIDE_TRIP_S. This catches BYD-style cloud-polling
+        # gaps where vehicle_on stays ON across real off/on cycles. The
+        # check runs BEFORE GPS sampling because once we trigger the
+        # close, we want to stop accumulating points.
+        last_move = self.current.last_movement_ts
+        if last_move is not None and (
+            (now - last_move).total_seconds() > _IDLE_INSIDE_TRIP_S
+        ):
+            _LOGGER.info(
+                "Idle watchdog: no movement for %.0fs while trip open — "
+                "force-closing at the last-movement timestamp",
+                (now - last_move).total_seconds(),
+            )
+            self.hass.async_create_task(self._async_close_trip(last_move))
+            return
+
         # GPS sampling — read configured location entity's lat/lon attributes
         # and store one sample per tick while the trip is open. The samples
         # are persisted on close via storage.async_insert_positions.
@@ -848,7 +893,7 @@ class EvTripLoggerCoordinator:
                 if lat is not None and lon is not None:
                     try:
                         self.current.gps_samples.append(
-                            (dt_util.now(), float(lat), float(lon))
+                            (now, float(lat), float(lon))
                         )
                     except (TypeError, ValueError):
                         pass
