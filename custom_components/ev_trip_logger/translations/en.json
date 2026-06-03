@@ -159,7 +159,20 @@
       "energy_to_full": { "name": "Energy to full charge" },
       "battery_state": { "name": "Battery percent" },
       "range_at_recent_efficiency": { "name": "Range at recent efficiency" },
-      "consumption_by_temp_bucket": { "name": "Consumption by temperature" }
+      "consumption_by_temp_bucket": { "name": "Consumption by temperature" },
+      "monthly_history": { "name": "Monthly history" },
+      "daily_km_60d": { "name": "Daily km (60 days)" },
+      "trip_patterns": { "name": "Trip patterns" },
+      "tops": { "name": "Trip rankings" },
+      "avg_trip_distance": { "name": "Avg trip distance (30 days)" },
+      "avg_trip_duration": { "name": "Avg trip duration (30 days)" },
+      "avg_trip_speed": { "name": "Avg trip speed (30 days)" },
+      "driving_time_30d": { "name": "Driving time (30 days)" },
+      "avg_charge_kwh_30d": { "name": "Avg charge energy (30 days)" },
+      "avg_charge_cost_30d": { "name": "Avg charge cost (30 days)" }
+    },
+    "calendar": {
+      "activity": { "name": "Activity" }
     }
   }
 }

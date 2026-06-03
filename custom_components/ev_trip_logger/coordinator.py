@@ -95,6 +95,11 @@ class TripInProgress:
     last_power_ts: datetime | None = None
     last_seen_odometer: float | None = None
     last_seen_soc: float | None = None
+    # GPS samples accumulated during the trip — list of (ts, lat, lon).
+    # Persisted to trip_positions on close so the dashboard can render the
+    # route map. Sampled by the live-tick callback so cadence is bound to
+    # _LIVE_TICK (30 s by default).
+    gps_samples: list[tuple[datetime, float, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -830,8 +835,24 @@ class EvTripLoggerCoordinator:
 
     @callback
     def _async_live_tick(self, _now: datetime) -> None:
-        if self.current is not None:
-            self._notify_listeners()
+        if self.current is None:
+            return
+        # GPS sampling — read configured location entity's lat/lon attributes
+        # and store one sample per tick while the trip is open. The samples
+        # are persisted on close via storage.async_insert_positions.
+        if self._location:
+            state = self.hass.states.get(self._location)
+            if state is not None:
+                lat = state.attributes.get("latitude")
+                lon = state.attributes.get("longitude")
+                if lat is not None and lon is not None:
+                    try:
+                        self.current.gps_samples.append(
+                            (dt_util.now(), float(lat), float(lon))
+                        )
+                    except (TypeError, ValueError):
+                        pass
+        self._notify_listeners()
 
     def _cancel_live_tick(self) -> None:
         if self._unsub_live_tick is not None:
@@ -959,6 +980,10 @@ class EvTripLoggerCoordinator:
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        # Persist GPS route samples accumulated during the trip.
+        if active.gps_samples:
+            await self.storage.async_insert_positions(trip_id, active.gps_samples)
 
         # Update journey state after insert: closed by arrival home, otherwise carry on.
         if is_at_home_end and journey_id is not None:

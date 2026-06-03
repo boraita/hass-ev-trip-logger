@@ -1278,3 +1278,160 @@ async def test_recent_charges_attr_exposes_full_schema(hass: HomeAssistant) -> N
         assert key in c, f"missing key: {key}"
     assert c["is_dcfc"] is True
     assert c["location"] == "Repsol"
+
+
+async def test_v050_storage_round_trip_positions_and_aggregates(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.0 backend covers: GPS positions + monthly history + daily km +
+    trip patterns + avg trip metrics + tops + avg charge metrics."""
+    from custom_components.ev_trip_logger.storage import (
+        ChargeRecord,
+        TripRecord,
+        TripStorage,
+    )
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    storage: TripStorage = coordinator.storage
+
+    # Seed 3 trips on 2 different months and 1 different weekday.
+    base_now = dt_util.now()
+    tr_a = TripRecord(
+        started_at=base_now - timedelta(days=40),
+        ended_at=base_now - timedelta(days=40) + timedelta(minutes=30),
+        duration_min=30.0,
+        distance_km=20.0,
+        energy_kwh=4.0,
+        consumption_kwh_100km=20.0,
+        avg_speed_kmh=40.0,
+        cost=1.0,
+    )
+    tr_b = TripRecord(
+        started_at=base_now - timedelta(days=5),
+        ended_at=base_now - timedelta(days=5) + timedelta(minutes=60),
+        duration_min=60.0,
+        distance_km=50.0,
+        energy_kwh=9.0,
+        consumption_kwh_100km=18.0,
+        avg_speed_kmh=50.0,
+        cost=2.0,
+    )
+    tr_c = TripRecord(
+        started_at=base_now - timedelta(days=1),
+        ended_at=base_now - timedelta(days=1) + timedelta(minutes=20),
+        duration_min=20.0,
+        distance_km=10.0,
+        energy_kwh=1.5,
+        consumption_kwh_100km=15.0,
+        avg_speed_kmh=30.0,
+        cost=0.5,
+    )
+    id_a = await storage.async_insert(tr_a)
+    id_b = await storage.async_insert(tr_b)
+    id_c = await storage.async_insert(tr_c)
+    assert id_a and id_b and id_c
+
+    # ===== GPS positions =====
+    samples = [
+        (base_now - timedelta(seconds=60), 40.123, -3.567),
+        (base_now - timedelta(seconds=30), 40.124, -3.568),
+        (base_now, 40.125, -3.569),
+    ]
+    n = await storage.async_insert_positions(id_c, samples)
+    assert n == 3
+    fetched = await storage.async_trip_positions(id_c)
+    assert len(fetched) == 3
+    assert fetched[0]["lat"] == pytest.approx(40.123)
+    assert fetched[-1]["lon"] == pytest.approx(-3.569)
+
+    # ===== Monthly history =====
+    mh = await storage.async_monthly_history(months=6)
+    # tr_a is ~40 days ago (different month), tr_b/tr_c may straddle a
+    # month boundary depending on when the test runs — just assert the
+    # full window sums correctly across all returned months.
+    assert len(mh) >= 1
+    total_km = sum(m["distance_km"] for m in mh)
+    assert total_km == pytest.approx(80.0)  # 20 + 50 + 10
+    total_trips = sum(m["trips"] for m in mh)
+    assert total_trips == 3
+
+    # ===== Daily km window =====
+    daily = await storage.async_daily_km_window(days=10)
+    assert len(daily) == 11  # window + today inclusive
+    km_total = sum(d["distance_km"] for d in daily)
+    assert km_total >= 60.0
+
+    # ===== Trip patterns =====
+    patterns = await storage.async_trip_patterns(days=90)
+    assert patterns["sample_count"] == 3
+    assert sum(patterns["by_hour"].values()) == 3
+    assert sum(patterns["by_weekday"].values()) == 3
+
+    # ===== Avg trip metrics =====
+    since = base_now - timedelta(days=10)
+    avg = await storage.async_avg_trip_metrics(since=since)
+    assert avg["count"] == 2  # tr_b + tr_c
+    assert avg["avg_distance_km"] == pytest.approx(30.0)  # (50 + 10) / 2
+    assert avg["driving_time_min"] == pytest.approx(80.0)  # 60 + 20
+
+    # ===== Tops lists =====
+    tops = await storage.async_tops_lists(limit=5)
+    assert "longest" in tops and len(tops["longest"]) == 3
+    assert tops["longest"][0]["distance_km"] == 50.0  # tr_b
+    assert tops["top_efficiency"][0]["consumption_kwh_100km"] == 15.0  # tr_c is best
+    assert tops["cheapest"][0]["cost"] == 0.5  # tr_c
+
+    # ===== Avg charge metrics =====
+    await storage.async_insert_charge(ChargeRecord(
+        ended_at=base_now, kwh=18.0, price_per_kwh=0.07, total_cost=1.26,
+    ))
+    await storage.async_insert_charge(ChargeRecord(
+        ended_at=base_now, kwh=22.0, price_per_kwh=0.07, total_cost=1.54,
+    ))
+    chg_avg = await storage.async_avg_charge_metrics(
+        since=base_now - timedelta(days=30)
+    )
+    assert chg_avg["count"] == 2
+    assert chg_avg["avg_kwh"] == pytest.approx(20.0)
+    assert chg_avg["avg_cost"] == pytest.approx(1.40, abs=0.01)
+
+
+async def test_v050_calendar_entity_emits_daily_events(hass: HomeAssistant) -> None:
+    """Calendar produces one all-day event per day with trips/charges."""
+    from custom_components.ev_trip_logger.calendar import EvActivityCalendar
+    from custom_components.ev_trip_logger.storage import ChargeRecord, TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    today = dt_util.now()
+    # Two trips today + one charge yesterday.
+    await coordinator.storage.async_insert(TripRecord(
+        started_at=today.replace(hour=8, minute=0, second=0, microsecond=0),
+        ended_at=today.replace(hour=8, minute=30, second=0, microsecond=0),
+        duration_min=30.0, distance_km=12.0,
+    ))
+    await coordinator.storage.async_insert(TripRecord(
+        started_at=today.replace(hour=18, minute=0, second=0, microsecond=0),
+        ended_at=today.replace(hour=18, minute=30, second=0, microsecond=0),
+        duration_min=30.0, distance_km=11.0,
+    ))
+    await coordinator.storage.async_insert_charge(ChargeRecord(
+        started_at=today - timedelta(days=1),
+        ended_at=today - timedelta(days=1) + timedelta(hours=2),
+        kwh=10.0, price_per_kwh=0.07, total_cost=0.7,
+    ))
+
+    cal = EvActivityCalendar(coordinator)
+    events = await cal.async_get_events(
+        hass,
+        today - timedelta(days=2),
+        today + timedelta(days=1),
+    )
+    # Two days have activity → two events.
+    assert len(events) == 2
+    # Today event should mention 2 viajes + 23 km.
+    today_evt = [e for e in events if e.start == today.date()][0]
+    assert "2 viajes" in today_evt.summary
+    assert "23" in today_evt.summary  # 12 + 11 km

@@ -159,7 +159,20 @@
       "energy_to_full": { "name": "Energía hasta el 100%" },
       "battery_state": { "name": "Porcentaje batería" },
       "range_at_recent_efficiency": { "name": "Autonomía según consumo reciente" },
-      "consumption_by_temp_bucket": { "name": "Consumo por temperatura" }
+      "consumption_by_temp_bucket": { "name": "Consumo por temperatura" },
+      "monthly_history": { "name": "Histórico mensual" },
+      "daily_km_60d": { "name": "Km diarios (60 días)" },
+      "trip_patterns": { "name": "Patrones de viaje" },
+      "tops": { "name": "Récords de viajes" },
+      "avg_trip_distance": { "name": "Distancia media por viaje (30 días)" },
+      "avg_trip_duration": { "name": "Duración media por viaje (30 días)" },
+      "avg_trip_speed": { "name": "Velocidad media por viaje (30 días)" },
+      "driving_time_30d": { "name": "Tiempo conduciendo (30 días)" },
+      "avg_charge_kwh_30d": { "name": "Energía media por carga (30 días)" },
+      "avg_charge_cost_30d": { "name": "Coste medio por carga (30 días)" }
+    },
+    "calendar": {
+      "activity": { "name": "Actividad" }
     }
   }
 }

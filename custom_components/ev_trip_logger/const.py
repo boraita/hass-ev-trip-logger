@@ -5,7 +5,7 @@ from typing import Final
 
 DOMAIN: Final = "ev_trip_logger"
 
-PLATFORMS: Final = ["sensor"]
+PLATFORMS: Final = ["sensor", "calendar"]
 
 CONF_NAME: Final = "name"
 CONF_ODOMETER: Final = "odometer_sensor"

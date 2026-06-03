@@ -229,6 +229,16 @@ async def async_setup_entry(
     entities.append(RangeAtRecentEfficiencySensor(coordinator))
     entities.append(ConsumptionByTempBucketSensor(coordinator))
 
+    # v0.5.0 — dashboard-driven additions
+    entities.append(MonthlyHistorySensor(coordinator))
+    entities.append(DailyKm60dSensor(coordinator))
+    entities.append(TripPatternsSensor(coordinator))
+    entities.append(TopsSensor(coordinator))
+    for key in ("avg_distance_km", "avg_duration_min", "avg_speed_kmh", "driving_time_min"):
+        entities.append(AvgTripMetricsSensor(coordinator, key=key))
+    for key in ("avg_kwh", "avg_cost"):
+        entities.append(AvgChargeMetricsSensor(coordinator, key=key))
+
     entities.extend(
         [
             LastChargeSensor(coordinator, key="kwh"),
@@ -1431,3 +1441,340 @@ class ConsumptionByTempBucketSensor(_BaseTripSensor):
             "bucket_size_c": self._BUCKET_SIZE_C,
             "sample_count": self._sample_count,
         }
+
+
+# === v0.5.0: Pantallas 3 (Trends), 4 (Patterns), 6 (Tops), 8 (Trip-list KPIs), 9 (Charges KPIs) ===
+
+
+class MonthlyHistorySensor(_BaseTripSensor):
+    """Per-month rollups for the last 12 months (powers dual-axis bar chart)."""
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="monthly_history",
+            translation_key="monthly_history",
+            icon="mdi:chart-bar-stacked",
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_monthly_history"
+        self._months: list[dict[str, Any]] = []
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._months = await self._coordinator.storage.async_monthly_history(12)
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return len(self._months)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"months": self._months}
+
+
+class DailyKm60dSensor(_BaseTripSensor):
+    """Per-day km totals for the last 60 days (powers the line chart)."""
+
+    _WINDOW_DAYS = 60
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="daily_km_60d",
+            translation_key="daily_km_60d",
+            native_unit_of_measurement=UnitOfLength.KILOMETERS,
+            device_class=SensorDeviceClass.DISTANCE,
+            state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:chart-line",
+            suggested_display_precision=0,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_daily_km_60d"
+        self._days: list[dict[str, Any]] = []
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._days = await self._coordinator.storage.async_daily_km_window(
+            self._WINDOW_DAYS
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float:
+        return round(sum(d.get("distance_km", 0) for d in self._days), 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"days": self._days, "window_days": self._WINDOW_DAYS}
+
+
+class TripPatternsSensor(_BaseTripSensor):
+    """Trip distribution by hour-of-day and weekday (powers radar / bar charts)."""
+
+    _WINDOW_DAYS = 90
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="trip_patterns",
+            translation_key="trip_patterns",
+            icon="mdi:chart-timeline-variant",
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_trip_patterns"
+        self._patterns: dict[str, Any] = {}
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._patterns = await self._coordinator.storage.async_trip_patterns(
+            self._WINDOW_DAYS
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return int(self._patterns.get("sample_count", 0))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "by_hour": self._patterns.get("by_hour", {}),
+            "by_weekday": self._patterns.get("by_weekday", {}),
+            "km_by_weekday": self._patterns.get("km_by_weekday", {}),
+            "window_days": self._WINDOW_DAYS,
+        }
+
+
+class AvgTripMetricsSensor(_BaseTripSensor):
+    """Per-trip averages over a window — one instance per metric key."""
+
+    _CONFIG: dict[str, dict[str, Any]] = {
+        "avg_distance_km": {
+            "unit": UnitOfLength.KILOMETERS,
+            "device_class": SensorDeviceClass.DISTANCE,
+            "icon": "mdi:map-marker-distance",
+            "slug": "avg_trip_distance",
+            "precision": 1,
+        },
+        "avg_duration_min": {
+            "unit": UnitOfTime.MINUTES,
+            "device_class": SensorDeviceClass.DURATION,
+            "icon": "mdi:timer-outline",
+            "slug": "avg_trip_duration",
+            "precision": 0,
+        },
+        "avg_speed_kmh": {
+            "unit": UnitOfSpeed.KILOMETERS_PER_HOUR,
+            "device_class": SensorDeviceClass.SPEED,
+            "icon": "mdi:speedometer",
+            "slug": "avg_trip_speed",
+            "precision": 1,
+        },
+        "driving_time_min": {
+            "unit": UnitOfTime.MINUTES,
+            "device_class": SensorDeviceClass.DURATION,
+            "icon": "mdi:steering",
+            "slug": "driving_time_30d",
+            "precision": 0,
+        },
+    }
+
+    _WINDOW_DAYS = 30
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator, *, key: str) -> None:
+        super().__init__(coordinator)
+        cfg = self._CONFIG[key]
+        self._key = key
+        slug = cfg["slug"]
+        self.entity_description = SensorEntityDescription(
+            key=slug,
+            translation_key=slug,
+            native_unit_of_measurement=cfg.get("unit"),
+            device_class=cfg.get("device_class"),
+            state_class=SensorStateClass.MEASUREMENT,
+            icon=cfg.get("icon"),
+            suggested_display_precision=cfg.get("precision"),
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_{slug}"
+        self._value: float | None = None
+        self._count: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        since = dt_util.now() - timedelta(days=self._WINDOW_DAYS)
+        m = await self._coordinator.storage.async_avg_trip_metrics(since)
+        self._value = m.get(self._key)
+        self._count = int(m.get("count", 0))
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"sample_count": self._count, "window_days": self._WINDOW_DAYS}
+
+
+class TopsSensor(_BaseTripSensor):
+    """Top-N trips per criterion (powers the Rankings screen)."""
+
+    _LIMIT = 9
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="tops",
+            translation_key="tops",
+            icon="mdi:trophy-variant",
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_tops"
+        self._tops: dict[str, list[dict[str, Any]]] = {}
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._tops = await self._coordinator.storage.async_tops_lists(self._LIMIT)
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return sum(len(v) for v in self._tops.values())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {**self._tops, "limit": self._LIMIT}
+
+
+class AvgChargeMetricsSensor(_BaseTripSensor):
+    """Average per-session charge metric (kWh or cost) for the last 30 days."""
+
+    _CONFIG: dict[str, dict[str, Any]] = {
+        "avg_kwh": {
+            "unit": UnitOfEnergy.KILO_WATT_HOUR,
+            "device_class": SensorDeviceClass.ENERGY,
+            "icon": "mdi:battery-charging",
+            "slug": "avg_charge_kwh_30d",
+            "precision": 2,
+        },
+        "avg_cost": {
+            "use_currency": True,
+            "device_class": SensorDeviceClass.MONETARY,
+            "icon": "mdi:cash-multiple",
+            "slug": "avg_charge_cost_30d",
+            "precision": 2,
+        },
+    }
+
+    _WINDOW_DAYS = 30
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator, *, key: str) -> None:
+        super().__init__(coordinator)
+        cfg = self._CONFIG[key]
+        self._key = key
+        slug = cfg["slug"]
+        self.entity_description = SensorEntityDescription(
+            key=slug,
+            translation_key=slug,
+            native_unit_of_measurement=(
+                coordinator.currency if cfg.get("use_currency") else cfg.get("unit")
+            ),
+            device_class=cfg.get("device_class"),
+            state_class=SensorStateClass.MEASUREMENT,
+            icon=cfg.get("icon"),
+            suggested_display_precision=cfg.get("precision"),
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_{slug}"
+        self._value: float | None = None
+        self._count: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        since = dt_util.now() - timedelta(days=self._WINDOW_DAYS)
+        m = await self._coordinator.storage.async_avg_charge_metrics(since)
+        self._value = m.get(self._key)
+        self._count = int(m.get("count", 0))
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"sample_count": self._count, "window_days": self._WINDOW_DAYS}

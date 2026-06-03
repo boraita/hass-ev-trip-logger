@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS charges (
     is_dcfc INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_charges_ended_at ON charges(ended_at);
+
+CREATE TABLE IF NOT EXISTS trip_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    lat REAL NOT NULL,
+    lon REAL NOT NULL,
+    FOREIGN KEY (trip_id) REFERENCES trips(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_trip_positions_trip_id ON trip_positions(trip_id);
 """
 
 
@@ -221,6 +231,22 @@ class TripStorage:
         }
         if "is_dcfc" not in charge_cols:
             conn.execute("ALTER TABLE charges ADD COLUMN is_dcfc INTEGER")
+        # v0.5.0: trip_positions table for route-map drilldown.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trip_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trip_id INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                FOREIGN KEY (trip_id) REFERENCES trips(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trip_positions_trip_id ON trip_positions(trip_id)"
+        )
 
     async def async_insert(self, record: TripRecord) -> int:
         """Persist a completed trip, return its id."""
@@ -751,6 +777,270 @@ class TripStorage:
             for r in rows:
                 writer.writerow(dict(r))
         return len(rows)
+
+    # === v0.5.0 additions: GPS positions + advanced aggregates ===
+
+    async def async_insert_positions(
+        self, trip_id: int, samples: list[tuple[datetime, float, float]]
+    ) -> int:
+        """Persist GPS samples for a trip. Each sample is (ts, lat, lon).
+
+        Called on trip close with whatever the GPS sampler accumulated. Returns
+        the number of rows inserted.
+        """
+        if not samples:
+            return 0
+        return await self._hass.async_add_executor_job(
+            self._insert_positions, trip_id, samples
+        )
+
+    def _insert_positions(
+        self, trip_id: int, samples: list[tuple[datetime, float, float]]
+    ) -> int:
+        rows = [(trip_id, ts.isoformat(), lat, lon) for ts, lat, lon in samples]
+        with sqlite3.connect(self._path) as conn:
+            conn.executemany(
+                "INSERT INTO trip_positions (trip_id, ts, lat, lon) VALUES (?,?,?,?)",
+                rows,
+            )
+        return len(rows)
+
+    async def async_trip_positions(self, trip_id: int) -> list[dict[str, Any]]:
+        """Return GPS samples for a trip ordered by ts."""
+        return await self._hass.async_add_executor_job(
+            self._trip_positions, trip_id
+        )
+
+    def _trip_positions(self, trip_id: int) -> list[dict[str, Any]]:
+        with sqlite3.connect(self._path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT ts, lat, lon FROM trip_positions WHERE trip_id = ? ORDER BY ts",
+                (trip_id,),
+            ).fetchall()
+        return [
+            {"ts": r["ts"], "lat": float(r["lat"]), "lon": float(r["lon"])}
+            for r in rows
+        ]
+
+    async def async_monthly_history(self, months: int = 12) -> list[dict[str, Any]]:
+        """Per-month rollup (km, kWh, cost, trips) for the last N months."""
+        return await self._hass.async_add_executor_job(
+            self._monthly_history, months
+        )
+
+    def _monthly_history(self, months: int) -> list[dict[str, Any]]:
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    substr(started_at, 1, 7) AS month,
+                    COALESCE(SUM(distance_km), 0) AS distance_km,
+                    COALESCE(SUM(energy_kwh), 0) AS energy_kwh,
+                    COALESCE(SUM(cost), 0) AS cost,
+                    COUNT(*) AS trips
+                FROM trips
+                GROUP BY month
+                ORDER BY month DESC
+                LIMIT ?
+                """,
+                (months,),
+            ).fetchall()
+        # Reverse to chronological order for chart consumers.
+        return list(reversed([
+            {
+                "month": r[0],
+                "distance_km": round(float(r[1]), 1),
+                "energy_kwh": round(float(r[2]), 2),
+                "cost": round(float(r[3]), 2),
+                "trips": int(r[4]),
+            }
+            for r in rows
+        ]))
+
+    async def async_daily_km_window(self, days: int = 60) -> list[dict[str, Any]]:
+        """Per-day km totals for the last N days (zero-filled)."""
+        return await self._hass.async_add_executor_job(
+            self._daily_km_window, days
+        )
+
+    def _daily_km_window(self, days: int) -> list[dict[str, Any]]:
+        from datetime import timedelta as _td
+        cutoff = (datetime.now() - _td(days=days)).date().isoformat()
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                """
+                SELECT substr(started_at, 1, 10) AS day,
+                       COALESCE(SUM(distance_km), 0) AS km
+                FROM trips
+                WHERE substr(started_at, 1, 10) >= ?
+                GROUP BY day
+                """,
+                (cutoff,),
+            ).fetchall()
+        by_day = {r[0]: float(r[1]) for r in rows}
+        # Zero-fill the full window so chart renderers don't draw gaps.
+        out: list[dict[str, Any]] = []
+        for i in range(days, -1, -1):
+            d = (datetime.now() - _td(days=i)).date().isoformat()
+            out.append({"day": d, "distance_km": round(by_day.get(d, 0.0), 1)})
+        return out
+
+    async def async_trip_patterns(self, days: int = 90) -> dict[str, Any]:
+        """Trip distribution by hour-of-day and weekday over the last N days.
+
+        Returns: {
+            "by_hour":    {"0": count, ..., "23": count},
+            "by_weekday": {"0": count, ..., "6": count},  # 0=Mon
+            "km_by_weekday": {"0": km, ...},
+            "sample_count": int,
+        }
+        """
+        return await self._hass.async_add_executor_job(
+            self._trip_patterns, days
+        )
+
+    def _trip_patterns(self, days: int) -> dict[str, Any]:
+        from datetime import timedelta as _td
+        cutoff = (datetime.now() - _td(days=days)).isoformat()
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                "SELECT started_at, distance_km FROM trips WHERE started_at >= ?",
+                (cutoff,),
+            ).fetchall()
+        by_hour: dict[int, int] = {h: 0 for h in range(24)}
+        by_weekday: dict[int, int] = {w: 0 for w in range(7)}
+        km_by_weekday: dict[int, float] = {w: 0.0 for w in range(7)}
+        for started_at, distance in rows:
+            try:
+                ts = datetime.fromisoformat(started_at)
+            except ValueError:
+                continue
+            by_hour[ts.hour] += 1
+            by_weekday[ts.weekday()] += 1
+            km_by_weekday[ts.weekday()] += float(distance or 0)
+        return {
+            "by_hour": {str(k): v for k, v in by_hour.items()},
+            "by_weekday": {str(k): v for k, v in by_weekday.items()},
+            "km_by_weekday": {
+                str(k): round(v, 1) for k, v in km_by_weekday.items()
+            },
+            "sample_count": len(rows),
+        }
+
+    async def async_avg_trip_metrics(
+        self, since: datetime
+    ) -> dict[str, float | None]:
+        """Per-trip averages over the window (distance, duration, speed, etc.).
+
+        Powers the 'last N trips averages' headers from the BYD app.
+        """
+        return await self._hass.async_add_executor_job(
+            self._avg_trip_metrics, since
+        )
+
+    def _avg_trip_metrics(self, since: datetime) -> dict[str, float | None]:
+        with sqlite3.connect(self._path) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    AVG(distance_km) AS d,
+                    AVG(duration_min) AS dur,
+                    AVG(energy_kwh) AS e,
+                    AVG(consumption_kwh_100km) AS c,
+                    AVG(avg_speed_kmh) AS s,
+                    SUM(duration_min) AS total_driving,
+                    COUNT(*) AS n
+                FROM trips
+                WHERE started_at >= ?
+                """,
+                (since.isoformat(),),
+            ).fetchone()
+        d, dur, e, c, s, total_driving, n = row
+        return {
+            "avg_distance_km": float(d) if d else None,
+            "avg_duration_min": float(dur) if dur else None,
+            "avg_energy_kwh": float(e) if e else None,
+            "avg_consumption_kwh_100km": float(c) if c else None,
+            "avg_speed_kmh": float(s) if s else None,
+            "driving_time_min": float(total_driving) if total_driving else 0.0,
+            "count": int(n or 0),
+        }
+
+    async def async_tops_lists(self, limit: int = 9) -> dict[str, list[dict[str, Any]]]:
+        """Top-N trips per criterion (distance, duration, consumption, efficiency, speed)."""
+        return await self._hass.async_add_executor_job(self._tops_lists, limit)
+
+    def _tops_lists(self, limit: int) -> dict[str, list[dict[str, Any]]]:
+        criteria = {
+            # SQL ORDER BY clause and human-friendly key
+            "longest": "distance_km DESC",
+            "longest_duration": "duration_min DESC",
+            "top_consumption": "energy_kwh DESC",        # most kWh used in one trip
+            "top_efficiency": "consumption_kwh_100km ASC",  # lowest kWh/100km = best
+            "top_speed": "avg_speed_kmh DESC",
+            "cheapest": "cost ASC",
+        }
+        out: dict[str, list[dict[str, Any]]] = {}
+        with sqlite3.connect(self._path) as conn:
+            for name, order_by in criteria.items():
+                # Skip rows where the sorting key is NULL so 'best' isn't 'unknown'.
+                key = order_by.split()[0]
+                rows = conn.execute(
+                    f"""
+                    SELECT id, started_at, ended_at, distance_km, duration_min,
+                           energy_kwh, consumption_kwh_100km, avg_speed_kmh, cost,
+                           currency, origin, destination
+                    FROM trips
+                    WHERE {key} IS NOT NULL
+                    ORDER BY {order_by}
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                out[name] = [
+                    {
+                        "trip_id": r[0],
+                        "started_at": r[1],
+                        "ended_at": r[2],
+                        "distance_km": r[3],
+                        "duration_min": r[4],
+                        "energy_kwh": r[5],
+                        "consumption_kwh_100km": r[6],
+                        "avg_speed_kmh": r[7],
+                        "cost": r[8],
+                        "currency": r[9],
+                        "origin": r[10],
+                        "destination": r[11],
+                    }
+                    for r in rows
+                ]
+        return out
+
+    async def async_avg_charge_metrics(
+        self, since: datetime
+    ) -> dict[str, float | int]:
+        """Per-session charge averages (kWh, cost) for the KPI tiles."""
+        return await self._hass.async_add_executor_job(
+            self._avg_charge_metrics, since
+        )
+
+    def _avg_charge_metrics(self, since: datetime) -> dict[str, float | int]:
+        with sqlite3.connect(self._path) as conn:
+            row = conn.execute(
+                """
+                SELECT AVG(kwh) AS k, AVG(total_cost) AS c, COUNT(*) AS n
+                FROM charges
+                WHERE ended_at >= ?
+                """,
+                (since.isoformat(),),
+            ).fetchone()
+        k, c, n = row
+        return {
+            "avg_kwh": float(k) if k else 0.0,
+            "avg_cost": float(c) if c else 0.0,
+            "count": int(n or 0),
+        }
 
 
 def _row_to_record(row: sqlite3.Row) -> TripRecord:
