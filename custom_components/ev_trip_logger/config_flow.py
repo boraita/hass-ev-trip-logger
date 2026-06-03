@@ -28,6 +28,7 @@ from .const import (
     CONF_ENERGY_PRICE,
     CONF_HOME_ZONE,
     CONF_IDLE_TIMEOUT,
+    CONF_IDLE_TRIP_TIMEOUT_MIN,
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
     CONF_NAME,
@@ -42,6 +43,7 @@ from .const import (
     DEFAULT_ENERGY_PRICE,
     DEFAULT_HOME_ZONE,
     DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_IDLE_TRIP_TIMEOUT_MIN,
     DEFAULT_MIN_TRIP_DISTANCE,
     DEFAULT_RECENT_LIMIT,
     DOMAIN,
@@ -141,6 +143,16 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): NumberSelector(
                 NumberSelectorConfig(
                     min=0, max=30, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min"
+                )
+            ),
+            vol.Required(
+                CONF_IDLE_TRIP_TIMEOUT_MIN,
+                default=defaults.get(
+                    CONF_IDLE_TRIP_TIMEOUT_MIN, DEFAULT_IDLE_TRIP_TIMEOUT_MIN
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=2, max=60, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min"
                 )
             ),
             vol.Required(

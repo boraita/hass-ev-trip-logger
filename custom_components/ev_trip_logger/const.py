@@ -19,6 +19,8 @@ CONF_SPEED: Final = "speed_sensor"
 
 CONF_BATTERY_CAPACITY: Final = "battery_capacity_kwh"
 CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"
+CONF_IDLE_TRIP_TIMEOUT_MIN: Final = "idle_trip_timeout_minutes"
+DEFAULT_IDLE_TRIP_TIMEOUT_MIN: Final = 10
 CONF_MIN_TRIP_DISTANCE: Final = "min_trip_distance_km"
 CONF_IDLE_TIMEOUT: Final = "idle_timeout_minutes"
 CONF_ENERGY_PRICE: Final = "energy_price_kwh"

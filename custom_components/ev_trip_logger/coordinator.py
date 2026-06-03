@@ -42,6 +42,7 @@ from .const import (
     CONF_MIN_TRIP_DISTANCE,
     CONF_ODOMETER,
     CONF_DCFC_THRESHOLD_KW,
+    CONF_IDLE_TRIP_TIMEOUT_MIN,
     CONF_POWER,
     CONF_SPEED,
     CONF_TEMP,
@@ -49,6 +50,7 @@ from .const import (
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_DCFC_THRESHOLD_KW,
+    DEFAULT_IDLE_TRIP_TIMEOUT_MIN,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
     DEFAULT_HOME_ZONE,
@@ -155,6 +157,14 @@ class EvTripLoggerCoordinator:
         )
         self._dcfc_threshold_kw = float(
             merged.get(CONF_DCFC_THRESHOLD_KW, DEFAULT_DCFC_THRESHOLD_KW)
+        )
+        # How long to wait without movement (odo change or speed > 0) before
+        # force-closing an open trip. Configurable so cloud-polling
+        # integrations with slow odo cadence (e.g. Tesla Fleet ~5 min)
+        # can use a longer threshold than those with 1-min cadence.
+        self._idle_trip_timeout_s = max(
+            60,
+            int(merged.get(CONF_IDLE_TRIP_TIMEOUT_MIN, DEFAULT_IDLE_TRIP_TIMEOUT_MIN)) * 60,
         )
         self._min_distance = float(
             merged.get(CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE)
@@ -901,7 +911,7 @@ class EvTripLoggerCoordinator:
         # close, we want to stop accumulating points.
         last_move = self.current.last_movement_ts
         if last_move is not None and (
-            (now - last_move).total_seconds() > _IDLE_INSIDE_TRIP_S
+            (now - last_move).total_seconds() > self._idle_trip_timeout_s
         ):
             _LOGGER.info(
                 "Idle watchdog: no movement for %.0fs while trip open — "
