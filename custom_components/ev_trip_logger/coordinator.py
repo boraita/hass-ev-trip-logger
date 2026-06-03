@@ -307,6 +307,20 @@ class EvTripLoggerCoordinator:
             await self.storage.async_last_completed_journey_id(self.current_journey_id)
         )
 
+        # One-shot heal: re-cost every trip from its preceding charge's
+        # price. Catches users whose CONF_ENERGY_PRICE was 0 at trip-close
+        # time, or whose set_last_charge_price corrections never
+        # propagated. Idempotent and cheap.
+        try:
+            healed = await self.storage.async_recompute_trip_costs_from_charges(
+                default_price=self._energy_price
+            )
+            if healed:
+                _LOGGER.info("Startup heal: recomputed cost on %d trip(s)", healed)
+                self.last_trip = await self.storage.async_get_last()
+        except Exception as err:  # pragma: no cover — defensive
+            _LOGGER.debug("Trip cost heal failed (non-fatal): %s", err)
+
         self._unsub_state = async_track_state_change_event(
             self.hass, [self._vehicle_on], self._async_vehicle_on_changed
         )
@@ -764,17 +778,32 @@ class EvTripLoggerCoordinator:
             return
         self.current_charge = None
         soc_end = self._read_float(self._battery) or active.last_seen_soc
-        if active.soc_start is None or soc_end is None or soc_end <= active.soc_start:
-            _LOGGER.debug("Discarding auto-charge: SoC delta not positive")
+        # Need at least 2 % SoC delta to count — cloud-polling can wobble by 1 %
+        # while sitting plugged in (battery balancing, etc.) and we don't want
+        # phantom 0.8 kWh "charges" stomping the user's price corrections.
+        if (
+            active.soc_start is None
+            or soc_end is None
+            or (soc_end - active.soc_start) < 2
+        ):
+            _LOGGER.debug("Discarding auto-charge: SoC delta < 2%%")
             self._notify_listeners()
             return
 
         if self.last_charge is not None:
-            elapsed = (now - self.last_charge.ended_at).total_seconds()
-            if elapsed < self._AUTO_CHARGE_DEDUP_WINDOW_S:
+            # Compare against `started_at` so a manual correction hours after
+            # the original auto-detect doesn't open the window. Also widen
+            # the dedup horizon to 2 h.
+            ref_ts = self.last_charge.started_at or self.last_charge.ended_at
+            elapsed = (now - ref_ts).total_seconds()
+            # NEVER insert a new auto-charge while the most recent one has its
+            # price locked by the user — that record's price is the truth and
+            # the auto-detector would clone it under the wrong default price.
+            if self.last_charge.price_locked or elapsed < 7200:  # 2 h
                 _LOGGER.debug(
-                    "Skipping auto-charge: a charge was logged %.0fs ago (likely manual)",
-                    elapsed,
+                    "Skipping auto-charge: previous charge %.0fs ago "
+                    "(price_locked=%s)",
+                    elapsed, self.last_charge.price_locked,
                 )
                 self._notify_listeners()
                 return
@@ -1172,6 +1201,17 @@ class EvTripLoggerCoordinator:
             updated.charge_id, updated.price_per_kwh, updated.total_cost,
             updated.location,
         )
+        # Re-cost every trip from the most-recent-before charge's price.
+        # Correcting a charge's price retroactively fixes the trips that
+        # used that energy. Trips with no prior charge fall back to the
+        # configured home tariff.
+        n = await self.storage.async_recompute_trip_costs_from_charges(
+            default_price=self._energy_price
+        )
+        if n:
+            _LOGGER.info("Recomputed cost on %d trip(s) after price correction", n)
+            self.last_trip = await self.storage.async_get_last()
+            self._notify_trip_log_listeners()
         self._notify_listeners()
         self._notify_trip_log_listeners()
         return updated

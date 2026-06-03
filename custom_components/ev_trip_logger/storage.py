@@ -59,7 +59,11 @@ CREATE TABLE IF NOT EXISTS charges (
     soc_end REAL,
     location TEXT,
     notes TEXT,
-    is_dcfc INTEGER
+    is_dcfc INTEGER,
+    -- price_locked = 1 when the user has explicitly corrected the price via
+    -- set_last_charge_price. Auto-detect must NOT stomp it with a phantom
+    -- second insert. NULL/0 = price is just the default fallback.
+    price_locked INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_charges_ended_at ON charges(ended_at);
 
@@ -163,6 +167,9 @@ class ChargeRecord:
     location: str | None = None
     notes: str | None = None
     is_dcfc: bool | None = None
+    # True if the user has explicitly set the price (incl. €0 for "free").
+    # Auto-detect must not stomp it.
+    price_locked: bool = False
     charge_id: int | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -245,6 +252,8 @@ class TripStorage:
         }
         if "is_dcfc" not in charge_cols:
             conn.execute("ALTER TABLE charges ADD COLUMN is_dcfc INTEGER")
+        if "price_locked" not in charge_cols:
+            conn.execute("ALTER TABLE charges ADD COLUMN price_locked INTEGER")
         # v0.5.0: trip_positions table for route-map drilldown.
         conn.execute(
             """
@@ -669,15 +678,74 @@ class TripStorage:
                 new_total = row["total_cost"]
             new_location = location if location is not None else row["location"]
             new_notes = notes if notes is not None else row["notes"]
+            # If the caller passed a pricing field (including 0), lock the
+            # price so auto-detect doesn't stomp the user's correction.
+            price_locked = (
+                1 if (price_per_kwh is not None or total_cost is not None) else None
+            )
             conn.execute(
                 "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
-                "location = ?, notes = ? WHERE id = ?",
-                (new_price, new_total, new_location, new_notes, row["id"]),
+                "location = ?, notes = ?, price_locked = COALESCE(?, price_locked) "
+                "WHERE id = ?",
+                (
+                    new_price, new_total, new_location, new_notes,
+                    price_locked, row["id"],
+                ),
             )
             updated = conn.execute(
                 "SELECT * FROM charges WHERE id = ?", (row["id"],)
             ).fetchone()
         return _row_to_charge(updated)
+
+    async def async_recompute_trip_costs_from_charges(
+        self, default_price: float = 0.0
+    ) -> int:
+        """Re-cost every trip from its preceding charge's price_per_kwh.
+
+        For each trip in the DB, look up the most recent charge whose
+        `ended_at <= trip.started_at` and set `cost = energy_kwh * that
+        charge's price_per_kwh`. Trips without prior charges fall back to
+        `default_price` (typically the user's CONF_ENERGY_PRICE option).
+
+        Idempotent. Called automatically after `set_last_charge_price`
+        and once on startup to heal historical €0 trips. Returns the
+        number of trip rows updated.
+        """
+        return await self._hass.async_add_executor_job(
+            self._recompute_trip_costs_from_charges, default_price
+        )
+
+    def _recompute_trip_costs_from_charges(self, default_price: float) -> int:
+        updated = 0
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            trips = conn.execute(
+                """
+                SELECT id, started_at, energy_kwh
+                FROM trips
+                WHERE energy_kwh IS NOT NULL AND energy_kwh > 0
+                """
+            ).fetchall()
+            for t in trips:
+                row = conn.execute(
+                    "SELECT price_per_kwh, currency FROM charges "
+                    "WHERE ended_at <= ? ORDER BY ended_at DESC LIMIT 1",
+                    (t["started_at"],),
+                ).fetchone()
+                if row is not None and row["price_per_kwh"] is not None:
+                    price = float(row["price_per_kwh"])
+                    currency = row["currency"]
+                else:
+                    price = float(default_price)
+                    currency = None
+                new_cost = float(t["energy_kwh"]) * price
+                conn.execute(
+                    "UPDATE trips SET cost = ?, currency = COALESCE(currency, ?) "
+                    "WHERE id = ?",
+                    (new_cost, currency, t["id"]),
+                )
+                updated += 1
+        return updated
 
     async def async_delete_last_charge(self) -> bool:
         return await self._hass.async_add_executor_job(self._delete_last_charge)
@@ -1004,6 +1072,9 @@ class TripStorage:
         with sqlite3.connect(self._path) as conn:
             for name, order_by in criteria.items():
                 # Skip rows where the sorting key is NULL so 'best' isn't 'unknown'.
+                # Also skip rows where the key is <=0: a "cheapest" trip costing
+                # €0 because the user's energy_price option was misconfigured is
+                # noise, not a record. Same goes for top_speed at 0 km/h etc.
                 key = order_by.split()[0]
                 rows = conn.execute(
                     f"""
@@ -1011,7 +1082,7 @@ class TripStorage:
                            energy_kwh, consumption_kwh_100km, avg_speed_kmh, cost,
                            currency, origin, destination
                     FROM trips
-                    WHERE {key} IS NOT NULL
+                    WHERE {key} IS NOT NULL AND {key} > 0
                     ORDER BY {order_by}
                     LIMIT ?
                     """,
@@ -1108,6 +1179,7 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
         location=row["location"],
         notes=row["notes"],
         is_dcfc=bool(is_dcfc_raw) if is_dcfc_raw is not None else None,
+        price_locked=bool(row["price_locked"]) if "price_locked" in row.keys() and row["price_locked"] else False,
     )
 
 

@@ -562,6 +562,7 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         "location": charge.location,
         "notes": charge.notes,
         "is_dcfc": charge.is_dcfc,
+        "price_locked": getattr(charge, "price_locked", False),
     }
 
 
