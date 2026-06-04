@@ -398,12 +398,18 @@ async def test_log_charge_without_price_uses_home_default(hass: HomeAssistant) -
     assert coordinator.last_charge.total_cost == pytest.approx(1.5)
 
 
-async def test_trip_cost_uses_last_charge_price(hass: HomeAssistant) -> None:
-    """A trip closed after a logged charge should use that charge's price."""
-    entry = await _setup(hass)
+async def test_trip_cost_uses_configured_home_tariff(hass: HomeAssistant) -> None:
+    """Trip cost always uses CONF_ENERGY_PRICE, not the last-charge price.
+
+    Earlier versions (<= v0.5.6) inherited the price from the most recent
+    charge. That broke when the user logged a one-off free/expensive
+    external charge: every subsequent trip got costed at €0 or at €0.50/kWh
+    when in reality the energy mostly came from prior home charges.
+    """
+    entry = await _setup(hass)  # home tariff defaults to 0.15 €/kWh
     coordinator = hass.data[DOMAIN][entry.entry_id]
 
-    # Log a charge at 0.50 €/kWh (away from home, expensive).
+    # An exotic charge — won't affect trip cost.
     await hass.services.async_call(
         DOMAIN, SERVICE_LOG_CHARGE,
         {"kwh": 5.0, "price_per_kwh": 0.50},
@@ -420,8 +426,8 @@ async def test_trip_cost_uses_last_charge_price(hass: HomeAssistant) -> None:
     trip = coordinator.last_trip
     assert trip is not None
     assert trip.energy_kwh == pytest.approx(15.0)
-    # Cost = energy * last-charge price (0.50), NOT the default 0.15.
-    assert trip.cost == pytest.approx(7.5)
+    # Cost = energy * configured home tariff (0.15), NOT the one-off charge's 0.50.
+    assert trip.cost == pytest.approx(2.25)
 
 
 async def test_auto_detect_charge_records_session(hass: HomeAssistant) -> None:
@@ -950,7 +956,9 @@ async def test_recent_trips_sensor_lists_trips_in_attributes(
     assert t["distance_km"] == pytest.approx(30.0)
     assert t["energy_kwh"] == pytest.approx(11.25)
     assert t["consumption_kwh_100km"] == pytest.approx(37.5)
-    assert t["cost"] == pytest.approx(3.38, abs=0.01)
+    # 11.25 kWh × 0.15 €/kWh (configured home tariff) = 1.69 €
+    # (Trip cost does NOT inherit the 0.30 from the one-off external charge.)
+    assert t["cost"] == pytest.approx(1.69, abs=0.01)
     assert t["score"] is not None  # depends on consumption
 
 

@@ -257,6 +257,17 @@ class EvTripLoggerCoordinator:
         """Current SoC % from the configured battery sensor, None if unreadable."""
         return self._read_float(self._battery)
 
+    def _trip_cost_price_per_kwh(self) -> float:
+        """€/kWh used to compute trip cost — ALWAYS the configured home tariff.
+
+        Trips don't carry the price of "the last charge" forward. An external
+        DC-fast at €0.40 or a free public charger were one-off events; the
+        car's battery holds a mix of home + external energy and trip cost is
+        more honestly modelled as `energy × home tariff`. Individual charge
+        records keep their actual price (free / home / DC) in their own row.
+        """
+        return float(self._energy_price)
+
     @property
     def exterior_temp(self) -> float | None:
         """Configured outside-temperature sensor value, None if unset/unreadable."""
@@ -646,11 +657,7 @@ class EvTripLoggerCoordinator:
         )
         if avg_speed is not None and avg_speed > 300:
             avg_speed = None
-        price_per_kwh = (
-            self.last_charge.price_per_kwh
-            if self.last_charge is not None
-            else self._energy_price
-        )
+        price_per_kwh = self._trip_cost_price_per_kwh()
         cost = energy * price_per_kwh if energy and energy > 0 else None
         location_start = self.last_trip.destination if self.last_trip else None
         location_end = self._read_str(self._location) if self._location else None
@@ -1002,11 +1009,7 @@ class EvTripLoggerCoordinator:
             if active.temp_samples
             else None
         )
-        price_per_kwh = (
-            self.last_charge.price_per_kwh
-            if self.last_charge is not None
-            else self._energy_price
-        )
+        price_per_kwh = self._trip_cost_price_per_kwh()
         cost_currency = (
             self.last_charge.currency
             if self.last_charge is not None and self.last_charge.currency
@@ -1326,11 +1329,7 @@ class EvTripLoggerCoordinator:
             # Sub-second time deltas produce nonsense (e.g. 40 000 km/h when
             # you bump the odometer slider just after turning on). Cap it.
             avg_speed = None
-        price_per_kwh = (
-            self.last_charge.price_per_kwh
-            if self.last_charge is not None
-            else self._energy_price
-        )
+        price_per_kwh = self._trip_cost_price_per_kwh()
         cost_currency = (
             self.last_charge.currency
             if self.last_charge is not None and self.last_charge.currency
@@ -1454,11 +1453,7 @@ class EvTripLoggerCoordinator:
         )
 
         # Live cost: use the most recent charge price if any, else the home default.
-        price_per_kwh = (
-            self.last_charge.price_per_kwh
-            if self.last_charge is not None
-            else self._energy_price
-        )
+        price_per_kwh = self._trip_cost_price_per_kwh()
         cost = (energy * price_per_kwh) if energy and energy > 0 else None
         # Live score: same curve as TripRecord.score.
         score = None

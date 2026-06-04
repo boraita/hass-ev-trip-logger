@@ -700,52 +700,35 @@ class TripStorage:
     async def async_recompute_trip_costs_from_charges(
         self, default_price: float = 0.0
     ) -> int:
-        """Re-cost every trip from its preceding charge's price_per_kwh.
+        """Re-cost every trip at the configured home tariff (`default_price`).
 
-        For each trip in the DB, look up the most recent charge whose
-        `ended_at <= trip.started_at` and set `cost = energy_kwh * that
-        charge's price_per_kwh`. Trips without prior charges fall back to
-        `default_price` (typically the user's CONF_ENERGY_PRICE option).
+        Trip cost is **NOT** inherited from individual charges. External
+        one-off charges (free public charger, expensive DC-fast on a road
+        trip) should not change the cost basis for the trips that follow —
+        the user's home tariff is the right reference. Each charge keeps
+        its own actual price in its own record (visible in recent_charges
+        and the AC/DC averages).
 
-        Idempotent. Called automatically after `set_last_charge_price`
-        and once on startup to heal historical €0 trips. Returns the
-        number of trip rows updated.
+        Idempotent. Called once on startup so historical €0 trips heal
+        themselves when the user fixes a wrongly-configured CONF_ENERGY_PRICE.
+        Returns the number of trip rows updated.
+
+        (The method name keeps `_from_charges` for backwards compat with
+        the v0.5.4-0.5.6 codepath.)
         """
         return await self._hass.async_add_executor_job(
             self._recompute_trip_costs_from_charges, default_price
         )
 
     def _recompute_trip_costs_from_charges(self, default_price: float) -> int:
-        updated = 0
+        price = float(default_price)
         with self._connect() as conn:
-            conn.row_factory = sqlite3.Row
-            trips = conn.execute(
-                """
-                SELECT id, started_at, energy_kwh
-                FROM trips
-                WHERE energy_kwh IS NOT NULL AND energy_kwh > 0
-                """
-            ).fetchall()
-            for t in trips:
-                row = conn.execute(
-                    "SELECT price_per_kwh, currency FROM charges "
-                    "WHERE ended_at <= ? ORDER BY ended_at DESC LIMIT 1",
-                    (t["started_at"],),
-                ).fetchone()
-                if row is not None and row["price_per_kwh"] is not None:
-                    price = float(row["price_per_kwh"])
-                    currency = row["currency"]
-                else:
-                    price = float(default_price)
-                    currency = None
-                new_cost = float(t["energy_kwh"]) * price
-                conn.execute(
-                    "UPDATE trips SET cost = ?, currency = COALESCE(currency, ?) "
-                    "WHERE id = ?",
-                    (new_cost, currency, t["id"]),
-                )
-                updated += 1
-        return updated
+            cur = conn.execute(
+                "UPDATE trips SET cost = energy_kwh * ? "
+                "WHERE energy_kwh IS NOT NULL AND energy_kwh > 0",
+                (price,),
+            )
+            return int(cur.rowcount or 0)
 
     async def async_delete_last_charge(self) -> bool:
         return await self._hass.async_add_executor_job(self._delete_last_charge)
