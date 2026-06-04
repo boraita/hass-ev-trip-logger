@@ -16,6 +16,7 @@ CONF_CHARGE_SENSOR: Final = "charge_sensor"
 CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
 CONF_SPEED: Final = "speed_sensor"
+CONF_PLUG_SENSOR: Final = "plug_sensor"
 
 CONF_BATTERY_CAPACITY: Final = "battery_capacity_kwh"
 CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"

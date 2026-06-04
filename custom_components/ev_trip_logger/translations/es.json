@@ -46,6 +46,7 @@
         "data": {
           "power_sensor": "Sensor de potencia (kW) — habilita regen, max_power, potencia de carga en vivo",
           "charge_sensor": "Binary sensor de carga — habilita auto-detección de cargas",
+          "plug_sensor": "Binary sensor cable enchufado — fusiona pulsos mientras el cable siga conectado",
           "location_tracker": "Entidad de ubicación (device_tracker, person, input_select…) — origen/destino + cierre de journey al llegar a casa",
           "exterior_temp_sensor": "Sensor de temperatura exterior — habilita avg_temp y consumo por temperatura",
           "speed_sensor": "Sensor de velocidad (km/h) — habilita max_speed",

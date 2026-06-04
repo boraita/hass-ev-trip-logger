@@ -40,6 +40,7 @@ from .const import (
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
+    CONF_PLUG_SENSOR,
     CONF_ODOMETER,
     CONF_DCFC_THRESHOLD_KW,
     CONF_IDLE_TRIP_TIMEOUT_MIN,
@@ -148,6 +149,7 @@ class EvTripLoggerCoordinator:
         self._vehicle_on = merged[CONF_VEHICLE_ON]
         self._power = merged.get(CONF_POWER)
         self._charge_sensor = merged.get(CONF_CHARGE_SENSOR)
+        self._plug_sensor = merged.get(CONF_PLUG_SENSOR)
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
         self._speed = merged.get(CONF_SPEED)
@@ -829,6 +831,34 @@ class EvTripLoggerCoordinator:
                 return
 
         kwh = (soc_end - active.soc_start) / 100.0 * self._battery_capacity
+        extra_soc = float(soc_end) - float(active.soc_start)
+
+        # Merge into the previous charge when the cable is STILL physically
+        # connected. Multiple `charging` on/off pulses (battery balancing,
+        # scheduled charging windows, sentry top-ups) inside one plugged
+        # interval are the same session — we shouldn't fragment them.
+        if (
+            self._plug_sensor is not None
+            and self._read_bool(self._plug_sensor) is True
+            and self.last_charge is not None
+        ):
+            merged = await self.storage.async_extend_last_charge(
+                extra_kwh=kwh, ended_at=now, extra_soc_pct=extra_soc,
+            )
+            if merged is not None:
+                self.last_charge = merged
+                _LOGGER.info(
+                    "Merged %.2f kWh into charge #%s (cable still plugged in)",
+                    kwh, merged.charge_id,
+                )
+                self.hass.bus.async_fire(
+                    EVENT_CHARGE_LOGGED,
+                    {"entry_id": self.entry_id, **merged.to_dict()},
+                )
+                self._notify_listeners()
+                self._notify_trip_log_listeners()
+                return
+
         # Location comes from the configured device_tracker (e.g. zone "home"); falls
         # back to "auto" so we can still tell auto-detected charges apart in the log.
         location = self._read_str(self._location) if self._location else None

@@ -730,6 +730,49 @@ class TripStorage:
             )
             return int(cur.rowcount or 0)
 
+    async def async_extend_last_charge(
+        self, extra_kwh: float, ended_at: datetime, extra_soc_pct: float | None = None
+    ) -> ChargeRecord | None:
+        """Append to the most recent charge instead of inserting a new row.
+
+        Use when the cable hasn't been physically disconnected (plug=on)
+        between two charging pulses: we treat the whole plugged interval
+        as ONE session. Adds `extra_kwh` to the row's kwh, extends
+        ended_at, recomputes total_cost from the existing price_per_kwh,
+        and (if provided) bumps soc_end by `extra_soc_pct`.
+        """
+        return await self._hass.async_add_executor_job(
+            self._extend_last_charge, extra_kwh, ended_at, extra_soc_pct
+        )
+
+    def _extend_last_charge(
+        self,
+        extra_kwh: float,
+        ended_at: datetime,
+        extra_soc_pct: float | None,
+    ) -> ChargeRecord | None:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM charges ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            new_kwh = float(row["kwh"] or 0) + float(extra_kwh)
+            new_total = new_kwh * float(row["price_per_kwh"] or 0)
+            new_soc_end = row["soc_end"]
+            if extra_soc_pct is not None and new_soc_end is not None:
+                new_soc_end = float(new_soc_end) + float(extra_soc_pct)
+            conn.execute(
+                "UPDATE charges SET kwh = ?, total_cost = ?, ended_at = ?, "
+                "soc_end = ? WHERE id = ?",
+                (new_kwh, new_total, ended_at.isoformat(), new_soc_end, row["id"]),
+            )
+            updated = conn.execute(
+                "SELECT * FROM charges WHERE id = ?", (row["id"],)
+            ).fetchone()
+        return _row_to_charge(updated)
+
     async def async_delete_last_charge(self) -> bool:
         return await self._hass.async_add_executor_job(self._delete_last_charge)
 

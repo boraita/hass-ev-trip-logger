@@ -33,6 +33,7 @@ from .const import (
     CONF_MIN_TRIP_DISTANCE,
     CONF_NAME,
     CONF_ODOMETER,
+    CONF_PLUG_SENSOR,
     CONF_POWER,
     CONF_RECENT_LIMIT,
     CONF_SPEED,
@@ -91,6 +92,10 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): EntitySelector(EntitySelectorConfig(domain="sensor", device_class="power")),
             _optional(
                 CONF_CHARGE_SENSOR,
+                EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
+            ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
+            _optional(
+                CONF_PLUG_SENSOR,
                 EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
             ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
             _optional(
