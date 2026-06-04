@@ -1220,20 +1220,34 @@ class EvTripLoggerCoordinator:
         total_cost: float | None = None,
         location: str | None = None,
         notes: str | None = None,
+        charge_id: int | None = None,
     ) -> ChargeRecord | None:
-        """Override price / location of the last charge already in storage.
+        """Override price / location of a charge already in storage.
+
+        Pass `charge_id` to target a specific row (useful for correcting an
+        older external charge whose price you only just found out). Omit it
+        to target the most-recent charge (the default — same as before).
 
         Use case: auto-detect logged a charge with the home default price, but
         you actually paid a public-charger rate. Pass price_per_kwh or
         total_cost (one of them) and the kWh + timestamp stay; price + cost
         are recomputed.
         """
-        updated = await self.storage.async_update_last_charge(
-            price_per_kwh=price_per_kwh,
-            total_cost=total_cost,
-            location=location,
-            notes=notes,
-        )
+        if charge_id is not None:
+            updated = await self.storage.async_update_charge_by_id(
+                charge_id,
+                price_per_kwh=price_per_kwh,
+                total_cost=total_cost,
+                location=location,
+                notes=notes,
+            )
+        else:
+            updated = await self.storage.async_update_last_charge(
+                price_per_kwh=price_per_kwh,
+                total_cost=total_cost,
+                location=location,
+                notes=notes,
+            )
         if updated is None:
             _LOGGER.warning("set_last_charge_price: no charge in storage to update")
             return None

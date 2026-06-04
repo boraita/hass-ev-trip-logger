@@ -113,11 +113,13 @@ delete_last_charge:
         text:
 
 set_last_charge_price:
-  name: Set last charge price
+  name: Set charge price
   description: >-
-    Override price and/or location of the most recently logged charge.
-    Useful when auto-detect saved a charge at home price but you actually
-    paid a public charger rate. kWh and timestamp stay; price and total
+    Override price and/or location of an already-logged charge. Pass
+    `charge_id` to target a specific older charge, or omit it to update
+    the most-recent one. Useful when auto-detect saved a charge at the
+    home tariff but you actually paid a public-charger rate — fix it on
+    the fly from the dashboard. kWh and timestamp stay; price and total
     cost are recomputed.
   fields:
     price_per_kwh:
@@ -149,6 +151,16 @@ set_last_charge_price:
       selector:
         text:
           multiline: true
+    charge_id:
+      name: Charge ID
+      description: >-
+        Target a specific charge by id (visible in recent_charges
+        attributes). Omit to update the most-recent charge.
+      selector:
+        number:
+          min: 1
+          step: 1
+          mode: box
     entry_id:
       name: Entry ID
       description: Restrict the action to a specific config entry.

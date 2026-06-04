@@ -61,6 +61,7 @@ _SCHEMA_SET_LAST_CHARGE_PRICE = vol.All(
             vol.Optional("total_cost"): vol.All(vol.Coerce(float), vol.Range(min=0)),
             vol.Optional("location"): cv.string,
             vol.Optional("notes"): cv.string,
+            vol.Optional("charge_id"): vol.All(vol.Coerce(int), vol.Range(min=1)),
         }
     ),
     cv.has_at_least_one_key("price_per_kwh", "total_cost", "location", "notes"),
@@ -159,6 +160,7 @@ def async_register_services(hass: HomeAssistant) -> None:
                 total_cost=call.data.get("total_cost"),
                 location=call.data.get("location"),
                 notes=call.data.get("notes"),
+                charge_id=call.data.get("charge_id"),
             )
 
     async def _purge_trips(call: ServiceCall) -> None:

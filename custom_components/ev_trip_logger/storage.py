@@ -639,6 +639,70 @@ class TripStorage:
             ).fetchone()
         return _row_to_charge(row) if row else None
 
+    async def async_update_charge_by_id(
+        self,
+        charge_id: int,
+        *,
+        price_per_kwh: float | None = None,
+        total_cost: float | None = None,
+        location: str | None = None,
+        notes: str | None = None,
+    ) -> ChargeRecord | None:
+        """Update a specific charge by id. Same semantics as
+        update_last_charge but targets the given row instead of the
+        most-recent one. Used by set_last_charge_price when a `charge_id`
+        argument is passed (so the user can correct any historical
+        external charge, not just the latest).
+        """
+        return await self._hass.async_add_executor_job(
+            self._update_charge_by_id, charge_id, price_per_kwh, total_cost,
+            location, notes,
+        )
+
+    def _update_charge_by_id(
+        self,
+        charge_id: int,
+        price_per_kwh: float | None,
+        total_cost: float | None,
+        location: str | None,
+        notes: str | None,
+    ) -> ChargeRecord | None:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM charges WHERE id = ?", (charge_id,)
+            ).fetchone()
+            if not row:
+                return None
+            kwh = row["kwh"]
+            if total_cost is not None:
+                new_total = float(total_cost)
+                new_price = new_total / kwh if kwh else 0.0
+            elif price_per_kwh is not None:
+                new_price = float(price_per_kwh)
+                new_total = kwh * new_price
+            else:
+                new_price = row["price_per_kwh"]
+                new_total = row["total_cost"]
+            new_location = location if location is not None else row["location"]
+            new_notes = notes if notes is not None else row["notes"]
+            price_locked = (
+                1 if (price_per_kwh is not None or total_cost is not None) else None
+            )
+            conn.execute(
+                "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
+                "location = ?, notes = ?, "
+                "price_locked = COALESCE(?, price_locked) WHERE id = ?",
+                (
+                    new_price, new_total, new_location, new_notes,
+                    price_locked, charge_id,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM charges WHERE id = ?", (charge_id,)
+            ).fetchone()
+        return _row_to_charge(updated)
+
     async def async_update_last_charge(
         self,
         *,
