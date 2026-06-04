@@ -155,6 +155,15 @@
       "recent_charges": { "name": "Cargas recientes" },
       "trip_records": { "name": "Récords de viajes" },
       "charge_in_progress": { "name": "Carga en curso" },
+      "plug_state": {
+        "name": "Estado del enchufe",
+        "state": {
+          "charging": "Cargando",
+          "paused": "Pausada (enchufada)",
+          "disconnected": "Desconectada",
+          "unknown": "Desconocido"
+        }
+      },
       "last_journey": { "name": "Último viaje (completo)" },
       "current_journey": { "name": "Viaje en curso" },
       "recent_journeys": { "name": "Viajes recientes (completos)" },

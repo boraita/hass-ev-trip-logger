@@ -220,6 +220,7 @@ async def async_setup_entry(
     entities.append(RecentChargesSensor(coordinator))
     entities.append(TripRecordsSensor(coordinator))
     entities.append(ChargeInProgressSensor(coordinator))
+    entities.append(PlugStateSensor(coordinator))
     entities.append(LastJourneySensor(coordinator))
     entities.append(CurrentJourneySensor(coordinator))
     entities.append(RecentJourneysSensor(coordinator))
@@ -773,6 +774,76 @@ class RecentJourneysSensor(_BaseTripSensor):
                 for j in self._journeys
             ],
         }
+
+
+class PlugStateSensor(_BaseTripSensor):
+    """Enum sensor exposing the real cable+charging state.
+
+    Combines the configured plug_sensor with the charge_sensor to produce:
+    - `disconnected` — cable not connected
+    - `charging`     — cable connected and current flowing
+    - `paused`       — cable connected, no current (charge complete / target SoC reached)
+    - `unknown`     — sensors unavailable
+
+    Lets the dashboard show "cable still plugged in, paused" rather than the
+    misleading "idle" the integration showed before v0.5.10.
+    """
+
+    _attr_options = ["charging", "paused", "disconnected", "unknown"]
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="plug_state",
+            translation_key="plug_state",
+            device_class=SensorDeviceClass.ENUM,
+            icon="mdi:ev-plug-type2",
+            options=["charging", "paused", "disconnected", "unknown"],
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_plug_state"
+
+    async def async_added_to_hass(self) -> None:
+        # Refresh whenever the source sensors update.
+        from homeassistant.helpers.event import async_track_state_change_event
+
+        @callback
+        def _refresh(_event: Any) -> None:
+            self.async_write_ha_state()
+
+        sources = [
+            s for s in (
+                getattr(self._coordinator, "_plug_sensor", None),
+                self._coordinator._charge_sensor,
+            ) if s
+        ]
+        if sources:
+            self.async_on_remove(
+                async_track_state_change_event(self.hass, sources, _refresh)
+            )
+
+    @property
+    def native_value(self) -> str:
+        plug = getattr(self._coordinator, "_plug_sensor", None)
+        charge = self._coordinator._charge_sensor
+        plug_state = self.hass.states.get(plug) if plug else None
+        charge_state = self.hass.states.get(charge) if charge else None
+        # Without configured sensors we can't distinguish — say unknown.
+        if not plug and not charge:
+            return "unknown"
+        # Treat the plug as the source of truth for "is the cable connected?"
+        # If the user only configured charge_sensor (no plug), fall back to
+        # using charge as a proxy: charging=on → charging, off → disconnected.
+        if plug_state is not None and plug_state.state in ("on", "off"):
+            if plug_state.state == "off":
+                return "disconnected"
+            # Plug is on — distinguish charging vs paused via charge_sensor
+            if charge_state is not None and charge_state.state in ("on", "off"):
+                return "charging" if charge_state.state == "on" else "paused"
+            return "paused"  # plug on but no charge_sensor → conservative
+        # Only charge_sensor configured
+        if charge_state is not None and charge_state.state in ("on", "off"):
+            return "charging" if charge_state.state == "on" else "disconnected"
+        return "unknown"
 
 
 class ChargeInProgressSensor(_BaseTripSensor):

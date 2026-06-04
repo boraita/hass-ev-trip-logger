@@ -155,6 +155,15 @@
       "recent_charges": { "name": "Recent charges" },
       "trip_records": { "name": "Trip records" },
       "charge_in_progress": { "name": "Charge in progress" },
+      "plug_state": {
+        "name": "Plug state",
+        "state": {
+          "charging": "Charging",
+          "paused": "Paused (plugged in)",
+          "disconnected": "Disconnected",
+          "unknown": "Unknown"
+        }
+      },
       "last_journey": { "name": "Last journey" },
       "current_journey": { "name": "Current journey" },
       "recent_journeys": { "name": "Recent journeys" },
