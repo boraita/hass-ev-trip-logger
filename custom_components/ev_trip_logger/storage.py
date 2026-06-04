@@ -787,6 +787,39 @@ class TripStorage:
     def _recompute_trip_costs_from_charges(self, default_price: float) -> int:
         price = float(default_price)
         with self._connect() as conn:
+            # Step 1 — estimate missing energy/consumption from the recent
+            # distance-weighted average. Cloud-polling integrations sometimes
+            # return the same SoC at start and end of a short trip (no
+            # refresh within the window), leaving energy_kwh NULL. We fill
+            # it in from the user's actual driving baseline so trip detail
+            # cards don't show blanks.
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(energy_kwh), 0) AS total_kwh,
+                    COALESCE(SUM(distance_km), 0) AS total_km
+                FROM trips
+                WHERE energy_kwh IS NOT NULL AND energy_kwh > 0
+                  AND distance_km IS NOT NULL AND distance_km > 0
+                """
+            ).fetchone()
+            total_kwh, total_km = row[0], row[1]
+            avg_per_100 = (total_kwh / total_km * 100.0) if total_km else None
+
+            if avg_per_100 and avg_per_100 > 0:
+                conn.execute(
+                    """
+                    UPDATE trips SET
+                        energy_kwh = distance_km * ? / 100.0,
+                        consumption_kwh_100km = ?
+                    WHERE (energy_kwh IS NULL OR energy_kwh <= 0)
+                      AND distance_km IS NOT NULL AND distance_km > 0
+                    """,
+                    (avg_per_100, avg_per_100),
+                )
+
+            # Step 2 — re-cost every trip with energy from the configured
+            # home tariff (free / external one-off charges don't propagate).
             cur = conn.execute(
                 "UPDATE trips SET cost = energy_kwh * ? "
                 "WHERE energy_kwh IS NOT NULL AND energy_kwh > 0",
