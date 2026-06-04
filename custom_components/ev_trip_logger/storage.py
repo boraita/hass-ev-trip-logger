@@ -111,6 +111,10 @@ class TripRecord:
     start_lon: float | None = None
     end_lat: float | None = None
     end_lon: float | None = None
+    # Reverse-geocoded human-readable addresses (Nominatim, optional).
+    # Populated at trip close when the GPS endpoint is outside any HA zone.
+    start_address: str | None = None
+    end_address: str | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -243,6 +247,9 @@ class TripStorage:
         for col in ("start_lat", "start_lon", "end_lat", "end_lon"):
             if col not in trip_cols:
                 conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
+        for col in ("start_address", "end_address"):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} TEXT")
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
@@ -285,8 +292,9 @@ class TripStorage:
                     energy_kwh, consumption_kwh_100km, avg_speed_kmh, max_power_kw,
                     max_speed_kmh, regen_kwh,
                     avg_temp_c, origin, destination, cost, currency, journey_id,
-                    start_lat, start_lon, end_lat, end_lon
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    start_lat, start_lon, end_lat, end_lon,
+                    start_address, end_address
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -314,6 +322,8 @@ class TripStorage:
                     record.start_lon,
                     record.end_lat,
                     record.end_lon,
+                    record.start_address,
+                    record.end_address,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -760,6 +770,50 @@ class TripStorage:
                 "SELECT * FROM charges WHERE id = ?", (row["id"],)
             ).fetchone()
         return _row_to_charge(updated)
+
+    async def async_trips_needing_geocode(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Trips with GPS coords but no address yet — for the backfill."""
+        return await self._hass.async_add_executor_job(self._trips_needing_geocode, limit)
+
+    def _trips_needing_geocode(self, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, start_lat, start_lon, end_lat, end_lon,
+                       start_address, end_address
+                FROM trips
+                WHERE ((start_lat IS NOT NULL AND start_address IS NULL)
+                    OR (end_lat IS NOT NULL AND end_address IS NULL))
+                ORDER BY id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def async_update_trip_addresses(
+        self, trip_id: int,
+        start_address: str | None = None,
+        end_address: str | None = None,
+    ) -> None:
+        await self._hass.async_add_executor_job(
+            self._update_trip_addresses, trip_id, start_address, end_address
+        )
+
+    def _update_trip_addresses(
+        self, trip_id: int,
+        start_address: str | None,
+        end_address: str | None,
+    ) -> None:
+        # COALESCE: only set non-null fields, don't blank an existing one.
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trips SET "
+                "start_address = COALESCE(?, start_address), "
+                "end_address = COALESCE(?, end_address) "
+                "WHERE id = ?",
+                (start_address, end_address, trip_id),
+            )
 
     async def async_recompute_trip_costs_from_charges(
         self, default_price: float = 0.0
@@ -1284,6 +1338,8 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         start_lon=row["start_lon"] if "start_lon" in row.keys() else None,
         end_lat=row["end_lat"] if "end_lat" in row.keys() else None,
         end_lon=row["end_lon"] if "end_lon" in row.keys() else None,
+        start_address=row["start_address"] if "start_address" in row.keys() else None,
+        end_address=row["end_address"] if "end_address" in row.keys() else None,
     )
 
 

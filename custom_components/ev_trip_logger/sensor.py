@@ -544,6 +544,10 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         "start_lon": _r(getattr(trip, "start_lon", None), 6),
         "end_lat": _r(getattr(trip, "end_lat", None), 6),
         "end_lon": _r(getattr(trip, "end_lon", None), 6),
+        # Reverse-geocoded human-readable labels (Nominatim, v0.5.12+).
+        # NULL for older trips and for points inside a named HA zone.
+        "start_address": getattr(trip, "start_address", None),
+        "end_address": getattr(trip, "end_address", None),
     }
 
 

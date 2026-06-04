@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -29,6 +30,7 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     CONF_BATTERY,
@@ -205,6 +207,10 @@ class EvTripLoggerCoordinator:
         self._synth_baseline: tuple[datetime, float, float | None] | None = None
         self._unsub_location: CALLBACK_TYPE | None = None
 
+        # Reverse-geocode cache keyed on rounded (lat, lon) → friendly label.
+        # Rounded to 4 decimal places (~10 m), which dedupes hits in the same
+        # parking spot across many trips. Cleared on integration reload.
+        self._geocode_cache: dict[tuple[float, float], str] = {}
         self._listeners: list[Callable[[], None]] = []
         self._trip_log_listeners: list[Callable[[], None]] = []
 
@@ -258,6 +264,102 @@ class EvTripLoggerCoordinator:
     def battery_level(self) -> float | None:
         """Current SoC % from the configured battery sensor, None if unreadable."""
         return self._read_float(self._battery)
+
+    async def _async_backfill_geocodes(self) -> None:
+        """Fill in start_address/end_address on historical trips with GPS.
+
+        Rate-limited to ~1 req/sec per Nominatim's usage policy. Stops at
+        50 trips per startup to avoid hammering the API. Idempotent: trips
+        that already have an address are skipped by the SQL.
+        """
+        try:
+            pending = await self.storage.async_trips_needing_geocode(limit=50)
+        except Exception as err:
+            _LOGGER.debug("Geocode backfill: list query failed: %s", err)
+            return
+        if not pending:
+            return
+        _LOGGER.info("Geocode backfill: %d trip(s) to resolve", len(pending))
+        filled = 0
+        for row in pending:
+            start_addr = None
+            end_addr = None
+            if row.get("start_lat") is not None and not row.get("start_address"):
+                start_addr = await self._async_reverse_geocode(
+                    row["start_lat"], row["start_lon"]
+                )
+                await asyncio.sleep(1.0)  # Nominatim politeness
+            if row.get("end_lat") is not None and not row.get("end_address"):
+                end_addr = await self._async_reverse_geocode(
+                    row["end_lat"], row["end_lon"]
+                )
+                await asyncio.sleep(1.0)
+            if start_addr or end_addr:
+                await self.storage.async_update_trip_addresses(
+                    row["id"], start_address=start_addr, end_address=end_addr,
+                )
+                filled += 1
+        if filled:
+            _LOGGER.info("Geocode backfill: filled %d trip(s)", filled)
+            self.last_trip = await self.storage.async_get_last()
+            self._notify_trip_log_listeners()
+
+    async def _async_reverse_geocode(
+        self, lat: float | None, lon: float | None
+    ) -> str | None:
+        """Resolve lat/lon to a short human-readable label via Nominatim.
+
+        Cached by rounded (lat, lon) so repeat trips to the same parking
+        spot don't repeatedly hit the API. Best-effort: returns None on
+        any failure (rate limit, timeout, network down) without blocking
+        the trip-close path.
+        """
+        if lat is None or lon is None:
+            return None
+        key = (round(float(lat), 4), round(float(lon), 4))
+        if key in self._geocode_cache:
+            return self._geocode_cache[key]
+        try:
+            session = async_get_clientsession(self.hass)
+            params = {
+                "lat": str(lat), "lon": str(lon),
+                "format": "json", "zoom": "17", "addressdetails": "1",
+                # Spanish-language preference so labels match the user's locale;
+                # Nominatim still falls back to local name when es isn't set.
+                "accept-language": "es",
+            }
+            headers = {
+                "User-Agent": (
+                    "hass-ev-trip-logger/0.5.12 "
+                    "(https://github.com/boraita/hass-ev-trip-logger)"
+                ),
+            }
+            async with session.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params=params, headers=headers, timeout=8,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        except Exception as exc:  # pragma: no cover — network can fail
+            _LOGGER.debug("Reverse geocode failed (%s,%s): %s", lat, lon, exc)
+            return None
+        a = data.get("address") or {}
+        # Prefer the most specific recognisable place; fall back through
+        # standard OSM hierarchy.
+        primary = (
+            a.get("amenity") or a.get("shop") or a.get("tourism")
+            or a.get("building") or a.get("road")
+            or a.get("neighbourhood") or a.get("suburb")
+            or a.get("hamlet") or a.get("village") or a.get("town")
+            or a.get("city") or data.get("name")
+        )
+        locality = a.get("city") or a.get("town") or a.get("village") or a.get("suburb")
+        label = primary or data.get("display_name", "").split(",")[0].strip()
+        if primary and locality and primary != locality:
+            label = f"{primary}, {locality}"
+        self._geocode_cache[key] = label
+        return label
 
     def _trip_cost_price_per_kwh(self) -> float:
         """€/kWh used to compute trip cost — ALWAYS the configured home tariff.
@@ -343,6 +445,12 @@ class EvTripLoggerCoordinator:
                 self.last_trip = await self.storage.async_get_last()
         except Exception as err:  # pragma: no cover — defensive
             _LOGGER.debug("Trip cost heal failed (non-fatal): %s", err)
+
+        # Background backfill of missing reverse-geocoded addresses for
+        # trips logged before v0.5.12. Rate-limited (~1 req/sec to respect
+        # Nominatim's policy). Runs as a separate task so HA start-up isn't
+        # blocked.
+        self.hass.async_create_task(self._async_backfill_geocodes())
 
         self._unsub_state = async_track_state_change_event(
             self.hass, [self._vehicle_on], self._async_vehicle_on_changed
@@ -1112,6 +1220,26 @@ class EvTripLoggerCoordinator:
         # Persist GPS route samples accumulated during the trip.
         if active.gps_samples:
             await self.storage.async_insert_positions(trip_id, active.gps_samples)
+
+        # Reverse-geocode start/end coords for any trip that doesn't end at
+        # a named HA zone (zones are already informative on their own).
+        # Best-effort — Nominatim failure leaves the field NULL.
+        async def _geocode_async() -> None:
+            start_addr = await self._async_reverse_geocode(record.start_lat, record.start_lon)
+            end_addr = await self._async_reverse_geocode(record.end_lat, record.end_lon)
+            if start_addr or end_addr:
+                await self.storage.async_update_trip_addresses(
+                    trip_id, start_address=start_addr, end_address=end_addr,
+                )
+                if self.last_trip and self.last_trip.trip_id == trip_id:
+                    self.last_trip = replace(
+                        self.last_trip,
+                        start_address=start_addr or self.last_trip.start_address,
+                        end_address=end_addr or self.last_trip.end_address,
+                    )
+                self._notify_trip_log_listeners()
+
+        self.hass.async_create_task(_geocode_async())
 
         # Update journey state after insert: closed by arrival home, otherwise carry on.
         if is_at_home_end and journey_id is not None:
