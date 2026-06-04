@@ -806,10 +806,13 @@ class EvTripLoggerCoordinator:
             # the dedup horizon to 2 h.
             ref_ts = self.last_charge.started_at or self.last_charge.ended_at
             elapsed = (now - ref_ts).total_seconds()
-            # NEVER insert a new auto-charge while the most recent one has its
-            # price locked by the user — that record's price is the truth and
-            # the auto-detector would clone it under the wrong default price.
-            if self.last_charge.price_locked or elapsed < 7200:  # 2 h
+            # Time-based dedup: a real new charging session shouldn't follow
+            # the previous one within 2 hours. price_locked alone must NOT
+            # block insertion — that flag is for protecting the prior
+            # record's price from auto-update, not for vetoing future
+            # charges (that bug in v0.5.4 swallowed an entire overnight
+            # session because the previous charge had been corrected).
+            if elapsed < 7200:  # 2 h
                 _LOGGER.debug(
                     "Skipping auto-charge: previous charge %.0fs ago "
                     "(price_locked=%s)",
