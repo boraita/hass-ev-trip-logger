@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -85,6 +86,23 @@ _HOME_ARRIVAL_GRACE_S = 600
 # that miss off→on cycles and leave a single bogus "trip" spanning multiple
 # real drives.
 _IDLE_INSIDE_TRIP_S = 600
+# v0.5.13 — bounded SoC ring buffer used by resolve_soc_start to retrieve
+# the freshest pre-vehicle_on reading. At 30 s cadence (Tesla streaming)
+# 64 entries cover ~32 min of history; at BYD-class 1.5 min cadence they
+# cover ~1.5 h. Memory cost is ≤ 6 KB.
+_SOC_BUFFER_MAX = 64
+# How far back to look for a pre-vehicle_on SoC sample. Anything older is
+# treated as "stale enough to be the wrong anchor".
+_PRE_ON_LOOKBACK = timedelta(minutes=5)
+# Outer window after charge-end where last_charge.soc_end can still be
+# the trip anchor. 12 h covers "charged overnight, drove off in the
+# morning" — the canonical bug. Beyond that, vampire drain has likely
+# made soc_end an unreliable anchor regardless. Within the window we
+# add two more gates: no trip recorded since the charge ended, and the
+# current SoC must not have dropped >2 % below soc_end (else the car
+# either sat too long or someone discharged it externally).
+_POST_CHARGE_ANCHOR_WINDOW = timedelta(hours=12)
+_POST_CHARGE_DRAIN_BUDGET_PCT = 2.0
 
 
 @dataclass
@@ -117,6 +135,15 @@ class TripInProgress:
     # route map. Sampled by the live-tick callback so cadence is bound to
     # _LIVE_TICK (30 s by default).
     gps_samples: list[tuple[datetime, float, float]] = field(default_factory=list)
+    # v0.5.13: provenance of soc_start, set by resolve_soc_start.
+    soc_start_source: str | None = None
+    # v0.5.13: independent kWh estimator via ∫|power| dt. When a power
+    # sensor is configured, every _async_power_changed tick adds a
+    # trapezoid; on close we compare this against the SoC-derived energy
+    # and pick the more pessimistic (= larger) value so consumption is
+    # never under-reported due to stale SoC.
+    energy_from_power_kwh: float = 0.0
+    last_abs_power_kw: float | None = None
 
 
 @dataclass
@@ -211,6 +238,12 @@ class EvTripLoggerCoordinator:
         # Rounded to 4 decimal places (~10 m), which dedupes hits in the same
         # parking spot across many trips. Cleared on integration reload.
         self._geocode_cache: dict[tuple[float, float], str] = {}
+        # v0.5.13: ring buffer of (timestamp, soc%) — populated by
+        # _async_metric_changed whenever the battery entity reports a
+        # fresh sample, regardless of trip state. Used by
+        # _resolve_soc_start to anchor trip start to the freshest
+        # pre-vehicle_on reading available (cf. design doc § 1).
+        self._soc_history: deque[tuple[datetime, float]] = deque(maxlen=_SOC_BUFFER_MAX)
         self._listeners: list[Callable[[], None]] = []
         self._trip_log_listeners: list[Callable[[], None]] = []
 
@@ -330,7 +363,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.12 "
+                    "hass-ev-trip-logger/0.5.13 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -577,6 +610,17 @@ class EvTripLoggerCoordinator:
         opens the trip retroactively. Without this, every HA restart during
         a real drive silently swallows the entire trip.
         """
+        # Feed the SoC ring buffer whenever the battery entity emits a
+        # fresh sample. Resolved later by _resolve_soc_start.
+        new_state = event.data.get("new_state")
+        if new_state is not None and new_state.entity_id == self._battery:
+            try:
+                soc_val = float(new_state.state)
+            except (TypeError, ValueError):
+                soc_val = None
+            if soc_val is not None:
+                self._soc_history.append((dt_util.now(), soc_val))
+
         if (
             self.current is None
             and self._read_bool(self._vehicle_on) is True
@@ -592,10 +636,10 @@ class EvTripLoggerCoordinator:
                 self.current_charge.last_seen_soc = soc
 
         # Idle watchdog — any odo change while a trip is open counts as
-        # evidence the car is actually moving. New_state.entity_id checks
-        # let us ignore battery-only ticks for the odometer signal.
+        # evidence the car is actually moving. The entity_id check lets us
+        # ignore battery-only ticks for the odometer signal (`new_state` was
+        # already read at the top of this handler to feed the SoC buffer).
         if self.current is not None:
-            new_state = event.data.get("new_state")
             if new_state is not None and new_state.entity_id == self._odometer:
                 self.current.last_movement_ts = dt_util.now()
 
@@ -848,6 +892,8 @@ class EvTripLoggerCoordinator:
         now = dt_util.now()
         prev_kw = self.current.last_power_kw
         prev_ts = self.current.last_power_ts
+        prev_abs = self.current.last_abs_power_kw
+        abs_now = abs(value)
         if prev_kw is not None and prev_ts is not None:
             dt_h = (now - prev_ts).total_seconds() / 3600.0
             if 0 < dt_h < 1.0:  # sanity-bound: skip samples with >1h gap
@@ -855,8 +901,17 @@ class EvTripLoggerCoordinator:
                 a = -min(prev_kw, 0.0)
                 b = -min(value, 0.0)
                 self.current.regen_kwh += (a + b) / 2.0 * dt_h
+                # v0.5.13 — independent kWh estimator. Trapezoid over
+                # |power| gives the trip's gross throughput; we compare
+                # against SoC-derived energy on close and keep the more
+                # pessimistic value. Independent of any SoC sensor lag.
+                if prev_abs is not None:
+                    self.current.energy_from_power_kwh += (
+                        (prev_abs + abs_now) / 2.0 * dt_h
+                    )
         self.current.last_power_kw = value
         self.current.last_power_ts = now
+        self.current.last_abs_power_kw = abs_now
         self._notify_listeners()
 
     @callback
@@ -987,6 +1042,86 @@ class EvTripLoggerCoordinator:
         self.current.temp_samples.append(value)
         self._notify_listeners()
 
+    def _resolve_soc_start(
+        self, now: datetime
+    ) -> tuple[float | None, str]:
+        """Return (soc_pct, source_tag) for a trip about to open.
+
+        Designed to fight stale-SoC-at-vehicle-on on cloud-polled
+        integrations (BYD, Tesla Fleet). Resolution order:
+
+        (a) ``last_charge_end`` — when a charge finished within the last
+            30 min, the plug just disconnected, and no charge is in
+            progress, the charge's ending SoC is the most trustworthy
+            anchor. Catches the exact bug the user reported: "charged
+            overnight to 80 %, drove off, integration sees 79 %, records
+            2 % consumption instead of 3 %".
+        (b) ``pre_on_sample`` — freshest reading from the 5-min SoC ring
+            buffer. Useful when (a) doesn't apply but the user's
+            integration has emitted any SoC update very recently. On BYD
+            the cadence is sparse (~8 min median) so this branch is rare
+            but cheap.
+        (c) ``post_on_sample`` — the current cached reading. Legacy
+            behaviour. Subject to up to 1 % staleness on integer-SoC
+            sensors like BYD's.
+        """
+        current = self._read_float(self._battery)
+
+        # (a) Last charge end. Multi-gate to avoid overcounting when the
+        # car has been sitting too long or has driven between charges:
+        #  - charge ended ≤ 12 h ago
+        #  - no charge currently in progress
+        #  - plug disconnected (when a plug sensor is wired)
+        #  - we haven't driven since the charge ended
+        #  - current SoC hasn't drained more than _POST_CHARGE_DRAIN_BUDGET_PCT
+        #    below soc_end (caps vampire-drain over-counting)
+        #  - soc_end is not BELOW current (would indicate a top-up the
+        #    integration missed; trust the live reading instead)
+        lc = self.last_charge
+        lt = self.last_trip
+        no_drive_since_charge = (
+            lc is not None
+            and lc.ended_at is not None
+            and (lt is None or lt.ended_at is None or lt.ended_at <= lc.ended_at)
+        )
+        if (
+            lc is not None
+            and lc.soc_end is not None
+            and lc.ended_at is not None
+            and (now - lc.ended_at) <= _POST_CHARGE_ANCHOR_WINDOW
+            and self.current_charge is None
+            and no_drive_since_charge
+        ):
+            plug_disconnected = (
+                self._plug_sensor is None
+                or self._read_bool(self._plug_sensor) is False
+            )
+            soc_end_f = float(lc.soc_end)
+            drain_ok = (
+                current is None
+                or (soc_end_f - current) <= _POST_CHARGE_DRAIN_BUDGET_PCT
+            )
+            not_below_current = current is None or soc_end_f >= current - 0.5
+            if plug_disconnected and drain_ok and not_below_current:
+                return soc_end_f, "last_charge_end"
+
+        # (b) Freshest sample within the pre-on lookback window.
+        cutoff = now - _PRE_ON_LOOKBACK
+        for ts, soc in reversed(self._soc_history):
+            if ts < cutoff:
+                break
+            # SoC should be ≥ current — the car only drains after on.
+            # If pre < current, the buffer entry is stale or a top-up
+            # we missed; fall through.
+            if current is None or soc >= current - 0.5:
+                return float(soc), "pre_on_sample"
+            break
+
+        # (c) Fallback to whatever the integration currently reports.
+        if current is not None:
+            return float(current), "post_on_sample"
+        return None, "unavailable"
+
     def _open_trip(self, now: datetime) -> None:
         # If a synth-trip finalize was pending, cancel it — the live trip
         # will own the distance from here on.
@@ -995,7 +1130,7 @@ class EvTripLoggerCoordinator:
             self._unsub_synth_finalize = None
         self._synth_baseline = None
         odometer = self._read_float(self._odometer)
-        soc = self._read_float(self._battery)
+        soc, soc_source = self._resolve_soc_start(now)
         location = self._read_str(self._location) if self._location else None
         temp = self._read_float(self._temp) if self._temp else None
 
@@ -1008,8 +1143,12 @@ class EvTripLoggerCoordinator:
             last_seen_odometer=odometer,
             last_seen_soc=soc,
             last_movement_ts=now,  # treat trip start as the first movement
+            soc_start_source=soc_source,
         )
-        _LOGGER.debug("Trip opened at %s odo=%s soc=%s", now, odometer, soc)
+        _LOGGER.debug(
+            "Trip opened at %s odo=%s soc=%s (source=%s)",
+            now, odometer, soc, soc_source,
+        )
         # Heartbeat so duration / avg_speed tick forward even when no sensor
         # is changing (e.g. car stopped at a light).
         if self._unsub_live_tick is None:
@@ -1123,11 +1262,31 @@ class EvTripLoggerCoordinator:
             if active.soc_start is not None and soc_end is not None
             else None
         )
-        energy = (
+        energy_soc = (
             (soc_used / 100.0) * self._battery_capacity
-            if soc_used is not None
+            if soc_used is not None and soc_used > 0
             else None
         )
+        # v0.5.13 — power-integration backup. ∫|P|dt accumulated during
+        # the trip is an independent estimator that doesn't depend on the
+        # SoC sensor's cadence. We pick the larger of the two so a stale
+        # SoC reading can never under-report consumption.
+        energy_pwr = (
+            active.energy_from_power_kwh
+            if self._power and active.energy_from_power_kwh > 0
+            else None
+        )
+        candidates = [e for e in (energy_soc, energy_pwr) if e is not None and e > 0]
+        if candidates:
+            energy = max(candidates)
+            energy_source = (
+                "power_integration"
+                if energy_pwr is not None and energy_pwr >= (energy_soc or 0)
+                else "soc"
+            )
+        else:
+            energy = None
+            energy_source = None
         consumption = (
             (energy / distance * 100.0)
             if energy is not None and distance > 0
@@ -1212,6 +1371,12 @@ class EvTripLoggerCoordinator:
             start_lon=(active.gps_samples[0][2] if active.gps_samples else None),
             end_lat=(active.gps_samples[-1][1] if active.gps_samples else None),
             end_lon=(active.gps_samples[-1][2] if active.gps_samples else None),
+            soc_start_source=active.soc_start_source,
+            energy_source=energy_source,
+            energy_from_power=(
+                round(active.energy_from_power_kwh, 4)
+                if active.energy_from_power_kwh > 0 else None
+            ),
         )
 
         trip_id = await self.storage.async_insert(record)

@@ -548,6 +548,14 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         # NULL for older trips and for points inside a named HA zone.
         "start_address": getattr(trip, "start_address", None),
         "end_address": getattr(trip, "end_address", None),
+        # v0.5.13+ provenance — see storage.py header. The dashboard
+        # can surface these as a small badge so the user knows whether
+        # consumption was anchored on charge-end SoC (most accurate),
+        # a fresh pre-on sample, the legacy cached value, or the
+        # independent power-integration estimator.
+        "soc_start_source": getattr(trip, "soc_start_source", None),
+        "energy_source": getattr(trip, "energy_source", None),
+        "energy_from_power": _r(getattr(trip, "energy_from_power", None), 2),
     }
 
 

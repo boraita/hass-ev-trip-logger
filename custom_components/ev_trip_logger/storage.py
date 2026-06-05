@@ -43,7 +43,21 @@ CREATE TABLE IF NOT EXISTS trips (
     start_lat REAL,
     start_lon REAL,
     end_lat REAL,
-    end_lon REAL
+    end_lon REAL,
+    -- v0.5.13: stale-SoC-at-trip-start fix.
+    -- soc_start_source: which heuristic produced soc_start
+    --   'last_charge_end'  → anchored to the prior charge's end SoC (best)
+    --   'pre_on_sample'    → buffer sample taken < 5 min before vehicle_on
+    --   'post_on_sample'   → current/cached reading (legacy fallback)
+    --   'unavailable'      → battery sensor unreadable at open
+    -- energy_source: how energy_kwh was derived
+    --   'soc'              → from soc_used * capacity
+    --   'power_integration'→ ∫|power| dt while trip open (more pessimistic)
+    --   'estimated'        → distance × avg kWh/100km heal
+    -- energy_from_power: raw integration result, kept for audit/dashboards.
+    soc_start_source TEXT,
+    energy_source TEXT,
+    energy_from_power REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -115,6 +129,10 @@ class TripRecord:
     # Populated at trip close when the GPS endpoint is outside any HA zone.
     start_address: str | None = None
     end_address: str | None = None
+    # v0.5.13: provenance of soc_start / energy_kwh — see _SCHEMA header.
+    soc_start_source: str | None = None
+    energy_source: str | None = None
+    energy_from_power: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -153,6 +171,9 @@ class TripRecord:
             "destination": self.destination,
             "cost": self.cost,
             "currency": self.currency,
+            "soc_start_source": self.soc_start_source,
+            "energy_source": self.energy_source,
+            "energy_from_power": self.energy_from_power,
         }
 
 
@@ -250,6 +271,12 @@ class TripStorage:
         for col in ("start_address", "end_address"):
             if col not in trip_cols:
                 conn.execute(f"ALTER TABLE trips ADD COLUMN {col} TEXT")
+        # v0.5.13: stale-SoC fix — see header comment in _SCHEMA.
+        for col in ("soc_start_source", "energy_source"):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} TEXT")
+        if "energy_from_power" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN energy_from_power REAL")
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
@@ -293,8 +320,9 @@ class TripStorage:
                     max_speed_kmh, regen_kwh,
                     avg_temp_c, origin, destination, cost, currency, journey_id,
                     start_lat, start_lon, end_lat, end_lon,
-                    start_address, end_address
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    start_address, end_address,
+                    soc_start_source, energy_source, energy_from_power
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -324,6 +352,9 @@ class TripStorage:
                     record.end_lon,
                     record.start_address,
                     record.end_address,
+                    record.soc_start_source,
+                    record.energy_source,
+                    record.energy_from_power,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -1340,6 +1371,9 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         end_lon=row["end_lon"] if "end_lon" in row.keys() else None,
         start_address=row["start_address"] if "start_address" in row.keys() else None,
         end_address=row["end_address"] if "end_address" in row.keys() else None,
+        soc_start_source=row["soc_start_source"] if "soc_start_source" in row.keys() else None,
+        energy_source=row["energy_source"] if "energy_source" in row.keys() else None,
+        energy_from_power=row["energy_from_power"] if "energy_from_power" in row.keys() else None,
     )
 
 
