@@ -520,6 +520,42 @@ class TripStorage:
                 out.append(s)
         return out
 
+    async def async_resolve_open_journey_id(
+        self, home_zone: str
+    ) -> int | None:
+        """Return the journey_id of the currently-open journey, if any.
+
+        Derives from the actual trip history rather than caching state
+        in memory. An open journey is the first journey-tagged trip
+        whose id is greater than the id of the most recent trip ending
+        at home. If no such trip exists (every journey has been closed
+        by a subsequent home arrival), returns None.
+
+        Comparison is case-insensitive against `home_zone` (the
+        configured device_tracker home slug, e.g. `home`).
+        """
+        return await self._hass.async_add_executor_job(
+            self._resolve_open_journey_id, home_zone
+        )
+
+    def _resolve_open_journey_id(self, home_zone: str) -> int | None:
+        slug = (home_zone or "home").strip().casefold()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT journey_id FROM trips
+                WHERE journey_id IS NOT NULL
+                  AND id > COALESCE(
+                      (SELECT MAX(id) FROM trips
+                       WHERE LOWER(destination) = ?),
+                      0)
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (slug,),
+            ).fetchone()
+        return int(row[0]) if row else None
+
     async def async_last_completed_journey_id(
         self, current_journey_id: int | None
     ) -> int | None:
@@ -809,13 +845,29 @@ class TripStorage:
     def _trips_needing_geocode(self, limit: int) -> list[dict[str, Any]]:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
+            # v0.5.14 — one-shot heal of the v0.5.12-0.5.13 empty-string
+            # poisoning: Nominatim sometimes returned an unrecognised
+            # address shape, our extractor produced label="", COALESCE
+            # persisted that empty string, the backfill query `IS NULL`
+            # never picked them up again, and the dashboard's Jinja
+            # `start_address or origin` evaluated "" as falsy → fell
+            # through to `not_home`. Clear the empties so the backfill
+            # can retry them with the fixed extractor.
+            conn.execute(
+                "UPDATE trips SET start_address = NULL WHERE start_address = ''"
+            )
+            conn.execute(
+                "UPDATE trips SET end_address = NULL WHERE end_address = ''"
+            )
             rows = conn.execute(
                 """
                 SELECT id, start_lat, start_lon, end_lat, end_lon,
                        start_address, end_address
                 FROM trips
-                WHERE ((start_lat IS NOT NULL AND start_address IS NULL)
-                    OR (end_lat IS NOT NULL AND end_address IS NULL))
+                WHERE ((start_lat IS NOT NULL AND
+                        (start_address IS NULL OR start_address = ''))
+                    OR (end_lat IS NOT NULL AND
+                        (end_address IS NULL OR end_address = '')))
                 ORDER BY id DESC LIMIT ?
                 """,
                 (limit,),
@@ -872,6 +924,29 @@ class TripStorage:
     def _recompute_trip_costs_from_charges(self, default_price: float) -> int:
         price = float(default_price)
         with self._connect() as conn:
+            # v0.5.14 — heal trips poisoned by the unbounded
+            # power-integration trapezoid shipped in v0.5.13. We detect
+            # them by impossibly-high consumption (>50 kWh/100km — even
+            # the worst EVs cap around 35) on trips tagged
+            # energy_source='power_integration', and reset their energy
+            # so the step-1 distance-based re-fill below replaces it.
+            poisoned = conn.execute(
+                """
+                UPDATE trips SET
+                    energy_kwh = NULL,
+                    consumption_kwh_100km = NULL,
+                    energy_source = 'estimated',
+                    energy_from_power = NULL
+                WHERE energy_source = 'power_integration'
+                  AND consumption_kwh_100km > 50
+                """
+            ).rowcount or 0
+            if poisoned:
+                _LOGGER.info(
+                    "Storage heal: cleared %d trip(s) with impossible "
+                    "power-integration consumption (v0.5.13 regression)",
+                    poisoned,
+                )
             # Step 1 — estimate missing energy/consumption from the recent
             # distance-weighted average. Cloud-polling integrations sometimes
             # return the same SoC at start and end of a short trip (no

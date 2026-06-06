@@ -76,10 +76,13 @@ _LIVE_TICK = timedelta(seconds=30)
 # drive; the window must be longer than the polling interval so we don't
 # fragment one drive into many micro-trips.
 _SYNTH_COALESCE_WINDOW_S = 300
-# How long after a trip closes we still accept a late device_tracker → home
-# transition as "the trip ended at home" (and use it to close the journey
-# and amend the trip's destination).
-_HOME_ARRIVAL_GRACE_S = 600
+# How long after a trip closes we still accept a late device_tracker
+# transition as "the trip actually ended at <that zone>" (and use it to
+# amend the trip's destination, plus close the journey when the new
+# destination is home). 30 min (was 10 min in v0.5.13) gives slow
+# cloud-polling trackers enough room without making spurious home flaps
+# probable — random GPS noise 30 min after parking is rare.
+_HOME_ARRIVAL_GRACE_S = 1800
 # Idle watchdog inside open trips. If neither the odometer changes nor the
 # speed sensor reports > 0 for this many seconds, the trip is force-closed
 # even if vehicle_on still reads ON. Catches cloud-polling sources (BYD, …)
@@ -103,6 +106,15 @@ _PRE_ON_LOOKBACK = timedelta(minutes=5)
 # either sat too long or someone discharged it externally).
 _POST_CHARGE_ANCHOR_WINDOW = timedelta(hours=12)
 _POST_CHARGE_DRAIN_BUDGET_PCT = 2.0
+# Sanity bounds for the v0.5.13 power-integration backup. Cloud-polled
+# integrations (BYD especially) occasionally replay a stale power sample
+# with a huge gap to the next one; without these guards a 200 kW × 0.5 h
+# trapezoid added 100 kWh to a single trip on 2026-06-05 and produced
+# absurd consumption numbers. Real-world peaks are ~230 kW DC fast-charge
+# (regen far less); anything above _MAX_PLAUSIBLE_POWER_KW is rejected,
+# and any gap > _MAX_POWER_TRAPEZOID_DT_H drops that trapezoid entirely.
+_MAX_PLAUSIBLE_POWER_KW = 250.0
+_MAX_POWER_TRAPEZOID_DT_H = 3.0 / 60.0  # 3 minutes
 
 
 @dataclass
@@ -363,7 +375,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.13 "
+                    "hass-ev-trip-logger/0.5.14 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -372,6 +384,15 @@ class EvTripLoggerCoordinator:
                 params=params, headers=headers, timeout=8,
             ) as resp:
                 if resp.status != 200:
+                    # 403/429 are Nominatim explicitly rejecting us
+                    # (UA block, rate-limit). Log loud so the user knows
+                    # — silent debug previously hid systemic failures.
+                    if resp.status in (403, 429):
+                        _LOGGER.warning(
+                            "Nominatim rejected reverse geocode "
+                            "(%s,%s): HTTP %d — back off / verify UA",
+                            lat, lon, resp.status,
+                        )
                     return None
                 data = await resp.json()
         except Exception as exc:  # pragma: no cover — network can fail
@@ -391,6 +412,14 @@ class EvTripLoggerCoordinator:
         label = primary or data.get("display_name", "").split(",")[0].strip()
         if primary and locality and primary != locality:
             label = f"{primary}, {locality}"
+        # v0.5.14 — never cache or return an empty string. The previous
+        # behaviour persisted "" via COALESCE, the backfill SQL didn't
+        # repick it (WHERE … IS NULL excludes ""), and the dashboard's
+        # `start_address or origin` evaluated "" as falsy → fell to
+        # `not_home`. End result: trips locked into a permanent
+        # not_home label even after Nominatim had been queried.
+        if not label:
+            return None
         self._geocode_cache[key] = label
         return label
 
@@ -444,15 +473,15 @@ class EvTripLoggerCoordinator:
         """Wire up state listeners and seed from existing storage."""
         self.last_trip = await self.storage.async_get_last()
         self.last_charge = await self.storage.async_get_last_charge()
-        # Resume an open journey if the last trip didn't end at home.
-        # We test by destination because the retroactive-close happens at the
-        # next stage's _open_trip, not at the previous close.
-        if (
-            self.last_trip is not None
-            and self.last_trip.journey_id is not None
-            and not self._is_at_home(self.last_trip.destination)
-        ):
-            self.current_journey_id = self.last_trip.journey_id
+        # Robust journey resume — derive from the actual trip log rather
+        # than from `last_trip.destination` (which can be wrong if the
+        # device_tracker lagged at close time or if an earlier amend
+        # corrupted it). The storage query finds the first journey-
+        # tagged trip after the most recent home-arrival; if any, that
+        # journey is still open.
+        self.current_journey_id = await self.storage.async_resolve_open_journey_id(
+            self.home_zone
+        )
         # Seed the odo-jump snapshot from the last trip if available so we can
         # detect missed trips that happened while HA was down.
         if self.last_trip is not None and self.last_trip.odometer_end is not None:
@@ -680,8 +709,15 @@ class EvTripLoggerCoordinator:
     ) -> None:
         if self.current is not None:
             return
-        # 1) Amend the last trip's destination if within the grace window
-        #    AND the recorded destination isn't already this zone.
+        # Amend the last trip's destination if a late tracker resolution
+        # arrives within the grace window. The journey closes ONLY as a
+        # consequence of that amendment producing a home destination —
+        # never on a standalone home flap. v0.5.13 used to close the
+        # journey on ANY home reading while idle, which spuriously
+        # closed journeys when the car sat at a remote location for
+        # days and the device_tracker briefly flapped (cloud GPS noise,
+        # geofence overshoot, restart of a presence integration, etc.).
+        amended_to_home = False
         if self.last_trip is not None and self.last_trip.trip_id is not None:
             delta_s = (when - self.last_trip.ended_at).total_seconds()
             if (
@@ -692,8 +728,8 @@ class EvTripLoggerCoordinator:
                     self.last_trip.trip_id, location
                 )
                 self.last_trip = replace(self.last_trip, destination=location)
-        # 2) Home arrival also closes the open journey.
-        if self._is_at_home(location) and self.current_journey_id is not None:
+                amended_to_home = self._is_at_home(location)
+        if amended_to_home and self.current_journey_id is not None:
             self.last_completed_journey_id = self.current_journey_id
             self.current_journey_id = None
         self._notify_listeners()
@@ -817,11 +853,13 @@ class EvTripLoggerCoordinator:
         location_end = self._read_str(self._location) if self._location else None
         started_from_home = self._is_at_home(location_start)
         is_at_home_end = self._is_at_home(location_end)
-        if started_from_home and self.current_journey_id is not None:
-            self.last_completed_journey_id = self.current_journey_id
-            self.current_journey_id = None
+        # Same invariant as _async_close_trip — open journeys absorb
+        # every stage until a home arrival closes them. No retroactive
+        # closures (the band-aid that conflated GPS noise with real
+        # home arrivals).
+        journey_id: int | None
         if self.current_journey_id is not None:
-            journey_id: int | None = self.current_journey_id
+            journey_id = self.current_journey_id
         elif started_from_home:
             journey_id = await self.storage.async_next_journey_id()
         else:
@@ -896,7 +934,15 @@ class EvTripLoggerCoordinator:
         abs_now = abs(value)
         if prev_kw is not None and prev_ts is not None:
             dt_h = (now - prev_ts).total_seconds() / 3600.0
-            if 0 < dt_h < 1.0:  # sanity-bound: skip samples with >1h gap
+            # Same plausibility/width gate as the energy trapezoid below.
+            # Without it, a cloud-replayed -200 kW sample over a 0.5 h
+            # gap would inject 100 kWh of phantom regen.
+            within_bounds = (
+                0 < dt_h <= _MAX_POWER_TRAPEZOID_DT_H
+                and abs(prev_kw) <= _MAX_PLAUSIBLE_POWER_KW
+                and abs(value) <= _MAX_PLAUSIBLE_POWER_KW
+            )
+            if within_bounds:
                 # Take the negative portion of each endpoint (regen only).
                 a = -min(prev_kw, 0.0)
                 b = -min(value, 0.0)
@@ -905,6 +951,11 @@ class EvTripLoggerCoordinator:
                 # |power| gives the trip's gross throughput; we compare
                 # against SoC-derived energy on close and keep the more
                 # pessimistic value. Independent of any SoC sensor lag.
+                #
+                # v0.5.14 — bounds already enforced via within_bounds
+                # above. Without them, a single BYD cloud-replay sample
+                # with abs(power) ≈ 200 kW and dt_h ≈ 0.5 h would inject
+                # ~100 kWh into one trip and blow up consumption.
                 if prev_abs is not None:
                     self.current.energy_from_power_kwh += (
                         (prev_abs + abs_now) / 2.0 * dt_h
@@ -1318,27 +1369,34 @@ class EvTripLoggerCoordinator:
             else None
         )
 
-        # Journey membership.
-        # Heuristic for noisy GPS: device_tracker may say "not_home" when the
-        # car parks just outside the home zone. If this stage *starts* at home
-        # while a journey is still open (last stage ended away), the car must
-        # have come home in between — retroactively close that journey and let
-        # this stage open a fresh one.
+        # Journey membership — v0.5.14 clean invariant:
+        #
+        #   A journey is the sequence of trips between leaving home and
+        #   returning home, no matter how many days elapse between
+        #   intermediate trips. It opens iff a trip starts from home and
+        #   ends away; closes iff a trip ends at home.
+        #
+        # Time gaps are irrelevant. Removed in this rewrite:
+        #   - The "retroactively close journey when stage opens from
+        #     home" band-aid, which conflated GPS-noise destinations
+        #     with legitimate home arrivals.
+        #   - Reliance on last_trip.destination at restart (handled in
+        #     async_start via storage.async_resolve_open_journey_id).
         is_at_home_end = self._is_at_home(location_end)
         started_from_home = self._is_at_home(active.location_start)
-        if started_from_home and self.current_journey_id is not None:
-            _LOGGER.debug(
-                "Retroactively closing journey %s — stage opened from home",
-                self.current_journey_id,
-            )
-            self.last_completed_journey_id = self.current_journey_id
-            self.current_journey_id = None
-
+        journey_id: int | None
         if self.current_journey_id is not None:
-            journey_id: int | None = self.current_journey_id
+            # Open journey absorbs this stage regardless of where it
+            # started. The journey only closes on a home arrival.
+            journey_id = self.current_journey_id
         elif started_from_home:
+            # Mint a new journey id. If this trip also ends at home (a
+            # short home→home round trip), it closes immediately as a
+            # one-stage journey.
             journey_id = await self.storage.async_next_journey_id()
         else:
+            # Orphan stage — not part of any journey. Happens when the
+            # device_tracker missed the previous trip's home departure.
             journey_id = None
 
         record = TripRecord(
