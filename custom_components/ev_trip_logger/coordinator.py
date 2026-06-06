@@ -114,7 +114,20 @@ _POST_CHARGE_DRAIN_BUDGET_PCT = 2.0
 # (regen far less); anything above _MAX_PLAUSIBLE_POWER_KW is rejected,
 # and any gap > _MAX_POWER_TRAPEZOID_DT_H drops that trapezoid entirely.
 _MAX_PLAUSIBLE_POWER_KW = 250.0
-_MAX_POWER_TRAPEZOID_DT_H = 3.0 / 60.0  # 3 minutes
+# v0.5.15 — relaxed from 3 → 20 min. The BYD audit (audit_soc_lag.py)
+# measured a median power-sample cadence of ~8 min, p90 ~18 min: the
+# v0.5.14 cap of 3 min rejected EVERY trapezoid for that car and left
+# short trips with NULL energy. 20 min covers ~p90 of natural cadence
+# without re-opening the v0.5.13 spike regression: the magnitude cap
+# (250 kW) bounds any single trapezoid to ~83 kWh in the worst case,
+# and a single such cap-pinned interval cannot persist across multiple
+# polls of a real drive.
+_MAX_POWER_TRAPEZOID_DT_H = 20.0 / 60.0
+# Per-trapezoid contribution clamp. Even within the gap bound, a spike
+# pair pinned at the magnitude cap shouldn't add more than this in one
+# tick — at ~5 kWh per trapezoid we're already at "highway cruise full
+# throttle for 10 min" territory, beyond which the sample is junk.
+_MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH = 5.0
 
 
 @dataclass
@@ -375,7 +388,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.14 "
+                    "hass-ev-trip-logger/0.5.15 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -668,9 +681,23 @@ class EvTripLoggerCoordinator:
         # evidence the car is actually moving. The entity_id check lets us
         # ignore battery-only ticks for the odometer signal (`new_state` was
         # already read at the top of this handler to feed the SoC buffer).
-        if self.current is not None:
-            if new_state is not None and new_state.entity_id == self._odometer:
+        # v0.5.15 — ALSO update last_seen_odometer / last_seen_soc here so
+        # the trip-close path doesn't depend on `current_snapshot` having
+        # been called by a sensor poll between the last data tick and the
+        # vehicle_on=off event. Cloud-polled cars can go several minutes
+        # between sensor polls; we now own the latest values directly.
+        if self.current is not None and new_state is not None:
+            if new_state.entity_id == self._odometer:
                 self.current.last_movement_ts = dt_util.now()
+                try:
+                    self.current.last_seen_odometer = float(new_state.state)
+                except (TypeError, ValueError):
+                    pass
+            elif new_state.entity_id == self._battery:
+                try:
+                    self.current.last_seen_soc = float(new_state.state)
+                except (TypeError, ValueError):
+                    pass
 
         self._notify_listeners()
         if self.current is None:
@@ -934,9 +961,12 @@ class EvTripLoggerCoordinator:
         abs_now = abs(value)
         if prev_kw is not None and prev_ts is not None:
             dt_h = (now - prev_ts).total_seconds() / 3600.0
-            # Same plausibility/width gate as the energy trapezoid below.
-            # Without it, a cloud-replayed -200 kW sample over a 0.5 h
-            # gap would inject 100 kWh of phantom regen.
+            # v0.5.15 — magnitude cap (250 kW) and a per-trapezoid
+            # contribution clamp keep spikes from inflating the trip,
+            # while the dt_h bound is generous enough (20 min) to
+            # accept BYD-class cloud cadences instead of dropping every
+            # sample. See _MAX_POWER_TRAPEZOID_DT_H comment for the
+            # tradeoff.
             within_bounds = (
                 0 < dt_h <= _MAX_POWER_TRAPEZOID_DT_H
                 and abs(prev_kw) <= _MAX_PLAUSIBLE_POWER_KW
@@ -956,10 +986,19 @@ class EvTripLoggerCoordinator:
                 # above. Without them, a single BYD cloud-replay sample
                 # with abs(power) ≈ 200 kW and dt_h ≈ 0.5 h would inject
                 # ~100 kWh into one trip and blow up consumption.
+                # v0.5.15 — per-trapezoid contribution clamp belt-and-
+                # braces: even with both endpoints inside the magnitude
+                # cap, a single tick shouldn't push more than ~5 kWh.
                 if prev_abs is not None:
-                    self.current.energy_from_power_kwh += (
-                        (prev_abs + abs_now) / 2.0 * dt_h
-                    )
+                    delta = (prev_abs + abs_now) / 2.0 * dt_h
+                    if delta > _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH:
+                        _LOGGER.warning(
+                            "Capping outsized power trapezoid: %.2f kWh "
+                            "(prev=%.1f kW, now=%.1f kW, dt=%.1f min)",
+                            delta, prev_abs, abs_now, dt_h * 60.0,
+                        )
+                        delta = _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH
+                    self.current.energy_from_power_kwh += delta
         self.current.last_power_kw = value
         self.current.last_power_ts = now
         self.current.last_abs_power_kw = abs_now
@@ -1299,10 +1338,18 @@ class EvTripLoggerCoordinator:
         duration_min = max(0.0, (now - active.started_at).total_seconds() / 60.0)
 
         if distance < self._min_distance:
-            _LOGGER.debug(
-                "Discarding short trip distance=%.2f km < min=%.2f km",
-                distance,
-                self._min_distance,
+            # v0.5.15 — log at INFO, not DEBUG. Silent discards make
+            # missing-trip diagnoses impossible. Include all the values
+            # that explain why the trip dropped so the user can see it
+            # in HA logs without enabling debug.
+            _LOGGER.info(
+                "Discarding short trip: distance=%.2f km < min=%.2f km "
+                "(odo=%s→%s, soc=%s→%s, duration=%.1f min). "
+                "If you expected this drive to log, raise CONF_MIN_TRIP_DISTANCE "
+                "or check that the odometer sensor is refreshing during trips.",
+                distance, self._min_distance,
+                active.odometer_start, odometer_end,
+                active.soc_start, soc_end, duration_min,
             )
             self.current = None
             self._notify_listeners()
@@ -1338,6 +1385,22 @@ class EvTripLoggerCoordinator:
         else:
             energy = None
             energy_source = None
+        # v0.5.15 — inline fallback when both SoC delta and power
+        # integration come back empty. For BYD's integer-step SoC
+        # (1 % resolution) any short trip that doesn't cross a 1 %
+        # boundary has soc_used=0, and the power-integration trapezoid
+        # is rejected when cloud-polling cadence is > 3 min — every
+        # such trip would otherwise persist with NULL energy and only
+        # heal on the next restart. Estimating from the user's own
+        # distance-weighted average kWh/100km is more useful than blank.
+        if energy is None and distance > 0:
+            try:
+                avg_per_100 = await self.storage.async_avg_consumption_kwh_per_100km()
+            except Exception:  # pragma: no cover — defensive
+                avg_per_100 = None
+            if avg_per_100 and avg_per_100 > 0:
+                energy = distance * avg_per_100 / 100.0
+                energy_source = "estimated"
         consumption = (
             (energy / distance * 100.0)
             if energy is not None and distance > 0

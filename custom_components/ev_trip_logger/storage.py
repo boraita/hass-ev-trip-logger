@@ -520,6 +520,38 @@ class TripStorage:
                 out.append(s)
         return out
 
+    async def async_avg_consumption_kwh_per_100km(self) -> float | None:
+        """Distance-weighted recent average kWh/100km across all trips.
+
+        Used by `_async_close_trip` as an inline fallback when both
+        SoC delta and power integration come back empty (the BYD
+        integer-step + cloud-polling combo guarantees this for short
+        trips). Without an inline estimate, the trip would persist
+        with NULL energy/consumption/cost and the user would only see
+        them fill on the next HA restart (via _recompute_trip_costs).
+        Returns None when there is no historical data yet.
+        """
+        return await self._hass.async_add_executor_job(
+            self._avg_consumption_kwh_per_100km
+        )
+
+    def _avg_consumption_kwh_per_100km(self) -> float | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(energy_kwh), 0) AS total_kwh,
+                    COALESCE(SUM(distance_km), 0) AS total_km
+                FROM trips
+                WHERE energy_kwh IS NOT NULL AND energy_kwh > 0
+                  AND distance_km IS NOT NULL AND distance_km > 0
+                """
+            ).fetchone()
+        total_kwh, total_km = row[0], row[1]
+        if not total_km:
+            return None
+        return float(total_kwh) / float(total_km) * 100.0
+
     async def async_resolve_open_journey_id(
         self, home_zone: str
     ) -> int | None:
