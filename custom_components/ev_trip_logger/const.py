@@ -17,6 +17,19 @@ CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
 CONF_SPEED: Final = "speed_sensor"
 CONF_PLUG_SENSOR: Final = "plug_sensor"
+# v0.5.31 — optional ABRP (A Better Route Planner) telemetry push.
+# Token+api_key required to activate; car_model is the ABRP slug
+# (e.g. "byd:sealion:25:82:rwd"). All three live in the integration's
+# config so the user only stores them once.
+CONF_ABRP_TOKEN: Final = "abrp_token"
+CONF_ABRP_API_KEY: Final = "abrp_api_key"
+CONF_ABRP_CAR_MODEL: Final = "abrp_car_model"
+# How often we push telemetry to ABRP. We hook off the existing
+# metric-change events (no new poll forced on the BYD cloud), but
+# throttle so we don't flood ABRP if the upstream emits bursts.
+ABRP_MIN_SEND_INTERVAL_S: Final = 30
+# How often the next-charge sensor polls ABRP's get_next_charge.
+ABRP_NEXT_CHARGE_REFRESH_S: Final = 120
 
 CONF_BATTERY_CAPACITY: Final = "battery_capacity_kwh"
 CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"

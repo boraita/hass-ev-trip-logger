@@ -225,6 +225,8 @@ async def async_setup_entry(
     entities.append(RecentTripsSensor(coordinator))
     entities.append(RecentChargesSensor(coordinator))
     entities.append(LastTripRouteSensor(coordinator))
+    if coordinator._abrp is not None:
+        entities.append(AbrpNextChargeSocSensor(coordinator))
     entities.append(TripRecordsSensor(coordinator))
     entities.append(ChargeInProgressSensor(coordinator))
     entities.append(PlugStateSensor(coordinator))
@@ -993,6 +995,55 @@ class RecentTripsSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"trips": [_trip_to_attr(t) for t in self._trips]}
+
+
+class AbrpNextChargeSocSensor(_BaseTripSensor):
+    """Target SoC of the next charge stop, read from ABRP's tlm/get_next_charge.
+
+    Only meaningful while a route is active in ABRP. State is the
+    target SoC (%) the route planner expects; None when there's no
+    active route. Refreshed every ABRP_NEXT_CHARGE_REFRESH_S — we
+    intentionally don't piggyback on the per-metric push so this small
+    GET stays cheap and predictable.
+    """
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="abrp_next_charge_soc",
+            translation_key="abrp_next_charge_soc",
+            native_unit_of_measurement=PERCENTAGE,
+            device_class=SensorDeviceClass.BATTERY,
+            icon="mdi:map-marker-radius",
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_abrp_next_charge_soc"
+        self._value: int | None = None
+
+    async def async_added_to_hass(self) -> None:
+        # Imported lazily to avoid a hard dependency at module import.
+        from .const import ABRP_NEXT_CHARGE_REFRESH_S  # noqa: PLC0415
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass,
+                self._async_refresh,
+                timedelta(seconds=ABRP_NEXT_CHARGE_REFRESH_S),
+            )
+        )
+
+    async def _async_refresh(self, *_: Any) -> None:
+        client = self._coordinator._abrp
+        if client is None:
+            return
+        try:
+            self._value = await client.refresh_next_charge()
+        except Exception:  # pragma: no cover — defensive
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        return self._value
 
 
 class LastTripRouteSensor(_BaseTripSensor):

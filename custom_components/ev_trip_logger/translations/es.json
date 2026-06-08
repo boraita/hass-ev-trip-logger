@@ -140,6 +140,7 @@
       "total_month_regen": { "name": "Regen este mes" },
       "total_30d_regen": { "name": "Regen (30 días)" },
       "total_year_regen": { "name": "Regen este año" },
+      "abrp_next_charge_soc": { "name": "ABRP SoC próxima carga" },
       "last_charge_kwh": { "name": "Energía de la última carga" },
       "last_charge_cost": { "name": "Coste de la última carga" },
       "last_charge_price": { "name": "Precio por kWh de la última carga" },

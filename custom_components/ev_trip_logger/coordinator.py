@@ -33,7 +33,12 @@ from homeassistant.helpers.event import (
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .abrp import AbrpClient, build_tlm
 from .const import (
+    ABRP_MIN_SEND_INTERVAL_S,
+    CONF_ABRP_API_KEY,
+    CONF_ABRP_CAR_MODEL,
+    CONF_ABRP_TOKEN,
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
     CONF_CHARGE_SENSOR,
@@ -265,6 +270,25 @@ class EvTripLoggerCoordinator:
         self._power = merged.get(CONF_POWER)
         self._charge_sensor = merged.get(CONF_CHARGE_SENSOR)
         self._plug_sensor = merged.get(CONF_PLUG_SENSOR)
+        # v0.5.31 — ABRP wiring. Only instantiate the client when BOTH
+        # token and api_key are present; otherwise the feature stays
+        # off completely (no requests, no logs).
+        abrp_token = (merged.get(CONF_ABRP_TOKEN) or "").strip()
+        abrp_api_key = (merged.get(CONF_ABRP_API_KEY) or "").strip()
+        self._abrp_car_model = (merged.get(CONF_ABRP_CAR_MODEL) or "").strip() or None
+        if abrp_token and abrp_api_key:
+            self._abrp: AbrpClient | None = AbrpClient(
+                async_get_clientsession(hass), abrp_api_key, abrp_token,
+            )
+            _LOGGER.info(
+                "ABRP enabled (car_model=%s)", self._abrp_car_model or "unset",
+            )
+        else:
+            self._abrp = None
+        # Monotonic timestamp of the last successful ABRP push. Used to
+        # throttle: with BYD's bursty cloud-poll cadence (multiple
+        # metric_changed events within ~1 s), we'd otherwise spam ABRP.
+        self._abrp_last_send: float = 0.0
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
         self._speed = merged.get(CONF_SPEED)
@@ -566,7 +590,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.30 "
+                    "hass-ev-trip-logger/0.5.31 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -944,6 +968,13 @@ class EvTripLoggerCoordinator:
         # tracker is also fresh. Captures the position even when no
         # trip is open yet (synth-trip case).
         self._capture_location_sample()
+
+        # v0.5.31 — opportunistically push to ABRP. Throttled inside
+        # _async_maybe_send_abrp so a burst of metric updates only
+        # generates one outbound request. No-op when ABRP isn't
+        # configured.
+        if self._abrp is not None:
+            self.hass.async_create_task(self._async_maybe_send_abrp())
 
         # v0.5.30 (issue #4) — relax: open the trip as soon as the
         # ODOMETER is readable. BYD's cloud-polled sensors arrive
@@ -1515,6 +1546,79 @@ class EvTripLoggerCoordinator:
                 "Charge session opened after trip force-close: soc=%s", soc
             )
             self._notify_listeners()
+
+    async def _async_maybe_send_abrp(self) -> None:
+        """Build a TLM payload from current sensor readings and push to ABRP.
+
+        Throttled by ABRP_MIN_SEND_INTERVAL_S so a metric burst (BYD's
+        cloud-poll can emit several state changes within a second)
+        doesn't flood the endpoint. Skipped entirely if the client
+        isn't configured.
+
+        Sign note: our power sensor is in kW with the standard EV
+        convention **+discharge / -charge**. ABRP wants kW with the
+        SAME convention. `build_tlm` historically negated for byd-
+        vehicle's raw cloud reading, so we pre-negate the W value here
+        to cancel that negation and pass through the correct sign.
+        """
+        if self._abrp is None:
+            return
+        import time as _time  # noqa: PLC0415 — local to keep import light
+        now_mono = _time.monotonic()
+        if now_mono - self._abrp_last_send < ABRP_MIN_SEND_INTERVAL_S:
+            return
+        # Snapshot every value we feed into ABRP up-front (read once).
+        soc = self._read_float(self._battery)
+        power_kw = self._read_float(self._power) if self._power else None
+        # build_tlm expects W with BYD-gl convention (+charge/-discharge)
+        # and will negate. Our power_kw is +discharge/-charge, so
+        # convert to W and negate → after build_tlm's negation we get
+        # back to our (and ABRP's) +discharge/-charge convention.
+        power_w_for_tlm: float | None = None
+        if power_kw is not None:
+            power_w_for_tlm = -float(power_kw) * 1000.0
+        speed = self._read_float(self._speed) if self._speed else None
+        odo = self._read_float(self._odometer)
+        ext_temp = self._read_float(self._temp) if self._temp else None
+        lat: float | None = None
+        lon: float | None = None
+        if self._location:
+            loc_state = self.hass.states.get(self._location)
+            if loc_state is not None:
+                try:
+                    lat = float(loc_state.attributes.get("latitude"))
+                    lon = float(loc_state.attributes.get("longitude"))
+                except (TypeError, ValueError):
+                    lat = lon = None
+        is_charging: bool | None = None
+        if self._charge_sensor:
+            is_charging = self._read_bool(self._charge_sensor)
+        is_parked: bool | None = None
+        veh_on = self._read_bool(self._vehicle_on)
+        if veh_on is not None:
+            is_parked = not veh_on
+        tlm = build_tlm(
+            soc=soc,
+            power_w=power_w_for_tlm,
+            speed=speed,
+            lat=lat, lon=lon,
+            is_charging=is_charging,
+            is_parked=is_parked,
+            ext_temp=ext_temp,
+            est_range=None,  # no generic range sensor in our config
+            odometer=odo,
+            car_model=self._abrp_car_model,
+        )
+        # Need at least SoC to be a useful sample.
+        if tlm.get("soc") is None:
+            return
+        try:
+            ok = await self._abrp.send(tlm)
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug("ABRP push raised: %s", exc)
+            return
+        if ok:
+            self._abrp_last_send = now_mono
 
     @callback
     def _capture_location_sample(self) -> None:

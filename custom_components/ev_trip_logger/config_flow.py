@@ -33,6 +33,9 @@ from .const import (
     CONF_MIN_TRIP_DISTANCE,
     CONF_NAME,
     CONF_ODOMETER,
+    CONF_ABRP_API_KEY,
+    CONF_ABRP_CAR_MODEL,
+    CONF_ABRP_TOKEN,
     CONF_PLUG_SENSOR,
     CONF_POWER,
     CONF_RECENT_LIMIT,
@@ -184,6 +187,13 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                     min=5, max=200, step=5, mode=NumberSelectorMode.BOX
                 )
             ),
+            # v0.5.31 — ABRP integration. All three optional; leave
+            # token blank to disable. The pair (token, api_key) comes
+            # from ABRP's Generic OEM linker; car_model is e.g.
+            # "byd:sealion:25:82:rwd".
+            _optional(CONF_ABRP_TOKEN, TextSelector()): TextSelector(),
+            _optional(CONF_ABRP_API_KEY, TextSelector()): TextSelector(),
+            _optional(CONF_ABRP_CAR_MODEL, TextSelector()): TextSelector(),
         }
     )
 
