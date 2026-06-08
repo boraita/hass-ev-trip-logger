@@ -380,6 +380,58 @@ class TripStorage:
                 (destination, trip_id),
             )
 
+    # Columns the set_trip service may overwrite. Excludes derived/key
+    # fields (id, score) and recorder-internal stuff. SoC %, distance,
+    # cost, etc. are user-correctable.
+    _TRIP_USER_EDITABLE = frozenset({
+        "started_at", "ended_at", "duration_min", "distance_km",
+        "odometer_start", "odometer_end", "soc_start", "soc_end",
+        "soc_used_pct", "energy_kwh", "consumption_kwh_100km",
+        "avg_speed_kmh", "max_power_kw", "max_speed_kmh", "regen_kwh",
+        "avg_temp_c", "origin", "destination", "cost", "currency",
+        "journey_id", "start_lat", "start_lon", "end_lat", "end_lon",
+        "start_address", "end_address",
+    })
+
+    async def async_update_trip(
+        self, trip_id: int, fields: dict[str, Any]
+    ) -> TripRecord | None:
+        """Generic trip patch: pass {"origin": "home", "kwh": 12.5, ...}.
+
+        Whitelisted columns only. Datetime values may be passed as
+        `datetime` objects OR as ISO strings — both are normalised to
+        ISO for storage. Returns the freshly-loaded TripRecord, or None
+        if the trip_id doesn't exist.
+        """
+        return await self._hass.async_add_executor_job(
+            self._update_trip, trip_id, fields,
+        )
+
+    def _update_trip(
+        self, trip_id: int, fields: dict[str, Any]
+    ) -> TripRecord | None:
+        clean: dict[str, Any] = {}
+        for k, v in fields.items():
+            if k not in self._TRIP_USER_EDITABLE or v is None:
+                continue
+            if isinstance(v, datetime):
+                clean[k] = v.isoformat()
+            else:
+                clean[k] = v
+        if not clean:
+            return None
+        cols = ", ".join(f"{k} = ?" for k in clean)
+        params = list(clean.values()) + [trip_id]
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(f"UPDATE trips SET {cols} WHERE id = ?", params)
+            if not cur.rowcount:
+                return None
+            row = conn.execute(
+                "SELECT * FROM trips WHERE id = ?", (trip_id,),
+            ).fetchone()
+        return _row_to_record(row) if row else None
+
     async def async_purge_trips(
         self, since: datetime | None = None, until: datetime | None = None
     ) -> int:
@@ -792,6 +844,65 @@ class TripStorage:
             self._update_charge_by_id, charge_id, price_per_kwh, total_cost,
             location, notes,
         )
+
+    # Columns the user can correct via the extended set_charge service.
+    _CHARGE_USER_EDITABLE = frozenset({
+        "started_at", "ended_at", "kwh", "soc_start", "soc_end",
+        "location", "notes", "is_dcfc", "currency",
+    })
+
+    async def async_patch_charge(
+        self, charge_id: int, fields: dict[str, Any]
+    ) -> ChargeRecord | None:
+        """Generic charge patch — same model as async_update_trip.
+
+        Used by the set_charge service so the user can correct
+        started_at/ended_at/soc_start/soc_end/kwh after the fact.
+        kwh changes do NOT auto-recompute total_cost — that's
+        async_update_charge_by_id's job and is invoked via
+        set_last_charge_price.
+        """
+        return await self._hass.async_add_executor_job(
+            self._patch_charge, charge_id, fields,
+        )
+
+    def _patch_charge(
+        self, charge_id: int, fields: dict[str, Any]
+    ) -> ChargeRecord | None:
+        clean: dict[str, Any] = {}
+        for k, v in fields.items():
+            if k not in self._CHARGE_USER_EDITABLE or v is None:
+                continue
+            if isinstance(v, datetime):
+                clean[k] = v.isoformat()
+            elif k == "is_dcfc":
+                clean[k] = 1 if bool(v) else 0
+            else:
+                clean[k] = v
+        if not clean:
+            return None
+        cols = ", ".join(f"{k} = ?" for k in clean)
+        params = list(clean.values()) + [charge_id]
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(f"UPDATE charges SET {cols} WHERE id = ?", params)
+            if not cur.rowcount:
+                return None
+            # If kwh changed and price_per_kwh exists, recompute total_cost.
+            if "kwh" in clean:
+                row = conn.execute(
+                    "SELECT kwh, price_per_kwh FROM charges WHERE id = ?",
+                    (charge_id,),
+                ).fetchone()
+                if row and row["price_per_kwh"] is not None:
+                    conn.execute(
+                        "UPDATE charges SET total_cost = ? WHERE id = ?",
+                        (float(row["kwh"]) * float(row["price_per_kwh"]), charge_id),
+                    )
+            row = conn.execute(
+                "SELECT * FROM charges WHERE id = ?", (charge_id,),
+            ).fetchone()
+        return _row_to_charge(row) if row else None
 
     def _update_charge_by_id(
         self,

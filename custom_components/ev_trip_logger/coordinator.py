@@ -514,7 +514,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.20 "
+                    "hass-ev-trip-logger/0.5.21 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -2089,6 +2089,75 @@ class EvTripLoggerCoordinator:
             self._notify_listeners()
             self._notify_trip_log_listeners()
         return deleted
+
+    async def async_set_trip_service(
+        self, *, trip_id: int, fields: dict[str, Any]
+    ) -> TripRecord | None:
+        """User-driven patch of a historical trip. See storage._update_trip
+        for the field whitelist. Refreshes `self.last_trip` if the updated
+        row is currently exposed by sensors, and re-emits a recompute pass
+        so cost/consumption recalculate when energy/distance/journey
+        change.
+        """
+        updated = await self.storage.async_update_trip(trip_id, fields)
+        if updated is None:
+            _LOGGER.warning(
+                "set_trip: trip_id=%s not found or no editable fields", trip_id,
+            )
+            return None
+        # Refresh in-memory caches.
+        if self.last_trip is not None and self.last_trip.trip_id == trip_id:
+            self.last_trip = updated
+        # If energy/distance/journey changed, re-run the recompute pass
+        # so derived sums (today/week/month) reflect the correction.
+        try:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                default_price=self._energy_price
+            )
+        except Exception:  # pragma: no cover — defensive
+            pass
+        # Also re-resolve the open journey: if the user changed
+        # journey_id or destination, the resume may now be different.
+        self.current_journey_id = await self.storage.async_resolve_open_journey_id(
+            self.home_zone
+        )
+        self.last_completed_journey_id = (
+            await self.storage.async_last_completed_journey_id(self.current_journey_id)
+        )
+        self.last_trip = await self.storage.async_get_last()
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
+        _LOGGER.info(
+            "set_trip: trip_id=%s patched fields=%s", trip_id, list(fields.keys()),
+        )
+        return updated
+
+    async def async_set_charge_service(
+        self, *, charge_id: int, fields: dict[str, Any]
+    ) -> ChargeRecord | None:
+        """User-driven patch of a historical charge."""
+        updated = await self.storage.async_patch_charge(charge_id, fields)
+        if updated is None:
+            _LOGGER.warning(
+                "set_charge: charge_id=%s not found or no editable fields",
+                charge_id,
+            )
+            return None
+        if self.last_charge is not None and self.last_charge.charge_id == charge_id:
+            self.last_charge = updated
+        else:
+            self.last_charge = await self.storage.async_get_last_charge()
+        self.hass.bus.async_fire(
+            EVENT_CHARGE_LOGGED,
+            {"entry_id": self.entry_id, **updated.to_dict()},
+        )
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
+        _LOGGER.info(
+            "set_charge: charge_id=%s patched fields=%s",
+            charge_id, list(fields.keys()),
+        )
+        return updated
 
     async def async_delete_last_trip_service(self) -> bool:
         deleted = await self.storage.async_delete_last()

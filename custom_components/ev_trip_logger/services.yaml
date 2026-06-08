@@ -290,3 +290,140 @@ purge_trips:
       description: Restrict the action to a specific config entry.
       selector:
         text:
+
+set_trip:
+  name: Set trip
+  description: >-
+    Amend any field on a logged trip. Useful to correct origin/destination
+    that the device_tracker mis-reported, or fix timestamps when the integration
+    closed late. Pass `trip_id` plus any field(s) to update.
+  fields:
+    trip_id:
+      name: Trip ID
+      description: ID of the trip row to patch (from sensor.<device>_recent_trips).
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+    started_at:
+      name: Started at
+      selector:
+        datetime:
+    ended_at:
+      name: Ended at
+      selector:
+        datetime:
+    distance_km:
+      name: Distance (km)
+      selector:
+        number:
+          min: 0
+          mode: box
+          unit_of_measurement: "km"
+    energy_kwh:
+      name: Energy (kWh)
+      selector:
+        number:
+          min: 0
+          mode: box
+          unit_of_measurement: "kWh"
+    soc_start:
+      name: SoC start (%)
+      selector:
+        number:
+          min: 0
+          max: 100
+          mode: box
+    soc_end:
+      name: SoC end (%)
+      selector:
+        number:
+          min: 0
+          max: 100
+          mode: box
+    origin:
+      name: Origin
+      selector:
+        text:
+    destination:
+      name: Destination
+      selector:
+        text:
+    cost:
+      name: Cost
+      selector:
+        number:
+          min: 0
+          mode: box
+    journey_id:
+      name: Journey ID
+      selector:
+        number:
+          min: 1
+          mode: box
+    entry_id:
+      name: Entry ID
+      selector:
+        text:
+
+set_charge:
+  name: Set charge
+  description: >-
+    Amend a charge's timestamps / kWh / SoC / location after the fact.
+    Use this to fix auto-detected charges that got wrong timestamps
+    (e.g. logged from a `now()` service call after the fact). kWh
+    changes auto-recompute total_cost from the existing price_per_kwh.
+  fields:
+    charge_id:
+      name: Charge ID
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+    started_at:
+      name: Started at
+      selector:
+        datetime:
+    ended_at:
+      name: Ended at
+      selector:
+        datetime:
+    kwh:
+      name: kWh
+      selector:
+        number:
+          min: 0
+          mode: box
+          unit_of_measurement: "kWh"
+    soc_start:
+      name: SoC start (%)
+      selector:
+        number:
+          min: 0
+          max: 100
+          mode: box
+    soc_end:
+      name: SoC end (%)
+      selector:
+        number:
+          min: 0
+          max: 100
+          mode: box
+    location:
+      name: Location
+      selector:
+        text:
+    notes:
+      name: Notes
+      selector:
+        text:
+    is_dcfc:
+      name: Is DC fast-charge
+      selector:
+        boolean:
+    entry_id:
+      name: Entry ID
+      selector:
+        text:

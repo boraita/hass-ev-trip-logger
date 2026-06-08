@@ -17,7 +17,9 @@ from .const import (
     SERVICE_LOG_CHARGE,
     SERVICE_LOG_MANUAL_TRIP,
     SERVICE_PURGE_TRIPS,
+    SERVICE_SET_CHARGE,
     SERVICE_SET_LAST_CHARGE_PRICE,
+    SERVICE_SET_TRIP,
     SERVICE_START_TRIP,
 )
 from .coordinator import EvTripLoggerCoordinator
@@ -93,6 +95,64 @@ _SCHEMA_LOG_MANUAL_TRIP = _SCHEMA_ENTRY.extend(
         vol.Optional("origin"): cv.string,
         vol.Optional("destination"): cv.string,
     }
+)
+
+
+# v0.5.21 — manual corrections. Any trip/charge field can be amended
+# after the fact; useful when the logger missed an off-edge, recorded
+# the wrong origin from a stale device_tracker, or persisted an
+# auto-detected charge with the wrong timestamps.
+_SCHEMA_SET_TRIP = vol.All(
+    _SCHEMA_ENTRY.extend(
+        {
+            vol.Required("trip_id"): vol.All(vol.Coerce(int), vol.Range(min=1)),
+            vol.Optional("started_at"): cv.datetime,
+            vol.Optional("ended_at"): cv.datetime,
+            vol.Optional("duration_min"): vol.Coerce(float),
+            vol.Optional("distance_km"): vol.Coerce(float),
+            vol.Optional("odometer_start"): vol.Coerce(float),
+            vol.Optional("odometer_end"): vol.Coerce(float),
+            vol.Optional("soc_start"): vol.Coerce(float),
+            vol.Optional("soc_end"): vol.Coerce(float),
+            vol.Optional("soc_used_pct"): vol.Coerce(float),
+            vol.Optional("energy_kwh"): vol.Coerce(float),
+            vol.Optional("consumption_kwh_100km"): vol.Coerce(float),
+            vol.Optional("avg_speed_kmh"): vol.Coerce(float),
+            vol.Optional("max_power_kw"): vol.Coerce(float),
+            vol.Optional("max_speed_kmh"): vol.Coerce(float),
+            vol.Optional("regen_kwh"): vol.Coerce(float),
+            vol.Optional("avg_temp_c"): vol.Coerce(float),
+            vol.Optional("origin"): cv.string,
+            vol.Optional("destination"): cv.string,
+            vol.Optional("cost"): vol.Coerce(float),
+            vol.Optional("currency"): cv.string,
+            vol.Optional("journey_id"): vol.All(vol.Coerce(int), vol.Range(min=1)),
+            vol.Optional("start_lat"): vol.Coerce(float),
+            vol.Optional("start_lon"): vol.Coerce(float),
+            vol.Optional("end_lat"): vol.Coerce(float),
+            vol.Optional("end_lon"): vol.Coerce(float),
+            vol.Optional("start_address"): cv.string,
+            vol.Optional("end_address"): cv.string,
+        }
+    ),
+)
+
+
+_SCHEMA_SET_CHARGE = vol.All(
+    _SCHEMA_ENTRY.extend(
+        {
+            vol.Required("charge_id"): vol.All(vol.Coerce(int), vol.Range(min=1)),
+            vol.Optional("started_at"): cv.datetime,
+            vol.Optional("ended_at"): cv.datetime,
+            vol.Optional("kwh"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            vol.Optional("soc_start"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+            vol.Optional("soc_end"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+            vol.Optional("location"): cv.string,
+            vol.Optional("notes"): cv.string,
+            vol.Optional("is_dcfc"): cv.boolean,
+            vol.Optional("currency"): cv.string,
+        }
+    ),
 )
 
 
@@ -214,6 +274,31 @@ def async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_PURGE_TRIPS, _purge_trips, schema=_SCHEMA_PURGE_TRIPS
     )
 
+    async def _set_trip(call: ServiceCall) -> None:
+        # Build the patch dict from every field the user passed.
+        # entry_id and trip_id are stripped; everything else is forwarded.
+        fields = {k: v for k, v in call.data.items()
+                  if k not in {"entry_id", "trip_id"}}
+        trip_id = int(call.data["trip_id"])
+        for c in _resolve_coordinators(hass, call):
+            await c.async_set_trip_service(trip_id=trip_id, fields=fields)
+
+    async def _set_charge(call: ServiceCall) -> None:
+        fields = {k: v for k, v in call.data.items()
+                  if k not in {"entry_id", "charge_id"}}
+        charge_id = int(call.data["charge_id"])
+        for c in _resolve_coordinators(hass, call):
+            await c.async_set_charge_service(
+                charge_id=charge_id, fields=fields,
+            )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_TRIP, _set_trip, schema=_SCHEMA_SET_TRIP
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_CHARGE, _set_charge, schema=_SCHEMA_SET_CHARGE
+    )
+
 
 @callback
 def async_unregister_services(hass: HomeAssistant) -> None:
@@ -227,6 +312,9 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_DELETE_LAST_CHARGE,
         SERVICE_SET_LAST_CHARGE_PRICE,
         SERVICE_LOG_MANUAL_TRIP,
+        SERVICE_PURGE_TRIPS,
+        SERVICE_SET_TRIP,
+        SERVICE_SET_CHARGE,
     ):
         if hass.services.has_service(DOMAIN, name):
             hass.services.async_remove(DOMAIN, name)
