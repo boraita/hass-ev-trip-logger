@@ -417,7 +417,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.17 "
+                    "hass-ev-trip-logger/0.5.18 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -602,11 +602,30 @@ class EvTripLoggerCoordinator:
         Why: at startup, sensors restored from history may still report unknown
         before the integration loads. Opening a trip then would record a wrong
         odometer_start. We skip and rely on the next vehicle_on transition.
+
+        v0.5.18 — require a FRESH vehicle_on edge before resuming. HA
+        caches the last sensor state across restarts via the recorder;
+        if the off-edge happened during the downtime, we'd open a
+        phantom trip from a stale "on" reading. Audit on 2026-06-08
+        showed trip #126 likely opened this way at 21:40 after a
+        restart, stayed open 10 h through the overnight charge.
         """
         if self.current is not None:
             return
-        if self._read_bool(self._vehicle_on) is not True:
+        st = self.hass.states.get(self._vehicle_on)
+        if st is None or st.state != STATE_ON:
             return
+        last_changed = st.last_changed
+        if last_changed is not None:
+            age = (dt_util.now() - last_changed).total_seconds()
+            if age > 300:  # 5 min — anything older is presumed stale
+                _LOGGER.info(
+                    "Skipping resume: vehicle_on=on but last edge was %.1f "
+                    "min ago — likely the off-edge happened during HA "
+                    "downtime",
+                    age / 60.0,
+                )
+                return
         if (
             self._read_float(self._odometer) is None
             or self._read_float(self._battery) is None
@@ -1175,16 +1194,29 @@ class EvTripLoggerCoordinator:
         if is_charging:
             if self.current_charge is not None:
                 return
-            # v0.5.16 — mutual exclusion: a Sealion 7 (and EVs in
-            # general) cannot drive while AC/DC charging. A `charging=on`
-            # event while a trip is open is a sensor race (regen pulse,
-            # brief flicker, stale state) — opening a charge would then
-            # capture mid-trip SoC and let `_async_power_changed`
-            # double-count cable power as drive energy. Ignore it.
+            # v0.5.18 — if a trip is "open" when a legitimate
+            # charging=on arrives, the trip is almost certainly stuck
+            # (vehicle_on never reported off, or a stale resume opened
+            # a phantom). The physical reality is "user is plugged in,
+            # so they're not driving". Force-close the trip first, then
+            # open the charge. This reverses the v0.5.16 "ignore" rule,
+            # which dropped legitimate overnight charges when a trip
+            # was phantom-open. The trip's ended_at uses the
+            # last_movement_ts (best-known last drive moment) so the
+            # trip's duration isn't inflated by the upcoming charge.
             if self.current is not None:
+                ts = (
+                    self.current.last_movement_ts
+                    if self.current.last_movement_ts is not None
+                    else now
+                )
                 _LOGGER.info(
-                    "Ignoring charging=on while trip is open — likely "
-                    "regen pulse or sensor flap"
+                    "charging=on with trip open — force-closing trip "
+                    "(presumed stuck) at %s before opening charge",
+                    ts.isoformat(),
+                )
+                self.hass.async_create_task(
+                    self._async_close_then_open_charge(ts, now)
                 )
                 return
             soc = self._read_float(self._battery)
@@ -1195,6 +1227,28 @@ class EvTripLoggerCoordinator:
             self._notify_listeners()
         elif self.current_charge is not None:
             self.hass.async_create_task(self._async_close_auto_charge(now))
+
+    async def _async_close_then_open_charge(
+        self, close_ts: datetime, now: datetime
+    ) -> None:
+        """Force-close the stuck trip, then open a fresh charge session.
+
+        Used when charging=on fires while self.current is non-None,
+        which is physically impossible (EV cannot drive while charging).
+        The trip is almost certainly a phantom from a prior stale resume
+        or a missed off-edge. We close it cleanly using the last-known
+        movement time so the trip's duration matches reality.
+        """
+        await self._async_close_trip(close_ts)
+        if self.current_charge is None:
+            soc = self._read_float(self._battery)
+            self.current_charge = ChargeInProgress(
+                started_at=now, soc_start=soc, last_seen_soc=soc
+            )
+            _LOGGER.debug(
+                "Charge session opened after trip force-close: soc=%s", soc
+            )
+            self._notify_listeners()
 
     async def _async_close_charge_then_open_trip(self, now: datetime) -> None:
         """Force-close any open charge, THEN open the trip.
@@ -1445,23 +1499,35 @@ class EvTripLoggerCoordinator:
             return
         now = dt_util.now()
 
-        # Idle watchdog — force-close any trip that has stopped showing
-        # evidence of movement (no odo change, no speed > 0) for longer
-        # than _IDLE_INSIDE_TRIP_S. This catches BYD-style cloud-polling
-        # gaps where vehicle_on stays ON across real off/on cycles. The
-        # check runs BEFORE GPS sampling because once we trigger the
-        # close, we want to stop accumulating points.
+        # Idle watchdog — force-close ONLY when vehicle_on is also off,
+        # which indicates we missed the off-edge entirely (cloud-poll
+        # cycle skipped it). If vehicle_on is still on, the user is
+        # just stopped briefly (running an errand, traffic, parked at
+        # a destination) and the trip should remain open until the
+        # off-edge actually arrives. v0.5.17 and earlier split a single
+        # drive into two records when the user paused > 10 min mid-
+        # cycle (audited: trips #123/#124 from cycle C 19:55-20:24).
         last_move = self.current.last_movement_ts
         if last_move is not None and (
             (now - last_move).total_seconds() > self._idle_trip_timeout_s
         ):
-            _LOGGER.info(
-                "Idle watchdog: no movement for %.0fs while trip open — "
-                "force-closing at the last-movement timestamp",
-                (now - last_move).total_seconds(),
-            )
-            self.hass.async_create_task(self._async_close_trip(last_move))
-            return
+            vehicle_on = self._read_bool(self._vehicle_on)
+            if vehicle_on is False:
+                _LOGGER.info(
+                    "Idle watchdog: no movement for %.0fs AND vehicle_on=off — "
+                    "force-closing (missed off-edge)",
+                    (now - last_move).total_seconds(),
+                )
+                self.hass.async_create_task(self._async_close_trip(last_move))
+                return
+            # vehicle_on still on (or unknown): log once and continue.
+            # Don't keep spamming the log — only emit every ~5 min.
+            if int((now - last_move).total_seconds()) % 300 < _LIVE_TICK.total_seconds():
+                _LOGGER.debug(
+                    "Idle watchdog: %.0fs without movement but vehicle_on=on — "
+                    "leaving trip open",
+                    (now - last_move).total_seconds(),
+                )
 
         # GPS sampling — read configured location entity's lat/lon attributes
         # and store one sample per tick while the trip is open. The samples
