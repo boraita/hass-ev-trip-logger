@@ -417,7 +417,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.16 "
+                    "hass-ev-trip-logger/0.5.17 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -585,6 +585,7 @@ class EvTripLoggerCoordinator:
 
         if self.hass.state == CoreState.running:
             self._maybe_resume_trip()
+            self._maybe_resume_charge()
         else:
             self.hass.bus.async_listen_once(
                 EVENT_HOMEASSISTANT_STARTED, self._async_on_ha_started
@@ -593,6 +594,7 @@ class EvTripLoggerCoordinator:
     @callback
     def _async_on_ha_started(self, _event: Event) -> None:
         self._maybe_resume_trip()
+        self._maybe_resume_charge()
 
     def _maybe_resume_trip(self) -> None:
         """Open a trip at startup only when vehicle_on=on AND odo/soc are readable.
@@ -615,6 +617,38 @@ class EvTripLoggerCoordinator:
             )
             return
         self._open_trip(dt_util.now())
+
+    def _maybe_resume_charge(self) -> None:
+        """Resume a ChargeInProgress at startup if a charge is already on.
+
+        Why: ChargeInProgress lives only in memory. If HA (or this
+        integration) restarts mid-charge, the charging=on event has
+        already fired before the listener registered, and the next
+        charging=off arrives to a coordinator that thinks no charge is
+        open → handler silently no-ops and the entire session is lost.
+        Mirroring _maybe_resume_trip closes this gap.
+
+        We use the sensor's last_changed as `started_at` (the true edge
+        from off→on), and the current SoC as a best-effort `soc_start`
+        — slightly off from the real charge-start SoC, but vastly
+        better than dropping the session.
+        """
+        if self._charge_sensor is None:
+            return
+        if self.current_charge is not None:
+            return
+        st = self.hass.states.get(self._charge_sensor)
+        if st is None or st.state != STATE_ON:
+            return
+        soc = self._read_float(self._battery)
+        started = st.last_changed or dt_util.now()
+        self.current_charge = ChargeInProgress(
+            started_at=started, soc_start=soc, last_seen_soc=soc
+        )
+        _LOGGER.info(
+            "Resumed mid-charge session at startup (started %s, soc≈%s)",
+            started.isoformat(), soc,
+        )
 
     async def async_stop(self) -> None:
         for unsub in (
