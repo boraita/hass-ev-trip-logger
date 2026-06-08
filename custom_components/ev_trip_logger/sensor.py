@@ -227,6 +227,10 @@ async def async_setup_entry(
     entities.append(LastTripRouteSensor(coordinator))
     if coordinator._abrp is not None:
         entities.append(AbrpNextChargeSocSensor(coordinator))
+    # v0.5.38 — two rolling-average sensors per tracked entity.
+    for eid in coordinator._tracked_sensors:
+        entities.append(TrackedAvgSensor(coordinator, eid, days=7))
+        entities.append(TrackedAvgSensor(coordinator, eid, days=30))
     entities.append(TripRecordsSensor(coordinator))
     entities.append(ChargeInProgressSensor(coordinator))
     entities.append(PlugStateSensor(coordinator))
@@ -1048,6 +1052,127 @@ class AbrpNextChargeSocSensor(_BaseTripSensor):
     @property
     def native_value(self) -> int | None:
         return self._value
+
+
+class TrackedAvgSensor(_BaseTripSensor):
+    """Rolling N-day mean of an arbitrary numeric sensor via HA recorder.
+
+    Configured via CONF_TRACKED_SENSORS. Each tracked entity gets two
+    of these — 7-day and 30-day. The state is the arithmetic mean of
+    every numeric sample the recorder has in the window; non-numeric
+    states (unknown/unavailable/strings) are dropped. Attributes
+    expose the sample count + window-edge timestamps so the dashboard
+    can show "based on N readings since …".
+    """
+
+    _unrecorded_attributes = frozenset({"samples"})
+
+    def __init__(
+        self,
+        coordinator: EvTripLoggerCoordinator,
+        source_entity: str,
+        *,
+        days: int,
+    ) -> None:
+        super().__init__(coordinator)
+        self._source = source_entity
+        self._days = days
+        # Slug = "<source-suffix>_avg_<N>d" so the resulting entity_id
+        # is sensor.<device>_<source-suffix>_avg_<N>d.
+        # source_entity looks like "sensor.byd_sealion_7_today_s_energy_consumption"
+        # → we strip the "sensor." prefix and any device prefix that
+        # matches the coordinator's entry title (lowercased). For
+        # foreign devices we keep the full slug.
+        src_slug = source_entity.split(".", 1)[-1]
+        device_prefix = (coordinator.entry.title or "").lower().replace(" ", "_")
+        if device_prefix and src_slug.startswith(device_prefix + "_"):
+            src_slug = src_slug[len(device_prefix) + 1:]
+        slug = f"{src_slug}_avg_{days}d"
+        self.entity_description = SensorEntityDescription(
+            key=slug,
+            translation_key=None,  # no translation file entry
+            icon="mdi:chart-line-variant",
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+        self._attr_name = f"{src_slug.replace('_', ' ').title()} avg {days}d"
+        self._attr_has_entity_name = False  # use _attr_name verbatim
+        self._attr_unique_id = (
+            f"{coordinator.entry_id}_{src_slug}_avg_{days}d"
+        )
+        self._mean: float | None = None
+        self._samples: int = 0
+        self._window_start: datetime | None = None
+
+    async def async_added_to_hass(self) -> None:
+        from .const import TRACKED_AVG_REFRESH_S  # noqa: PLC0415
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh,
+                timedelta(seconds=TRACKED_AVG_REFRESH_S),
+            )
+        )
+
+    async def _async_refresh(self, *_: Any) -> None:
+        try:
+            from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+        except Exception:
+            return
+        end = dt_util.now()
+        start = end - timedelta(days=self._days)
+        self._window_start = start
+        try:
+            recorder = get_instance(self.hass)
+            result = await recorder.async_add_executor_job(
+                state_changes_during_period,
+                self.hass, start, end, self._source,
+            )
+        except Exception as exc:
+            _LOGGER.debug("TrackedAvg %s: recorder query failed: %s",
+                          self._source, exc)
+            return
+        states = result.get(self._source, []) if isinstance(result, dict) else []
+        values: list[float] = []
+        for s in states:
+            try:
+                v = float(s.state)
+            except (TypeError, ValueError):
+                continue
+            values.append(v)
+        if values:
+            self._mean = sum(values) / len(values)
+            self._samples = len(values)
+        else:
+            self._mean = None
+            self._samples = 0
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        if self._mean is None:
+            return None
+        return round(self._mean, 2)
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        # Mirror the source sensor's unit when we can read it.
+        state = self.hass.states.get(self._source)
+        if state is not None:
+            return state.attributes.get("unit_of_measurement")
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "source_entity": self._source,
+            "window_days": self._days,
+            "samples": self._samples,
+            "window_start": self._window_start.isoformat()
+                if self._window_start else None,
+        }
 
 
 class LastTripRouteSensor(_BaseTripSensor):

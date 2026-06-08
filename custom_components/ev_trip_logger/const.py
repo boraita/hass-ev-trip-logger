@@ -24,6 +24,15 @@ CONF_PLUG_SENSOR: Final = "plug_sensor"
 # 'reconstructed_polling_paused' so the dashboard can show low
 # confidence.
 CONF_POLLING_PAUSED_SENSOR: Final = "polling_paused_sensor"
+# v0.5.38 — optional list of numeric sensors whose 7d / 30d averages
+# the integration will expose. Typical use: BYD's energy snapshot
+# entities (today's consumption, last-50km kWh, lifetime average,
+# etc.) that only update when the user presses the fetch button.
+# Tracking them here gives the user actual rolling means without
+# wiring multiple HA `statistics` platform entries by hand.
+CONF_TRACKED_SENSORS: Final = "tracked_sensors"
+# How often each tracked-average sensor re-queries the recorder.
+TRACKED_AVG_REFRESH_S: Final = 300
 # v0.5.31 — optional ABRP (A Better Route Planner) telemetry push.
 # Token+api_key required to activate; car_model is the ABRP slug
 # (e.g. "byd:sealion:25:82:rwd"). All three live in the integration's

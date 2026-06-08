@@ -52,6 +52,7 @@ from .const import (
     CONF_MIN_TRIP_DISTANCE,
     CONF_PLUG_SENSOR,
     CONF_POLLING_PAUSED_SENSOR,
+    CONF_TRACKED_SENSORS,
     CONF_ODOMETER,
     CONF_DCFC_THRESHOLD_KW,
     CONF_IDLE_TRIP_TIMEOUT_MIN,
@@ -277,6 +278,16 @@ class EvTripLoggerCoordinator:
         # synth-trip window we tag confidence as
         # 'reconstructed_polling_paused'.
         self._polling_paused_sensor = merged.get(CONF_POLLING_PAUSED_SENSOR)
+        # v0.5.38 — list of external numeric sensors to roll up via the
+        # HA recorder. The platform creates two AVG sensors per entry
+        # (7-day and 30-day). Stored verbatim so multi-entry option
+        # flows can edit / extend the list.
+        tracked = merged.get(CONF_TRACKED_SENSORS) or []
+        if isinstance(tracked, str):
+            tracked = [tracked]
+        self._tracked_sensors: list[str] = [
+            str(eid) for eid in tracked if eid
+        ]
         # v0.5.31 — ABRP wiring. Only instantiate the client when BOTH
         # token and api_key are present; otherwise the feature stays
         # off completely (no requests, no logs).
@@ -608,7 +619,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.37 "
+                    "hass-ev-trip-logger/0.5.38 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
