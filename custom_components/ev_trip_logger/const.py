@@ -17,6 +17,16 @@ CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
 CONF_SPEED: Final = "speed_sensor"
 CONF_PLUG_SENSOR: Final = "plug_sensor"
+# v0.5.23 — optional on-demand refresh button (e.g. the BYD integration's
+# button.byd_sealion_7_fetch_energy_data). Pressed by the integration
+# before reading sensors at trip/charge lifecycle boundaries so the
+# captured odo/SoC are as fresh as the upstream cloud allows. Without
+# this, cloud-polled cars have 8-10 min stale data at every open/close.
+CONF_REFRESH_BUTTON: Final = "refresh_button"
+# How long to wait after pressing the refresh button before reading
+# the sensors back. The upstream integration needs time to round-trip
+# to the cloud and write the fresh value into HA state.
+DEFAULT_REFRESH_SETTLE_S: Final = 8
 
 CONF_BATTERY_CAPACITY: Final = "battery_capacity_kwh"
 CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"
