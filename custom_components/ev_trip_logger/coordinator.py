@@ -106,6 +106,26 @@ _PRE_ON_LOOKBACK = timedelta(minutes=5)
 # either sat too long or someone discharged it externally).
 _POST_CHARGE_ANCHOR_WINDOW = timedelta(hours=12)
 _POST_CHARGE_DRAIN_BUDGET_PCT = 2.0
+# Max age the synth-trip baseline can be before we discard it. Without
+# this, `_async_check_odo_jump` happily uses `_last_idle_odo` from
+# yesterday as the start anchor for today's drive, producing 10 h
+# phantom trips that span overnight charging (SoC rises across the
+# "trip", soc_used goes negative, energy ends up NULL or absurd).
+_MAX_SYNTH_BASELINE_AGE = timedelta(hours=2)
+# Debounce for vehicle_on off-edge. BYD cloud-poll occasionally sends a
+# flicker (on→off→on within 1-2 s). Without this, two _async_close_trip
+# tasks queue: the first closes properly, the second sees self.current
+# is None and silently returns — but the next vehicle_on=on then opens
+# a fresh trip from the SAME ignition event, fragmenting one real drive
+# into two short trips with a near-zero gap. The debounce coalesces
+# off-edges in this window into one close.
+_VEHICLE_ON_OFF_DEBOUNCE_S = 3.0
+# Minimum time a location zone must persist before we treat it as a real
+# arrival. Cloud-polled device_trackers occasionally bounce (e.g.
+# home→not_home→home in 40 s) when geofence math wobbles near the home
+# boundary. v0.5.14's late-zone-arrival used to amend the destination
+# on the first flap, fragmenting a single drive into two trips.
+_LOCATION_DWELL_MIN_S = 60.0
 # Sanity bounds for the v0.5.13 power-integration backup. Cloud-polled
 # integrations (BYD especially) occasionally replay a stale power sample
 # with a huge gap to the next one; without these guards a 200 kW × 0.5 h
@@ -258,6 +278,10 @@ class EvTripLoggerCoordinator:
         self._unsub_synth_finalize: CALLBACK_TYPE | None = None
         self._synth_baseline: tuple[datetime, float, float | None] | None = None
         self._unsub_location: CALLBACK_TYPE | None = None
+        # v0.5.16 — vehicle_on off-edge debounce. Holds the most recent
+        # off-edge timestamp so a follow-up on→off within
+        # _VEHICLE_ON_OFF_DEBOUNCE_S can be detected and re-coalesced.
+        self._pending_close_unsub: CALLBACK_TYPE | None = None
 
         # Reverse-geocode cache keyed on rounded (lat, lon) → friendly label.
         # Rounded to 4 decimal places (~10 m), which dedupes hits in the same
@@ -374,7 +398,12 @@ class EvTripLoggerCoordinator:
         """
         if lat is None or lon is None:
             return None
-        key = (round(float(lat), 4), round(float(lon), 4))
+        # v0.5.16 — sharper key (~1.1 m at the equator). The previous
+        # 4-decimal rounding (~11 m) collapsed adjacent shops/parking
+        # spots to the same key, so trip B inherited trip A's address.
+        # That label was then PERSISTED via async_update_trip_addresses,
+        # producing the "mezcla direcciones" reports.
+        key = (round(float(lat), 5), round(float(lon), 5))
         if key in self._geocode_cache:
             return self._geocode_cache[key]
         try:
@@ -388,7 +417,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.15 "
+                    "hass-ev-trip-logger/0.5.16 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -619,6 +648,17 @@ class EvTripLoggerCoordinator:
         now = dt_util.now()
         if is_on:
             self._cancel_idle()
+            # v0.5.16 — if a debounced close is pending from a recent
+            # off-edge, this on event means it was a flicker (BYD cloud-
+            # poll sometimes sends on→off→on within 1-2 s). Cancel the
+            # pending close, leave the trip open, return.
+            if self._pending_close_unsub is not None:
+                self._pending_close_unsub()
+                self._pending_close_unsub = None
+                _LOGGER.info(
+                    "vehicle_on=on cancelled a pending close — flicker absorbed"
+                )
+                return
             if self.current is None:
                 # Defer opening if metrics aren't ready yet — avoids recording
                 # a bogus odometer_start. The next metric tick will not re-open
@@ -633,14 +673,40 @@ class EvTripLoggerCoordinator:
                         "vehicle_on=on but odometer/battery not ready; not opening trip"
                     )
                     return
-                self._open_trip(now)
+                # v0.5.16 — mutual exclusion: a charge session must end
+                # before a trip opens. Chain via an async helper so the
+                # close completes BEFORE _open_trip, letting
+                # _resolve_soc_start consume the freshly-closed
+                # last_charge.soc_end as the new trip's anchor.
+                if self.current_charge is not None:
+                    _LOGGER.info(
+                        "vehicle_on=on with charge in progress — "
+                        "closing charge before opening trip"
+                    )
+                    self.hass.async_create_task(
+                        self._async_close_charge_then_open_trip(now)
+                    )
+                else:
+                    self._open_trip(now)
         elif self.current is not None:
-            # Close immediately: each on/off cycle is one trip. Trip stats
-            # (avg_speed, energy_kwh, consumption) are computed from the
-            # actual on→off interval. The legacy idle_timeout debounce was
-            # merging consecutive cycles (e.g. a home→work + work→shops
-            # pair) into a single "trip" with bogus aggregate stats.
-            self.hass.async_create_task(self._async_close_trip(now))
+            # v0.5.16 — debounced close. Captures the off timestamp so
+            # the trip's ended_at reflects the actual off-edge, not the
+            # debounce expiry. If a fresh on arrives before the timer
+            # fires, the close is cancelled above and the trip stays
+            # open.
+            if self._pending_close_unsub is not None:
+                self._pending_close_unsub()
+                self._pending_close_unsub = None
+            off_ts = now
+
+            @callback
+            def _debounced_close(_at: datetime) -> None:
+                self._pending_close_unsub = None
+                self.hass.async_create_task(self._async_close_trip(off_ts))
+
+            self._pending_close_unsub = async_call_later(
+                self.hass, _VEHICLE_ON_OFF_DEBOUNCE_S, _debounced_close
+            )
 
     @callback
     def _async_metric_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -716,6 +782,11 @@ class EvTripLoggerCoordinator:
            not just home) so history matches reality.
         2. Specifically on `home` arrival, close the open journey too —
            home is the natural journey terminator; other zones aren't.
+
+        v0.5.16 — dwell guard: we defer the amend by _LOCATION_DWELL_MIN_S
+        and re-check the state at that point. If the zone changed again
+        in the interim (a flap), no amend fires. This stops the 40 s
+        home→not_home→home GPS glitch from fragmenting a single drive.
         """
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _INVALID_STATES:
@@ -727,9 +798,21 @@ class EvTripLoggerCoordinator:
         # While a trip is active, normal close will pick this up later.
         if self.current is not None:
             return
-        self.hass.async_create_task(
-            self._async_handle_late_zone_arrival(loc, new_state.last_updated)
-        )
+        when = new_state.last_updated
+
+        async def _deferred() -> None:
+            await asyncio.sleep(_LOCATION_DWELL_MIN_S)
+            # Re-read NOW — if the zone changed back, this was a flap.
+            current_loc = self._read_str(self._location)
+            if current_loc != loc:
+                _LOGGER.debug(
+                    "Ignoring location flap: %s → %s within %.0f s",
+                    loc, current_loc, _LOCATION_DWELL_MIN_S,
+                )
+                return
+            await self._async_handle_late_zone_arrival(loc, when)
+
+        self.hass.async_create_task(_deferred())
 
     async def _async_handle_late_zone_arrival(
         self, location: str, when: datetime
@@ -785,6 +868,19 @@ class EvTripLoggerCoordinator:
             self._last_idle_odo = (now, odo, soc)
             return
         prev_t, prev_odo, prev_soc = prev
+        # v0.5.16 — if the baseline is older than _MAX_SYNTH_BASELINE_AGE,
+        # the user has either parked overnight or HA has been idle a
+        # long time. Reusing such a stale prev_t as `started_at` produces
+        # phantom 10 h trips that span overnight charging (SoC went UP
+        # during the "trip", making soc_used negative). Treat it as a
+        # fresh observation instead.
+        if (now - prev_t) > _MAX_SYNTH_BASELINE_AGE:
+            _LOGGER.debug(
+                "Synth baseline stale (%.1f h old) — resetting to now",
+                (now - prev_t).total_seconds() / 3600.0,
+            )
+            self._last_idle_odo = (now, odo, soc)
+            return
         delta = odo - prev_odo
 
         if delta < self._min_distance:
@@ -947,6 +1043,16 @@ class EvTripLoggerCoordinator:
         if self.current_charge is not None:
             self.current_charge.last_power_kw = abs(value)
             self._notify_listeners()
+            # v0.5.16 — cable power is NOT trip energy. When a charge
+            # session is in progress, return early so we don't integrate
+            # the AC inrush or DC delivery into the trip's regen / power
+            # estimator. The bug (confirmed empirically) is BYD reports
+            # charging as negative power → the trip's regen_kwh and
+            # energy_from_power_kwh balloon while the cable runs, then
+            # `max(energy_soc, energy_pwr)` picks the inflated value at
+            # close. Symptom: a stationary trip + charge gives a huge
+            # max_power and impossible consumption.
+            return
         if self.current is None:
             return
         self.current.max_power = max(self.current.max_power, abs(value))
@@ -1035,6 +1141,18 @@ class EvTripLoggerCoordinator:
         if is_charging:
             if self.current_charge is not None:
                 return
+            # v0.5.16 — mutual exclusion: a Sealion 7 (and EVs in
+            # general) cannot drive while AC/DC charging. A `charging=on`
+            # event while a trip is open is a sensor race (regen pulse,
+            # brief flicker, stale state) — opening a charge would then
+            # capture mid-trip SoC and let `_async_power_changed`
+            # double-count cable power as drive energy. Ignore it.
+            if self.current is not None:
+                _LOGGER.info(
+                    "Ignoring charging=on while trip is open — likely "
+                    "regen pulse or sensor flap"
+                )
+                return
             soc = self._read_float(self._battery)
             self.current_charge = ChargeInProgress(
                 started_at=now, soc_start=soc, last_seen_soc=soc
@@ -1043,6 +1161,18 @@ class EvTripLoggerCoordinator:
             self._notify_listeners()
         elif self.current_charge is not None:
             self.hass.async_create_task(self._async_close_auto_charge(now))
+
+    async def _async_close_charge_then_open_trip(self, now: datetime) -> None:
+        """Force-close any open charge, THEN open the trip.
+
+        Used when vehicle_on=on fires while current_charge is non-None.
+        Awaiting the close persists last_charge so _resolve_soc_start
+        for the new trip can use the freshly-captured soc_end as anchor
+        (the most accurate option per the SoC-source design).
+        """
+        await self._async_close_auto_charge(now)
+        if self.current is None:
+            self._open_trip(now)
 
     async def _async_close_auto_charge(self, now: datetime) -> None:
         active = self.current_charge
@@ -1120,6 +1250,7 @@ class EvTripLoggerCoordinator:
             location=location or "auto",
             notes=f"auto-detected from {self._charge_sensor}",
             started_at=active.started_at,
+            soc_start=active.soc_start,
         )
 
     @callback
@@ -1457,6 +1588,15 @@ class EvTripLoggerCoordinator:
             # short home→home round trip), it closes immediately as a
             # one-stage journey.
             journey_id = await self.storage.async_next_journey_id()
+        elif is_at_home_end:
+            # v0.5.16 — orphan home-arrival stitching. The audit showed
+            # ~30 % of historical journeys had their closing home leg
+            # logged with journey_id=NULL because device_tracker GPS
+            # noise (or an old amend bug) had already closed the open
+            # journey before this trip arrived home. Treat this trip as
+            # the closing stage of its own one-stage journey so journey
+            # aggregates always include the arrival.
+            journey_id = await self.storage.async_next_journey_id()
         else:
             # Orphan stage — not part of any journey. Happens when the
             # device_tracker missed the previous trip's home departure.
@@ -1567,6 +1707,7 @@ class EvTripLoggerCoordinator:
         location: str | None = None,
         notes: str | None = None,
         started_at: datetime | None = None,
+        soc_start: float | None = None,
         is_dcfc: bool | None = None,
     ) -> ChargeRecord:
         """Persist a charge session.
@@ -1595,9 +1736,15 @@ class EvTripLoggerCoordinator:
 
         if is_dcfc is None and started_at is not None:
             duration_h = (now - started_at).total_seconds() / 3600.0
-            if duration_h > 0:
+            # v0.5.16 — guard divide-by-near-zero. A sub-minute session
+            # (charge-sensor flicker on/off in seconds) would compute an
+            # astronomical avg_kw and misclassify a normal AC pulse as
+            # DCFC. Require ≥3 min of duration AND a physically possible
+            # avg_kw before classifying.
+            if duration_h >= 0.05:
                 avg_kw = kwh / duration_h
-                is_dcfc = avg_kw > self._dcfc_threshold_kw
+                if avg_kw <= 400:
+                    is_dcfc = avg_kw > self._dcfc_threshold_kw
 
         record = ChargeRecord(
             started_at=started_at,
@@ -1606,6 +1753,7 @@ class EvTripLoggerCoordinator:
             price_per_kwh=price_per_kwh,
             total_cost=total_cost,
             currency=currency or self._currency,
+            soc_start=soc_start,
             soc_end=self._read_float(self._battery),
             location=location,
             notes=notes,

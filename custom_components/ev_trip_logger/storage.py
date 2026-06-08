@@ -573,6 +573,31 @@ class TripStorage:
     def _resolve_open_journey_id(self, home_zone: str) -> int | None:
         slug = (home_zone or "home").strip().casefold()
         with self._connect() as conn:
+            # v0.5.16 — DESC: if storage somehow has multiple distinct
+            # journey_ids past the last home-arrival (a partial purge,
+            # crash-mid-close, or a wrongly minted id), pick the NEWEST
+            # one as the open journey. Picking the oldest accreted new
+            # stages into a stale journey. Log a warning when ambiguity
+            # is observed so the inconsistency is visible.
+            rows = conn.execute(
+                """
+                SELECT DISTINCT journey_id FROM trips
+                WHERE journey_id IS NOT NULL
+                  AND id > COALESCE(
+                      (SELECT MAX(id) FROM trips
+                       WHERE LOWER(destination) = ?),
+                      0)
+                """,
+                (slug,),
+            ).fetchall()
+            if not rows:
+                return None
+            if len(rows) > 1:
+                _LOGGER.warning(
+                    "Multiple open journey_ids past last home-arrival: %s — "
+                    "picking newest. Storage may need a manual repair.",
+                    sorted(int(r[0]) for r in rows),
+                )
             row = conn.execute(
                 """
                 SELECT journey_id FROM trips
@@ -581,7 +606,7 @@ class TripStorage:
                       (SELECT MAX(id) FROM trips
                        WHERE LOWER(destination) = ?),
                       0)
-                ORDER BY id ASC
+                ORDER BY id DESC
                 LIMIT 1
                 """,
                 (slug,),

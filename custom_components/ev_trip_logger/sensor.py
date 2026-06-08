@@ -993,6 +993,13 @@ class TripRecordsSensor(_BaseTripSensor):
     consumption — exposed separately so cards can label them independently.
     """
 
+    # v0.5.16 — dict-valued attributes re-emit on every refresh; without
+    # these exclusions the recorder serialises kilobytes of state per
+    # tick and HA logs "State attributes exceeded maximum size" warnings.
+    _unrecorded_attributes = frozenset({
+        "most_efficient", "longest", "cheapest", "totals", "best_score",
+    })
+
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
         self._records: dict[str, Any] | None = None
@@ -1475,6 +1482,7 @@ class ConsumptionByTempBucketSensor(_BaseTripSensor):
     attributes for dashboard charts.
     """
 
+    _unrecorded_attributes = frozenset({"by_bucket"})
     _BUCKET_SIZE_C = 5.0
 
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
@@ -1539,6 +1547,8 @@ class ConsumptionByTempBucketSensor(_BaseTripSensor):
 class MonthlyHistorySensor(_BaseTripSensor):
     """Per-month rollups for the last 12 months (powers dual-axis bar chart)."""
 
+    _unrecorded_attributes = frozenset({"months"})
+
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         super().__init__(coordinator)
         self.entity_description = SensorEntityDescription(
@@ -1579,6 +1589,7 @@ class MonthlyHistorySensor(_BaseTripSensor):
 class DailyKm60dSensor(_BaseTripSensor):
     """Per-day km totals for the last 60 days (powers the line chart)."""
 
+    _unrecorded_attributes = frozenset({"days"})
     _WINDOW_DAYS = 60
 
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
@@ -1627,6 +1638,7 @@ class DailyKm60dSensor(_BaseTripSensor):
 class TripPatternsSensor(_BaseTripSensor):
     """Trip distribution by hour-of-day and weekday (powers radar / bar charts)."""
 
+    _unrecorded_attributes = frozenset({"by_hour", "by_weekday", "km_by_weekday"})
     _WINDOW_DAYS = 90
 
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
@@ -1760,6 +1772,13 @@ class AvgTripMetricsSensor(_BaseTripSensor):
 class TopsSensor(_BaseTripSensor):
     """Top-N trips per criterion (powers the Rankings screen)."""
 
+    # v0.5.16 — six lists × nine dicts is the heaviest blob the integration
+    # emits. Without exclusion, the recorder serialises ~30 KB per refresh
+    # and HA drops the attributes silently with a warning.
+    _unrecorded_attributes = frozenset({
+        "longest", "longest_duration", "top_consumption",
+        "top_efficiency", "top_speed", "cheapest",
+    })
     _LIMIT = 9
 
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
