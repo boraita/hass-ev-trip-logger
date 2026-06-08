@@ -347,6 +347,103 @@ class EvTripLoggerCoordinator:
         """Current SoC % from the configured battery sensor, None if unreadable."""
         return self._read_float(self._battery)
 
+    async def _async_lat_lon_at(
+        self, entity_id: str, when: datetime
+    ) -> tuple[float, float] | None:
+        """Resolve lat/lon attrs of `entity_id` from recorder history at `when`.
+
+        Looks 30 min before / 5 min after the target moment. Picks the
+        most recent state whose timestamp is ≤ `when` (the value the
+        car likely had at trip start/end). Returns None on any failure
+        (recorder unavailable, no states in window, missing attrs).
+        """
+        try:
+            from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+        except Exception:  # pragma: no cover — recorder always present
+            return None
+        start = when - timedelta(minutes=30)
+        end = when + timedelta(minutes=5)
+        try:
+            recorder = get_instance(self.hass)
+            result = await recorder.async_add_executor_job(
+                state_changes_during_period,
+                self.hass, start, end, entity_id,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug(
+                "Recorder GPS lookup failed for %s @ %s: %s",
+                entity_id, when, exc,
+            )
+            return None
+        states = result.get(entity_id, []) if isinstance(result, dict) else []
+        if not states:
+            return None
+        # Sort by timestamp; pick the latest state ≤ when, else fall
+        # back to the earliest > when (better than nothing).
+        try:
+            sorted_states = sorted(states, key=lambda s: s.last_updated)
+        except Exception:
+            sorted_states = list(states)
+        candidates = [s for s in sorted_states if s.last_updated <= when]
+        pick = candidates[-1] if candidates else sorted_states[0]
+        try:
+            lat = float(pick.attributes.get("latitude"))
+            lon = float(pick.attributes.get("longitude"))
+        except (TypeError, ValueError):
+            return None
+        return (lat, lon)
+
+    async def _async_backfill_gps(self) -> None:
+        """One-shot: fill in start_lat/lon and end_lat/lon for trips with
+        NULL GPS coords by querying the recorder for the location entity's
+        history at each trip's started_at / ended_at.
+
+        Bounded to 50 trips per startup (the same cap as the geocode
+        backfill it chains into). The location entity history typically
+        only survives ~10 days in HA's recorder, so older trips will
+        return no result — those stay unresolved. After GPS is filled,
+        the geocode backfill resolves them to street/town.
+        """
+        if not self._location:
+            return
+        try:
+            pending = await self.storage.async_trips_missing_gps(limit=50)
+        except Exception as err:  # pragma: no cover — defensive
+            _LOGGER.debug("GPS backfill: list query failed: %s", err)
+            return
+        if not pending:
+            return
+        _LOGGER.info("GPS backfill: %d trip(s) to resolve", len(pending))
+        filled = 0
+        for row in pending:
+            try:
+                started = datetime.fromisoformat(row["started_at"])
+                ended = datetime.fromisoformat(row["ended_at"])
+            except (TypeError, ValueError):
+                continue
+            start_coords = await self._async_lat_lon_at(self._location, started)
+            end_coords = await self._async_lat_lon_at(self._location, ended)
+            if not (start_coords or end_coords):
+                continue
+            await self.storage.async_update_trip_gps(
+                row["id"],
+                start_lat=start_coords[0] if start_coords else None,
+                start_lon=start_coords[1] if start_coords else None,
+                end_lat=end_coords[0] if end_coords else None,
+                end_lon=end_coords[1] if end_coords else None,
+            )
+            filled += 1
+        if filled:
+            _LOGGER.info(
+                "GPS backfill: filled %d trip(s); kicking geocode backfill",
+                filled,
+            )
+            # Trigger the address resolver for the newly-coord'd rows.
+            self.hass.async_create_task(self._async_backfill_geocodes())
+
     async def _async_backfill_geocodes(self) -> None:
         """Fill in start_address/end_address on historical trips with GPS.
 
@@ -417,7 +514,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.19 "
+                    "hass-ev-trip-logger/0.5.20 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -550,11 +647,18 @@ class EvTripLoggerCoordinator:
         except Exception as err:  # pragma: no cover — defensive
             _LOGGER.debug("Trip cost heal failed (non-fatal): %s", err)
 
-        # Background backfill of missing reverse-geocoded addresses for
-        # trips logged before v0.5.12. Rate-limited (~1 req/sec to respect
-        # Nominatim's policy). Runs as a separate task so HA start-up isn't
-        # blocked.
-        self.hass.async_create_task(self._async_backfill_geocodes())
+        # v0.5.20 — one-shot GPS backfill from recorder history first,
+        # which then chains into the geocode backfill so trips logged
+        # before v0.5.3 (synth, no GPS) get street/town labels too. The
+        # backfill is bounded (50 rows max) and idempotent. If the
+        # recorder no longer holds the device_tracker history for an
+        # older trip (default retention 10 days), that row stays
+        # unresolved — the geocoder backfill will pick it up later
+        # if/when coords become available another way.
+        if self._location:
+            self.hass.async_create_task(self._async_backfill_gps())
+        else:
+            self.hass.async_create_task(self._async_backfill_geocodes())
 
         self._unsub_state = async_track_state_change_event(
             self.hass, [self._vehicle_on], self._async_vehicle_on_changed

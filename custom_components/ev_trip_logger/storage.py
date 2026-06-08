@@ -895,6 +895,66 @@ class TripStorage:
             ).fetchone()
         return _row_to_charge(updated)
 
+    async def async_trips_missing_gps(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Trips with NULL start_lat AND NULL end_lat — for GPS backfill.
+
+        Returns the newest matching rows first so a one-shot heal at
+        startup is bounded; older rows are picked up on subsequent
+        startups (the integration triggers this heal once per launch).
+        """
+        return await self._hass.async_add_executor_job(
+            self._trips_missing_gps, limit
+        )
+
+    def _trips_missing_gps(self, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, started_at, ended_at
+                FROM trips
+                WHERE start_lat IS NULL AND end_lat IS NULL
+                ORDER BY id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def async_update_trip_gps(
+        self,
+        trip_id: int,
+        *,
+        start_lat: float | None = None,
+        start_lon: float | None = None,
+        end_lat: float | None = None,
+        end_lon: float | None = None,
+    ) -> None:
+        await self._hass.async_add_executor_job(
+            self._update_trip_gps, trip_id,
+            start_lat, start_lon, end_lat, end_lon,
+        )
+
+    def _update_trip_gps(
+        self,
+        trip_id: int,
+        start_lat: float | None,
+        start_lon: float | None,
+        end_lat: float | None,
+        end_lon: float | None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE trips SET
+                    start_lat = COALESCE(?, start_lat),
+                    start_lon = COALESCE(?, start_lon),
+                    end_lat = COALESCE(?, end_lat),
+                    end_lon = COALESCE(?, end_lon)
+                WHERE id = ?
+                """,
+                (start_lat, start_lon, end_lat, end_lon, trip_id),
+            )
+
     async def async_trips_needing_geocode(self, limit: int = 50) -> list[dict[str, Any]]:
         """Trips with GPS coords but no address yet — for the backfill."""
         return await self._hass.async_add_executor_job(self._trips_needing_geocode, limit)
