@@ -514,7 +514,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.21 "
+                    "hass-ev-trip-logger/0.5.22 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
