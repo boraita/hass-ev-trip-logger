@@ -15,6 +15,7 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -50,6 +51,15 @@ class AbrpPushSwitch(SwitchEntity, RestoreEntity):
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         self._coordinator = coordinator
         self._attr_unique_id = f"{coordinator.entry_id}_abrp_push"
+        # Link to the same device sensors use so the generated
+        # entity_id is `switch.<device-slug>_abrp_telemetry` instead
+        # of falling back to integration+entry_id soup.
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, coordinator.entry_id)},
+            name=coordinator.entry.title,
+            manufacturer="EV Trip Logger",
+            model="Vehicle-agnostic trip logger",
+        )
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
