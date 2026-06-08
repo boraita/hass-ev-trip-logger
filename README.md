@@ -4,143 +4,223 @@
 
 # EV Trip Logger for Home Assistant
 
-[![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-[![GitHub Release](https://img.shields.io/github/v/release/boraita/hass-ev-trip-logger?include_prereleases)](https://github.com/boraita/hass-ev-trip-logger/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+A vehicle-agnostic Home Assistant custom integration that records every drive and charge from the entities your manufacturer integration already exposes, derives accurate consumption / cost / journey aggregates from them, and surfaces everything through standard HA sensors so any dashboard can consume the data.
 
-A trip logger for any electric vehicle in Home Assistant.
+Works with **any cloud-polled EV integration** — BYD, Tesla Fleet, OVMS, Bouncie, native CAN-bus dongles, even a manual setup. You point it at the entities you already have; it does the rest.
 
-## What it does
+> Companion dashboard with ~25 ready-to-use cards: **[hass-ev-trip-dashboard](https://github.com/boraita/hass-ev-trip-dashboard)**.
 
-Your HA already shows odometer, battery and "vehicle on/off" from whatever integration runs your car. On their own, those numbers don't tell you anything. This integration sits on top and turns them into trip data:
+---
 
-- **Each drive becomes a trip** — date, distance, energy used, consumption (kWh/100km), cost, score 0–10.
-- **Journeys** group consecutive trips into one "from home to home" outing — work → lunch → errands → back home is one journey, not four trips.
-- **Each charge is logged** — kWh added, what you paid, where, with auto-detection if your car exposes a "charging" sensor.
-- **Monthly totals** — kilometres, energy, money spent on charging, estimated cost of the driving.
-- **History** — the last 10 drives and charges as a list you can drop straight into a Lovelace card.
+## Why
 
-It is **vehicle-agnostic**: BYD, Tesla, Kia, Hyundai, MG, ESPHome — anything that exposes the right sensors in HA.
+Cloud-polled EVs have stale, integer-step SoC, sparse odometer ticks, and unreliable `vehicle_on` transitions. Out of the box that makes:
+- consumption per trip off by 1–2 % (or NULL on short trips),
+- single drives split into multiple rows,
+- overnight charges silently dropped on reload,
+- journeys (casa → … → casa) shown as 1-stage fragments,
+- addresses stuck as `not_home`.
 
-## Try it locally before installing
+This integration solves all of that with explicit state machines, fallbacks, and a recovery service. The hard work of v0.5.x is documented in [the release notes](https://github.com/boraita/hass-ev-trip-logger/releases).
 
-The repo ships with a one-command dev environment: a Docker Home Assistant with fake EV sensors you can poke from the dashboard.
-
-```bash
-git clone https://github.com/boraita/hass-ev-trip-logger
-cd hass-ev-trip-logger
-docker compose up -d
-```
-
-Then open **http://localhost:8124**, create a throwaway admin user, and:
-
-1. Settings → Devices → **Add Integration** → search **EV Trip Logger**.
-2. Pick the simulated sensors that come with the dev container:
-   - Odometer: `sensor.sim_ev_odometer`
-   - Battery: `sensor.sim_ev_battery`
-   - Vehicle on: `binary_sensor.sim_ev_vehicle_on`
-3. Drop the idle timeout to **1 minute** so trips close fast while testing.
-
-Now simulate a drive from Developer Tools (or any dashboard with sliders):
-
-- Toggle `input_boolean.ev_vehicle_on` to **on**.
-- Move `input_number.ev_odometer` from `10000` to `10015` (+15 km).
-- Move `input_number.ev_battery` from `80` to `70` (-10%).
-- Toggle vehicle on **off** — after ~1 minute the trip closes and `sensor.<your_device>_last_trip_distance`, `_energy`, `_cost`, `_score`… all show real numbers.
-
-To wipe the dev HA and start over: `docker compose down && rm -rf .dev/config/.storage && docker compose up -d`.
-
-## Install in your real HA
-
-### HACS (recommended)
-
-1. HACS → ⋮ → **Custom repositories** → add `https://github.com/boraita/hass-ev-trip-logger` as **Integration**.
-2. Search and install **EV Trip Logger**, restart HA.
-3. Settings → Devices → **Add Integration** → search "EV Trip Logger".
-
-### Manual
-
-Copy `custom_components/ev_trip_logger/` into your HA `config/custom_components/` and restart.
-
-## What it asks during setup
-
-Three required sensors:
-
-- An **odometer** sensor (km or mi).
-- A **battery level** sensor (%).
-- A **vehicle-on** binary sensor (anything that goes `on` when the car is in use).
-
-Plus a handful of optional ones that unlock more metrics:
-
-- **Power** sensor — for max power per trip.
-- **Charging** binary sensor — enables automatic charge logging.
-- **Device tracker** — fills in trip origin/destination and tags charges with the zone (home, work, etc.).
-- **Exterior temperature** — for consumption correlation.
-- Battery capacity (kWh), minimum trip distance, idle timeout, **home charge price** (€/kWh), and currency.
+---
 
 ## What you get
 
-A vehicle device with around 30 sensors, grouped:
+### Trip detection
+- `vehicle_on` off→on opens a trip; on→off closes it (with a 3 s flicker debounce).
+- Stuck/missed cycles are reconstructed from monotonic odometer growth (synthetic trips, tagged `confidence='reconstructed'`).
+- An idle watchdog force-closes a trip only when **`vehicle_on=off` is also seen** — a long stop mid-drive no longer splits the row.
+- Manual `log_manual_trip` and `recover_missing_trips` services for back-filling.
 
-- **Current trip** — live while driving (distance, battery used, energy, kWh/100km, average speed, max power, average temperature).
-- **Last trip** — same metrics frozen at trip end, plus **cost** and a **score 0–10** matched to BYD's app curve.
-- **Monthly aggregates** — distance (today/week/month/year), energy, estimated cost, trip count, average consumption (30 days).
-- **Charges** — last charge (kWh, cost, €/kWh), monthly totals (kWh charged, money spent, charge count, average €/kWh).
-- **`recent_trips` / `recent_charges`** — count as state, last 10 entries as attributes for Lovelace cards.
-- **`charge_in_progress`** — `charging` / `idle` so you can see at a glance whether the integration is already tracking a session.
-- **`last_journey` / `current_journey`** — stages count as state plus distance, energy, cost as attributes. A journey opens when you leave home and closes when the device tracker re-enters the configured home zone (default `home`, renameable in setup).
+### Energy accounting
+- **Stale SoC resolution**: pick `soc_start` from `last_charge.soc_end`, the ring buffer, or current value — whichever is most trustworthy.
+- **Power integration backup** (∫ |power| dt during the trip), capped at 250 kW and 20 min trapezoid width. Pessimistic `max(energy_soc, energy_pwr)` is the canonical figure.
+- **Inline `distance × avg_consumption` fallback** at close when both SoC delta and power-integration come back empty (BYD-style integer SoC + sparse power).
+- **Regen tracking** via negative-power trapezoidal integration. Aggregated to today / week / month / 30d / year / lifetime sensors.
 
-## Logging a charge
+### Journeys
+- A journey opens iff a trip starts at home and ends away; closes iff a trip ends at home. Time gaps between intermediate trips are irrelevant.
+- Auto-stitch: a trip ending at home with no open journey mints a fresh id AND absorbs orphan trips since the last home-arrival into it, so the full `casa → … → casa` chain renders as one row.
+- Resume on restart via SQL (not in-memory state), so a mid-trip reload never loses the open journey.
 
-If you set a **charging binary sensor** in the config, every charge is detected automatically while the car is plugged in. The default price comes from your config; the location comes from the device tracker.
+### Charges
+- Auto-detected from your `charge_sensor`. Plug-sensor wired ⇒ multiple charging pulses inside one plugged interval merge into a single session.
+- `_maybe_resume_charge` recovers a session that started before HA restarted (without it, the entire charge would be dropped).
+- `kwh_charged_before` and `kwh_charged_during` attributes on every trip let the dashboard show "+24 kWh between trips" so a SoC bump isn't mysterious.
 
-For chargers with a different price (public, work, friends'…), log them manually:
+### GPS / routing
+- Every cloud poll fills a ring buffer of `(ts, lat, lon)` samples. Trips open with a real start anchor; synth trips persist a route to `trip_positions`.
+- `gps_distance_km` is the haversine sum over the route — compared against the odometer-derived `distance_km` it surfaces sensor lag.
+- New trips reverse-geocode their endpoints via Nominatim; old trips backfilled from recorder history at startup.
 
-```yaml
-service: ev_trip_logger.log_charge
-data:
-  kwh: 35.4
-  total_cost: 12.40            # or: price_per_kwh: 0.45
-  location: Iberdrola Móstoles  # optional — defaults to device tracker zone
-```
+### ABRP (A Better Route Planner)
+- In-tree client. Configure `abrp_token` + `abrp_api_key` + `abrp_car_model` in the options flow.
+- Telemetry piggy-backs on existing metric events — **no new poll forced** on the manufacturer's cloud.
+- New `switch.abrp_push` (RestoreEntity) — runtime kill switch your automations can toggle.
+- `abrp_push_interval_s` is user-configurable (5..600 s, default 30).
+- Sensor `<device>_abrp_next_charge_soc` reads ABRP's next-charge target every 2 min while a route is active.
 
-You can also pass only `kwh`; the integration uses the home price you configured.
+### Recovery & corrections
+- **`recover_missing_trips`** — scans the recorder for odo growth not covered by any existing trip and inserts synth records. Never modifies existing rows.
+- **`set_trip(trip_id, …)`** — patch any field on any trip (origin, destination, energy, journey_id, timestamps, GPS, address, etc.).
+- **`set_charge(charge_id, …)`** — same for charges. kWh edits auto-recompute total_cost.
+- `confidence` column tags every trip as `live`, `reconstructed`, `reconstructed_polling_paused`, or `reconstructed_recovery` so dashboards can warn about low-quality rows.
 
-## Lovelace example
+---
 
-Markdown card (no HACS needed) that renders a trip list similar to the BYD app:
+## Install (HACS)
 
-```yaml
-type: markdown
-content: |
-  ## Last trips ({{ states('sensor.my_ev_recent_trips') }})
-  {%- for t in state_attr('sensor.my_ev_recent_trips', 'trips') or [] %}
+1. HACS → Integrations → ⋮ → Custom repositories → add `https://github.com/boraita/hass-ev-trip-logger`, category **Integration**.
+2. Install **EV Trip Logger**, restart HA.
+3. Settings → Devices & Services → **Add Integration** → "EV Trip Logger".
 
-  **{{ as_timestamp(t.ended_at) | timestamp_custom('%d/%m/%Y · %H:%M') }}**
-  | Distancia | Consumo | Eficiencia | Coste | Score |
-  |---:|---:|---:|---:|---:|
-  | {{ t.distance_km }} km | {{ t.energy_kwh }} kWh | {{ t.consumption_kwh_100km }} kWh/100km | {{ t.cost }} {{ t.currency }} | **{{ t.score }}** |
-  {%- endfor %}
-```
+---
 
-Replace `sensor.my_ev_*` with whatever you named your device.
+## Configuration
+
+The wizard asks for the entities the integration consumes. Required first, optional after.
+
+| Field | Required | What it's for |
+|---|---|---|
+| **Name** | ✅ | Device label (free text). |
+| **Odometer sensor** | ✅ | `sensor.…_odometer` — km, monotonic. |
+| **Battery sensor** | ✅ | `sensor.…_battery_level` — %, 0..100. |
+| **Vehicle-on binary sensor** | ✅ | `binary_sensor.…_vehicle_on`. Primary trip trigger. |
+| **Battery capacity (kWh)** | ✅ | E.g. 82.56 for a Sealion 7 Extended Range. Used to derive kWh from SoC delta. |
+| **Home zone** | ✅ | Usually `zone.home`. Journey logic uses it. |
+| Power sensor | optional | kW, +discharge/-charge. Enables regen + power-integration backup + ABRP push. |
+| Charge binary sensor | optional | `binary_sensor.…_charging`. Auto-charge detection. |
+| Plug binary sensor | optional | Lets multi-pulse plugged sessions merge into one charge row. |
+| Polling-paused sensor | optional | A switch or binary_sensor that goes ON when the manufacturer integration sleeps. Synth trips in that window get tagged `reconstructed_polling_paused`. |
+| Location tracker | optional | `device_tracker.…_location`. Drives origin/destination + route map. |
+| Outside temp | optional | For per-trip avg temp + temp-bucket consumption analysis. |
+| Speed sensor | optional | Refines the idle watchdog + ABRP `speed`. |
+| Min trip distance | ✅ | Default 0.5 km. Trips under this are discarded (precon/climate, not real drives). |
+| Idle timeout | ✅ | Mid-trip stop tolerance (minutes). |
+| Energy price (€/kWh) | ✅ | Home tariff. Trip cost = energy × this price (NOT per-charge price — see [why](#why-trip-cost-is-the-home-tariff)). |
+| Currency | ✅ | "EUR", "USD", etc. |
+| Recent trips limit | ✅ | How many rows the `_recent_trips` attribute exposes (5..200, default 50). |
+| ABRP token / api_key / car_model | optional | Enables ABRP telemetry push. |
+| ABRP push interval (s) | optional | Throttle for outbound pushes (5..600, default 30). |
+
+---
+
+## Why trip cost is the home tariff
+
+A charge at a €0.40/kWh public DC fast-charger is a one-off event; the energy already mixed with home-charged kWh in the battery. Trip cost is therefore modelled as `energy × home_tariff`. Each individual charge record keeps its **actual** price in its own row, visible in the AC / DC monthly averages.
+
+---
 
 ## Services
 
-- `ev_trip_logger.start_trip` / `end_trip` — manual control.
-- `ev_trip_logger.log_charge` / `delete_last_charge`.
-- `ev_trip_logger.delete_last_trip`.
-- `ev_trip_logger.export_csv` — dump all trips to a CSV path.
+All services accept an optional `entry_id` to target a specific config entry when you have multiple vehicles.
 
-## Pairing with ABRP (A Better Routeplanner)
+| Service | Purpose |
+|---|---|
+| `start_trip` / `end_trip` | Manually bracket a trip when sensors fail you. |
+| `log_charge` | Manually insert a charge (kwh + optional price/location/notes). |
+| `log_manual_trip` | Insert a full trip backfill (started_at, ended_at, distance, soc, etc.). |
+| `set_trip(trip_id, …)` | Patch any column on a logged trip. |
+| `set_charge(charge_id, …)` | Patch any column on a logged charge. |
+| `set_last_charge_price(price_per_kwh \| total_cost \| charge_id, …)` | Correct a charge's price; triggers a trip cost recompute. |
+| `delete_last_trip` / `delete_last_charge` | Drop the most recent row. |
+| `purge_trips(since, until)` | Bulk delete in a date range. |
+| `recover_missing_trips(since, until?)` | **Recovery mode** — scan recorder for odo growth not covered by any trip and insert synth rows. Existing trips are never modified. |
+| `export_csv(path)` | Dump every trip to CSV. |
 
-This integration **logs and summarises** trips after the fact — it is *not* a live telemetry pusher. If you want ABRP to predict routes using your car, install the dedicated **ABRP Telemetry** HACS integration (`iternio/abrp-telemetry`) alongside this one. Point it at the same `power`, `battery`, `device_tracker` and `exterior_temp_sensor` entities you configured here and it'll handle the 5-second live push. The two integrations are complementary: ABRP for routing, this one for history and per-trip insight.
+---
 
-## Events for automations
+## Sensors exposed
 
-- `ev_trip_logger_trip_started` / `ev_trip_logger_trip_ended` — fires with full trip data.
-- `ev_trip_logger_charge_logged` — fires when a charge is recorded (manual or auto).
+A complete list lives in the source (`sensor.py`). The headline ones, all prefixed `sensor.<device>_`:
+
+**Live/last/aggregates per metric** — `current_trip_*`, `last_trip_*`, `distance_today`, `distance_this_week`, `energy_this_month`, etc., for: distance, duration, energy, consumption, avg_speed, max_speed, max_power, regen, battery_used, score, cost, avg_temperature.
+
+**Charges** — `last_charge_*`, `current_charge_*`, `charges_30d_*`, plus AC/DC price breakdowns.
+
+**Journeys** — `current_journey`, `last_journey`, `recent_journeys` (with stages list).
+
+**Routing** — `recent_trips` (attribute `trips` = list of dicts with everything), `last_trip_route` (attribute `points` = downsampled route), `trip_patterns` (by hour / weekday).
+
+**Records & rankings** — `trip_records.totals.{distance_km, energy_kwh, cost, regen_kwh, trips}`, `tops` (longest, top_efficiency, cheapest, …).
+
+**Battery & range** — `battery_energy` (kWh in battery), `energy_to_full_charge`, `battery_percent`, `range_at_recent_efficiency`.
+
+**ABRP** (only when configured) — `switch.abrp_push`, `abrp_next_charge_soc`.
+
+---
+
+## ABRP setup (optional)
+
+1. In the ABRP app: car → *Edit Car Connection Details → Generic OEM → Link*. Copy **user token** and **api key**.
+2. HA → Settings → Devices & Services → EV Trip Logger → **Configure** → paste them. `car_model` example: `byd:sealion:25:82:rwd`.
+3. The new `switch.abrp_push` defaults to ON. To replicate the legacy `abrp_telemetry` "only while driving" pattern, point your automations at it:
+
+```yaml
+- alias: ABRP only while driving
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.<vehicle>_vehicle_on
+      to: "on"
+      id: "on"
+    - trigger: state
+      entity_id: binary_sensor.<vehicle>_vehicle_on
+      to: "off"
+      id: "off"
+  actions:
+    - choose:
+        - conditions: [{ condition: trigger, id: "on" }]
+          sequence: [{ action: switch.turn_on, target: { entity_id: switch.abrp_push } }]
+      default:
+        - action: switch.turn_off
+          target: { entity_id: switch.abrp_push }
+```
+
+---
+
+## Recovery workflow
+
+When you notice a trip missing or with wrong data:
+
+```yaml
+# Developer Tools → Actions
+service: ev_trip_logger.recover_missing_trips
+data:
+  since: 2026-06-01 00:00:00
+  until: 2026-06-08 23:59:59     # optional, defaults to now
+```
+
+Existing rows are never touched (±2 min tolerance). New rows are tagged `confidence='reconstructed_recovery'` so the dashboard can show a "low confidence" badge.
+
+For one-off corrections:
+
+```yaml
+service: ev_trip_logger.set_trip
+data:
+  trip_id: 130
+  origin: home
+  started_at: 2026-06-07 22:20:00
+  journey_id: 13
+```
+
+---
+
+## Reporting issues
+
+The integration logs at INFO when it drops or repairs a trip. Enable debug for the namespace to see every state-machine decision:
+
+```yaml
+logger:
+  default: info
+  logs:
+    custom_components.ev_trip_logger: debug
+```
+
+Open issues at https://github.com/boraita/hass-ev-trip-logger/issues with the relevant log lines + a description.
+
+---
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT.
