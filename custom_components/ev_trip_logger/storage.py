@@ -637,7 +637,7 @@ class TripStorage:
                 SELECT journey_id FROM trips
                 WHERE journey_id IS NOT NULL {excl}
                 GROUP BY journey_id
-                ORDER BY MAX(id) DESC
+                ORDER BY MAX(ended_at) DESC
                 LIMIT ?
                 """,
                 params + (limit,),
@@ -821,7 +821,7 @@ class TripStorage:
                 SELECT journey_id FROM trips
                 WHERE journey_id IS NOT NULL {excl}
                 GROUP BY journey_id
-                ORDER BY MAX(id) DESC
+                ORDER BY MAX(ended_at) DESC
                 LIMIT 1
                 """,
                 params,

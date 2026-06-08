@@ -608,7 +608,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.35 "
+                    "hass-ev-trip-logger/0.5.36 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -2616,6 +2616,26 @@ class EvTripLoggerCoordinator:
         )
         cost = energy * price_per_kwh if energy is not None and energy > 0 else None
 
+        # v0.5.36 — apply the same journey state machine as the live
+        # close path. Without this, manually-logged trips ended at
+        # home but with current_journey_id=None left the open journey
+        # ungrouped and let the NEXT trip's auto-stitch include the
+        # whole orphan range — corrupting today's journey with
+        # yesterday's leg.
+        is_at_home_end = self._is_at_home(destination)
+        started_from_home = self._is_at_home(origin)
+        journey_id: int | None
+        stitched_orphan_home = False
+        if self.current_journey_id is not None:
+            journey_id = self.current_journey_id
+        elif started_from_home:
+            journey_id = await self.storage.async_next_journey_id()
+        elif is_at_home_end:
+            journey_id = await self.storage.async_next_journey_id()
+            stitched_orphan_home = True
+        else:
+            journey_id = None
+
         record = TripRecord(
             started_at=started_at,
             ended_at=ended_at,
@@ -2635,10 +2655,23 @@ class EvTripLoggerCoordinator:
             destination=destination,
             cost=cost,
             currency=cost_currency if cost is not None else None,
+            journey_id=journey_id,
+            confidence="live",  # manual entries are intentional, treat as live
         )
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        if stitched_orphan_home and journey_id is not None:
+            await self.storage.async_absorb_orphans_into_journey(
+                journey_id, self.home_zone,
+            )
+        # Update journey state mirror.
+        if is_at_home_end and journey_id is not None:
+            self.last_completed_journey_id = journey_id
+            self.current_journey_id = None
+        else:
+            self.current_journey_id = journey_id
 
         self.last_trip = record
         self.hass.bus.async_fire(
