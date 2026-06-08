@@ -770,7 +770,8 @@ class TripStorage:
             conn.row_factory = sqlite3.Row
             tot = conn.execute(
                 "SELECT COUNT(*) AS c, COALESCE(SUM(distance_km), 0) AS d, "
-                "COALESCE(SUM(energy_kwh), 0) AS e, COALESCE(SUM(cost), 0) AS k "
+                "COALESCE(SUM(energy_kwh), 0) AS e, COALESCE(SUM(cost), 0) AS k, "
+                "COALESCE(SUM(regen_kwh), 0) AS r "
                 "FROM trips"
             ).fetchone()
             if not tot or tot["c"] == 0:
@@ -798,6 +799,7 @@ class TripStorage:
                 "distance_km": round(float(tot["d"]), 1),
                 "energy_kwh": round(float(tot["e"]), 2),
                 "cost": round(float(tot["k"]), 2),
+                "regen_kwh": round(float(tot["r"]), 2),
             },
             "most_efficient": _row_to_record(efficient) if efficient else None,
             "longest": _row_to_record(longest) if longest else None,
@@ -827,17 +829,19 @@ class TripStorage:
                     COALESCE(SUM(distance_km), 0) AS distance,
                     COALESCE(SUM(energy_kwh), 0) AS energy,
                     COALESCE(SUM(cost), 0) AS cost,
+                    COALESCE(SUM(regen_kwh), 0) AS regen,
                     COUNT(*) AS count
                 FROM trips WHERE started_at >= ?
                 """,
                 (since.isoformat(),),
             ).fetchone()
-        distance, energy, cost, count = row
+        distance, energy, cost, regen, count = row
         avg_consumption = (energy / distance * 100) if distance else 0
         return {
             "distance_km": float(distance),
             "energy_kwh": float(energy),
             "cost": float(cost),
+            "regen_kwh": float(regen),
             "count": int(count),
             "avg_consumption_kwh_100km": float(avg_consumption),
         }

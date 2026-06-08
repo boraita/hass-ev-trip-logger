@@ -213,6 +213,12 @@ async def async_setup_entry(
             AggregateSensor(coordinator, period="month", key="cost"),
             AggregateSensor(coordinator, period="month", key="count"),
             AggregateSensor(coordinator, period="30d", key="avg_consumption_kwh_100km"),
+            # v0.5.28 — total regen aggregated per period.
+            AggregateSensor(coordinator, period="today", key="regen_kwh"),
+            AggregateSensor(coordinator, period="week", key="regen_kwh"),
+            AggregateSensor(coordinator, period="month", key="regen_kwh"),
+            AggregateSensor(coordinator, period="30d", key="regen_kwh"),
+            AggregateSensor(coordinator, period="year", key="regen_kwh"),
         ]
     )
 
@@ -430,6 +436,7 @@ class AggregateSensor(_BaseTripSensor):
     _PERIODIC_KEYS_UNITS: dict[str, tuple[str | None, SensorDeviceClass | None, str | None]] = {
         "distance_km": (UnitOfLength.KILOMETERS, SensorDeviceClass.DISTANCE, None),
         "energy_kwh": (UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, None),
+        "regen_kwh": (UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, "mdi:battery-charging"),
         "cost": (None, SensorDeviceClass.MONETARY, "mdi:currency-eur"),
         "count": (None, None, "mdi:counter"),
         "avg_consumption_kwh_100km": ("kWh/100km", None, "mdi:car-electric"),
@@ -438,6 +445,7 @@ class AggregateSensor(_BaseTripSensor):
     _SLUG_BY_KEY: dict[str, str] = {
         "distance_km": "distance",
         "energy_kwh": "energy",
+        "regen_kwh": "regen",
         "cost": "cost",
         "count": "count",
         "avg_consumption_kwh_100km": "avg_consumption",
@@ -449,6 +457,7 @@ class AggregateSensor(_BaseTripSensor):
     _STATE_CLASS_BY_KEY: dict[str, SensorStateClass | None] = {
         "distance_km": SensorStateClass.TOTAL_INCREASING,
         "energy_kwh": SensorStateClass.TOTAL_INCREASING,
+        "regen_kwh": SensorStateClass.TOTAL_INCREASING,
         "cost": SensorStateClass.TOTAL,
         "count": SensorStateClass.MEASUREMENT,
         "avg_consumption_kwh_100km": SensorStateClass.MEASUREMENT,
