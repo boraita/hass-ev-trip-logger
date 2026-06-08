@@ -51,6 +51,7 @@ from .const import (
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
     CONF_PLUG_SENSOR,
+    CONF_POLLING_PAUSED_SENSOR,
     CONF_ODOMETER,
     CONF_DCFC_THRESHOLD_KW,
     CONF_IDLE_TRIP_TIMEOUT_MIN,
@@ -272,6 +273,10 @@ class EvTripLoggerCoordinator:
         self._power = merged.get(CONF_POWER)
         self._charge_sensor = merged.get(CONF_CHARGE_SENSOR)
         self._plug_sensor = merged.get(CONF_PLUG_SENSOR)
+        # v0.5.35 — optional polling-pause sensor. When ON during a
+        # synth-trip window we tag confidence as
+        # 'reconstructed_polling_paused'.
+        self._polling_paused_sensor = merged.get(CONF_POLLING_PAUSED_SENSOR)
         # v0.5.31 — ABRP wiring. Only instantiate the client when BOTH
         # token and api_key are present; otherwise the feature stays
         # off completely (no requests, no logs).
@@ -603,7 +608,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.32 "
+                    "hass-ev-trip-logger/0.5.35 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -1330,6 +1335,11 @@ class EvTripLoggerCoordinator:
                 round(_route_distance_km(route), 2)
                 if route and len(route) >= 2 else None
             ),
+            # v0.5.35 — synth path. If a polling-pause sensor is wired
+            # and it was ON at any point in the window, the upstream
+            # manufacturer integration was sleeping → tag for low
+            # confidence so the dashboard can warn the user.
+            confidence=self._synth_confidence(started_at, ended_at),
         )
 
         # v0.5.27 — same charges-window attribution as the live close.
@@ -1632,6 +1642,28 @@ class EvTripLoggerCoordinator:
             return
         if ok:
             self._abrp_last_send = now_mono
+
+    def _synth_confidence(
+        self, started_at: datetime, ended_at: datetime
+    ) -> str:
+        """Decide the confidence tag for a synthetic trip.
+
+        Returns 'reconstructed' by default; if the configured
+        polling-pause sensor was ON anywhere inside [started_at,
+        ended_at], returns 'reconstructed_polling_paused' (lowest
+        confidence — the manufacturer integration was sleeping, so
+        even the route's odometer ticks are sparse).
+        """
+        if not self._polling_paused_sensor:
+            return "reconstructed"
+        # Check the CURRENT state — a synth window is short (≤ a few
+        # cloud-poll intervals) and the pause flag is usually sticky.
+        # A more rigorous check would walk recorder history; we accept
+        # the small chance of a brief unpause inside the window in
+        # exchange for staying off the executor.
+        if self._read_bool(self._polling_paused_sensor) is True:
+            return "reconstructed_polling_paused"
+        return "reconstructed"
 
     @callback
     def _capture_location_sample(self) -> None:
@@ -2172,6 +2204,9 @@ class EvTripLoggerCoordinator:
                 round(_route_distance_km(active.gps_samples), 2)
                 if active.gps_samples and len(active.gps_samples) >= 2 else None
             ),
+            # v0.5.35 — live path always tags as 'live' (precise
+            # times + full metrics).
+            confidence="live",
         )
 
         # v0.5.27 — attribute pre/intra-trip charging energy. Lets the

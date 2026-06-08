@@ -72,7 +72,23 @@ CREATE TABLE IF NOT EXISTS trips (
     -- (started_at ≤ charge.ended_at ≤ ended_at). Should be ~0 thanks
     -- to v0.5.18 mutex (trip force-closes on charging=on), but
     -- non-zero in edge cases — manual logs, force-close races, etc.
-    kwh_charged_during REAL
+    kwh_charged_during REAL,
+    -- v0.5.35: detection-quality flag.
+    --   'live'                          → captured via vehicle_on
+    --                                     transitions (precise times,
+    --                                     full metrics).
+    --   'reconstructed'                 → synth path. Odometer
+    --                                     monotonic growth detected,
+    --                                     vehicle_on never flipped.
+    --                                     started_at is the last
+    --                                     idle reading; metrics are
+    --                                     partial.
+    --   'reconstructed_polling_paused'  → reconstructed AND the
+    --                                     configured polling-pause
+    --                                     sensor was ON during the
+    --                                     window, so even the route
+    --                                     points are sparse.
+    confidence TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -151,6 +167,7 @@ class TripRecord:
     gps_distance_km: float | None = None
     kwh_charged_before: float | None = None
     kwh_charged_during: float | None = None
+    confidence: str | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -300,6 +317,8 @@ class TripStorage:
         for col in ("kwh_charged_before", "kwh_charged_during"):
             if col not in trip_cols:
                 conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
+        if "confidence" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN confidence TEXT")
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
@@ -345,8 +364,9 @@ class TripStorage:
                     start_lat, start_lon, end_lat, end_lon,
                     start_address, end_address,
                     soc_start_source, energy_source, energy_from_power,
-                    gps_distance_km, kwh_charged_before, kwh_charged_during
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    gps_distance_km, kwh_charged_before, kwh_charged_during,
+                    confidence
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -382,6 +402,7 @@ class TripStorage:
                     record.gps_distance_km,
                     record.kwh_charged_before,
                     record.kwh_charged_during,
+                    record.confidence,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -418,7 +439,7 @@ class TripStorage:
         "avg_temp_c", "origin", "destination", "cost", "currency",
         "journey_id", "start_lat", "start_lon", "end_lat", "end_lon",
         "start_address", "end_address", "gps_distance_km",
-        "kwh_charged_before", "kwh_charged_during",
+        "kwh_charged_before", "kwh_charged_during", "confidence",
     })
 
     async def async_charges_in_window(
@@ -1797,6 +1818,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         gps_distance_km=row["gps_distance_km"] if "gps_distance_km" in row.keys() else None,
         kwh_charged_before=row["kwh_charged_before"] if "kwh_charged_before" in row.keys() else None,
         kwh_charged_during=row["kwh_charged_during"] if "kwh_charged_during" in row.keys() else None,
+        confidence=row["confidence"] if "confidence" in row.keys() else None,
     )
 
 

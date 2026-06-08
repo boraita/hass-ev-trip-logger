@@ -613,6 +613,10 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         # interpret SoC deltas when a charge happened in between.
         "kwh_charged_before": _r(getattr(trip, "kwh_charged_before", None), 2),
         "kwh_charged_during": _r(getattr(trip, "kwh_charged_during", None), 2),
+        # v0.5.35 — detection-quality tag: 'live' | 'reconstructed' |
+        # 'reconstructed_polling_paused'. Dashboards can color rows
+        # accordingly.
+        "confidence": getattr(trip, "confidence", None),
     }
 
 

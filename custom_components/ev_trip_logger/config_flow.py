@@ -38,6 +38,7 @@ from .const import (
     CONF_ABRP_PUSH_INTERVAL_S,
     CONF_ABRP_TOKEN,
     CONF_PLUG_SENSOR,
+    CONF_POLLING_PAUSED_SENSOR,
     DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_POWER,
     CONF_RECENT_LIMIT,
@@ -103,6 +104,14 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_PLUG_SENSOR,
                 EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
             ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
+            _optional(
+                CONF_POLLING_PAUSED_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain=["switch", "binary_sensor"])
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain=["switch", "binary_sensor"])
+            ),
             _optional(
                 CONF_LOCATION,
                 EntitySelector(

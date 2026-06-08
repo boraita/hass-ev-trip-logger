@@ -17,6 +17,13 @@ CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
 CONF_SPEED: Final = "speed_sensor"
 CONF_PLUG_SENSOR: Final = "plug_sensor"
+# v0.5.35 — optional polling-pause sensor (e.g. BYD's
+# switch.byd_sealion_7_disable_polling). When ON, the manufacturer
+# integration has paused its cloud poll → any trip reconstructed in
+# that window will have especially sparse data, and we flag it as
+# 'reconstructed_polling_paused' so the dashboard can show low
+# confidence.
+CONF_POLLING_PAUSED_SENSOR: Final = "polling_paused_sensor"
 # v0.5.31 — optional ABRP (A Better Route Planner) telemetry push.
 # Token+api_key required to activate; car_model is the ABRP slug
 # (e.g. "byd:sealion:25:82:rwd"). All three live in the integration's
