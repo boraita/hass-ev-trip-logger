@@ -51,9 +51,13 @@ class AbrpPushSwitch(SwitchEntity, RestoreEntity):
     def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
         self._coordinator = coordinator
         self._attr_unique_id = f"{coordinator.entry_id}_abrp_push"
-        # Link to the same device sensors use so the generated
-        # entity_id is `switch.<device-slug>_abrp_telemetry` instead
-        # of falling back to integration+entry_id soup.
+        # Explicit entity_id — ABRP is a service identity, not a
+        # vehicle property, so the prefix shouldn't carry the car's
+        # name. HA will append `_2` etc. for collisions when the user
+        # has multiple ev_trip_logger entries.
+        self.entity_id = "switch.abrp_push"
+        # Device link kept so the switch appears under the integration
+        # device card.
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.entry_id)},
             name=coordinator.entry.title,
