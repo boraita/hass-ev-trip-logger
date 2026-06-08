@@ -44,7 +44,6 @@ from .const import (
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
     CONF_PLUG_SENSOR,
-    CONF_REFRESH_BUTTON,
     CONF_ODOMETER,
     CONF_DCFC_THRESHOLD_KW,
     CONF_IDLE_TRIP_TIMEOUT_MIN,
@@ -55,7 +54,6 @@ from .const import (
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_DCFC_THRESHOLD_KW,
-    DEFAULT_REFRESH_SETTLE_S,
     DEFAULT_IDLE_TRIP_TIMEOUT_MIN,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
@@ -226,7 +224,6 @@ class EvTripLoggerCoordinator:
         self._power = merged.get(CONF_POWER)
         self._charge_sensor = merged.get(CONF_CHARGE_SENSOR)
         self._plug_sensor = merged.get(CONF_PLUG_SENSOR)
-        self._refresh_button = merged.get(CONF_REFRESH_BUTTON)
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
         self._speed = merged.get(CONF_SPEED)
@@ -517,7 +514,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.23 "
+                    "hass-ev-trip-logger/0.5.24 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -846,13 +843,6 @@ class EvTripLoggerCoordinator:
                     self.hass.async_create_task(
                         self._async_close_charge_then_open_trip(now)
                     )
-                elif self._refresh_button:
-                    # v0.5.23 — give the cloud-polled vehicle a kick so
-                    # odo/SoC/location are as fresh as possible before
-                    # we capture them as the trip's starting values.
-                    self.hass.async_create_task(
-                        self._async_refresh_then_open_trip(now)
-                    )
                 else:
                     self._open_trip(now)
         elif self.current is not None:
@@ -869,15 +859,7 @@ class EvTripLoggerCoordinator:
             @callback
             def _debounced_close(_at: datetime) -> None:
                 self._pending_close_unsub = None
-                if self._refresh_button:
-                    # v0.5.23 — refresh before close so odo_end / soc_end
-                    # capture a post-press value (matters most on the
-                    # final stop where the user has just parked).
-                    self.hass.async_create_task(
-                        self._async_refresh_then_close_trip(off_ts)
-                    )
-                else:
-                    self.hass.async_create_task(self._async_close_trip(off_ts))
+                self.hass.async_create_task(self._async_close_trip(off_ts))
 
             self._pending_close_unsub = async_call_later(
                 self.hass, _VEHICLE_ON_OFF_DEBOUNCE_S, _debounced_close
@@ -1424,83 +1406,11 @@ class EvTripLoggerCoordinator:
         if self.current is None:
             self._open_trip(now)
 
-    async def _async_press_refresh(self) -> None:
-        """Press the configured refresh button (if any) and wait for the
-        upstream integration to write fresh values into HA state.
-
-        Used at trip/charge lifecycle boundaries on cloud-polled cars
-        where the 8-10 min poll cadence leaves stale odo/SoC at every
-        open/close. Pressing a manufacturer-supplied "fetch now" button
-        (e.g. button.byd_sealion_7_fetch_energy_data) forces a fresh
-        round-trip to the vehicle's cloud; we then sleep
-        DEFAULT_REFRESH_SETTLE_S so the resulting state changes
-        actually land before we read sensors back.
-        """
-        if not self._refresh_button:
-            return
-        try:
-            await self.hass.services.async_call(
-                "button", "press",
-                {"entity_id": self._refresh_button},
-                blocking=False,
-            )
-        except Exception as exc:  # pragma: no cover — defensive
-            _LOGGER.debug(
-                "Refresh button press failed (%s): %s",
-                self._refresh_button, exc,
-            )
-            return
-        await asyncio.sleep(DEFAULT_REFRESH_SETTLE_S)
-
-    async def _async_refresh_then_open_trip(self, now: datetime) -> None:
-        """Press refresh button, wait, then open the trip.
-
-        Wrapper invoked from sync callbacks via async_create_task so the
-        cloud-polled odometer / battery / location used as the trip's
-        starting values are as fresh as the upstream can produce.
-        """
-        await self._async_press_refresh()
-        if self.current is not None:
-            return
-        # Re-check that vehicle_on is still on; if it flipped off
-        # during the settle wait, abort (the flicker debounce normally
-        # handles this but be defensive when refresh-button delays
-        # extend the window).
-        if self._read_bool(self._vehicle_on) is not True:
-            return
-        if (
-            self._read_float(self._odometer) is None
-            or self._read_float(self._battery) is None
-        ):
-            _LOGGER.warning(
-                "Post-refresh: odometer/battery still not ready; "
-                "opening trip with whatever cached value exists"
-            )
-        self._open_trip(now)
-
-    async def _async_refresh_then_close_trip(self, now: datetime) -> None:
-        """Press refresh button, wait, then close the trip.
-
-        Ensures odo_end / soc_end captured at close reflect the freshest
-        cloud poll. The trip's `ended_at` is the original off-edge
-        timestamp (passed in), NOT the post-settle clock — so duration
-        and avg_speed math stay correct.
-        """
-        await self._async_press_refresh()
-        if self.current is None:
-            return
-        await self._async_close_trip(now)
 
     async def _async_close_auto_charge(self, now: datetime) -> None:
         active = self.current_charge
         if active is None:
             return
-        # v0.5.23 — kick the cloud-polled vehicle BEFORE we clear
-        # current_charge so soc_end captures the freshest reading.
-        # Press is best-effort; on failure (button missing, network
-        # down) we just continue with the cached value.
-        if self._refresh_button:
-            await self._async_press_refresh()
         self.current_charge = None
         soc_end = self._read_float(self._battery) or active.last_seen_soc
         # Need at least 2 % SoC delta to count — cloud-polling can wobble by 1 %

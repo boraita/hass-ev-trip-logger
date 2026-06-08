@@ -35,7 +35,6 @@ from .const import (
     CONF_ODOMETER,
     CONF_PLUG_SENSOR,
     CONF_POWER,
-    CONF_REFRESH_BUTTON,
     CONF_RECENT_LIMIT,
     CONF_SPEED,
     CONF_TEMP,
@@ -127,10 +126,6 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="speed")
             ),
-            _optional(
-                CONF_REFRESH_BUTTON,
-                EntitySelector(EntitySelectorConfig(domain="button")),
-            ): EntitySelector(EntitySelectorConfig(domain="button")),
             vol.Required(
                 CONF_BATTERY_CAPACITY,
                 default=defaults.get(CONF_BATTERY_CAPACITY, DEFAULT_BATTERY_CAPACITY),
