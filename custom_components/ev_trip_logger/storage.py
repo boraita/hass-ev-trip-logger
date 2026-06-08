@@ -57,7 +57,12 @@ CREATE TABLE IF NOT EXISTS trips (
     -- energy_from_power: raw integration result, kept for audit/dashboards.
     soc_start_source TEXT,
     energy_source TEXT,
-    energy_from_power REAL
+    energy_from_power REAL,
+    -- v0.5.26: distance recomputed from the route polyline via
+    -- haversine. Compared with the odometer-derived distance_km it
+    -- reveals odo cadence issues (gps > odo means we have route
+    -- points the odometer missed) or GPS noise (gps >> odo).
+    gps_distance_km REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -133,6 +138,7 @@ class TripRecord:
     soc_start_source: str | None = None
     energy_source: str | None = None
     energy_from_power: float | None = None
+    gps_distance_km: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -277,6 +283,8 @@ class TripStorage:
                 conn.execute(f"ALTER TABLE trips ADD COLUMN {col} TEXT")
         if "energy_from_power" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN energy_from_power REAL")
+        if "gps_distance_km" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN gps_distance_km REAL")
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
@@ -321,8 +329,9 @@ class TripStorage:
                     avg_temp_c, origin, destination, cost, currency, journey_id,
                     start_lat, start_lon, end_lat, end_lon,
                     start_address, end_address,
-                    soc_start_source, energy_source, energy_from_power
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    soc_start_source, energy_source, energy_from_power,
+                    gps_distance_km
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -355,6 +364,7 @@ class TripStorage:
                     record.soc_start_source,
                     record.energy_source,
                     record.energy_from_power,
+                    record.gps_distance_km,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -390,7 +400,7 @@ class TripStorage:
         "avg_speed_kmh", "max_power_kw", "max_speed_kmh", "regen_kwh",
         "avg_temp_c", "origin", "destination", "cost", "currency",
         "journey_id", "start_lat", "start_lon", "end_lat", "end_lon",
-        "start_address", "end_address",
+        "start_address", "end_address", "gps_distance_km",
     })
 
     async def async_update_trip(
@@ -1677,6 +1687,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         soc_start_source=row["soc_start_source"] if "soc_start_source" in row.keys() else None,
         energy_source=row["energy_source"] if "energy_source" in row.keys() else None,
         energy_from_power=row["energy_from_power"] if "energy_from_power" in row.keys() else None,
+        gps_distance_km=row["gps_distance_km"] if "gps_distance_km" in row.keys() else None,
     )
 
 

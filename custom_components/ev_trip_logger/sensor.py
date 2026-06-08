@@ -592,6 +592,10 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         "soc_start_source": getattr(trip, "soc_start_source", None),
         "energy_source": getattr(trip, "energy_source", None),
         "energy_from_power": _r(getattr(trip, "energy_from_power", None), 2),
+        # v0.5.26 — distance recomputed from the GPS route via
+        # haversine. May differ slightly from `distance_km` (odo-
+        # derived); when both exist the dashboard can show both.
+        "gps_distance_km": _r(getattr(trip, "gps_distance_km", None), 1),
     }
 
 

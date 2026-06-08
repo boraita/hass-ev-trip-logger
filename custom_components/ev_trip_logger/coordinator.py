@@ -130,6 +130,37 @@ _GPS_BUFFER_MAX = 256
 # sample within the last N minutes is recent enough to qualify as
 # "the car's position at trip start" — anything older is stale.
 _PRE_TRIP_GPS_LOOKBACK_S = 600  # 10 min
+
+
+def _haversine_km(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """Great-circle distance between two lat/lon pairs in km. Mean
+    Earth radius 6371 km. Cheap (no external deps).
+    """
+    from math import radians, sin, cos, sqrt, atan2
+    r1 = radians(lat1)
+    r2 = radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlam = radians(lon2 - lon1)
+    a = sin(dphi / 2) ** 2 + cos(r1) * cos(r2) * sin(dlam / 2) ** 2
+    return 2 * 6371.0 * atan2(sqrt(a), sqrt(1 - a))
+
+
+def _route_distance_km(
+    samples: list[tuple[datetime, float, float]] | list[tuple[float, float, float]],
+) -> float | None:
+    """Sum haversine segments across a sequence of (ts, lat, lon).
+    None if fewer than 2 points.
+    """
+    if not samples or len(samples) < 2:
+        return None
+    total = 0.0
+    for i in range(1, len(samples)):
+        _, lat1, lon1 = samples[i - 1]
+        _, lat2, lon2 = samples[i]
+        total += _haversine_km(lat1, lon1, lat2, lon2)
+    return total
 # Minimum time a location zone must persist before we treat it as a real
 # arrival. Cloud-polled device_trackers occasionally bounce (e.g.
 # home→not_home→home in 40 s) when geofence math wobbles near the home
@@ -535,7 +566,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.25 "
+                    "hass-ev-trip-logger/0.5.26 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -1234,6 +1265,10 @@ class EvTripLoggerCoordinator:
             start_lon=start_lon,
             end_lat=end_lat,
             end_lon=end_lon,
+            gps_distance_km=(
+                round(_route_distance_km(route), 2)
+                if route and len(route) >= 2 else None
+            ),
         )
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
@@ -1981,6 +2016,10 @@ class EvTripLoggerCoordinator:
             energy_from_power=(
                 round(active.energy_from_power_kwh, 4)
                 if active.energy_from_power_kwh > 0 else None
+            ),
+            gps_distance_km=(
+                round(_route_distance_km(active.gps_samples), 2)
+                if active.gps_samples and len(active.gps_samples) >= 2 else None
             ),
         )
 
