@@ -103,15 +103,15 @@ class EvActivityCalendar(CalendarEntity):
             parts: list[str] = []
             if slot["trips"]:
                 parts.append(
-                    f"{slot['trips']} viaje{'s' if slot['trips'] != 1 else ''}"
+                    f"{slot['trips']} trip{'s' if slot['trips'] != 1 else ''}"
                 )
             if slot["km"]:
                 parts.append(f"{slot['km']:.1f} km")
             if slot["charges"]:
                 parts.append(
-                    f"{slot['charges']} carga{'s' if slot['charges'] != 1 else ''}"
+                    f"{slot['charges']} charge{'s' if slot['charges'] != 1 else ''}"
                 )
-            summary = " · ".join(parts) if parts else "Actividad EV"
+            summary = " · ".join(parts) if parts else "EV activity"
             events.append(
                 CalendarEvent(
                     summary=summary,

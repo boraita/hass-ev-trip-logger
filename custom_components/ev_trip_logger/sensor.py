@@ -539,7 +539,7 @@ def _humanize_location(
         return raw_clean
     if address:
         return address
-    return "Fuera de zonas conocidas"
+    return "Outside known zones"
 
 
 def _trip_to_attr(trip: Any) -> dict[str, Any]:
