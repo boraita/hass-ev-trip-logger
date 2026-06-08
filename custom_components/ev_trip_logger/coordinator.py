@@ -566,7 +566,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.28 "
+                    "hass-ev-trip-logger/0.5.30 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -945,11 +945,18 @@ class EvTripLoggerCoordinator:
         # trip is open yet (synth-trip case).
         self._capture_location_sample()
 
+        # v0.5.30 (issue #4) — relax: open the trip as soon as the
+        # ODOMETER is readable. BYD's cloud-polled sensors arrive
+        # offset (odo and battery seconds-to-minutes apart), so the
+        # old "both must be non-None" gate left real trips to the
+        # synthetic path. soc_start is filled in by _resolve_soc_start
+        # which already handles None gracefully (charge-end anchor,
+        # ring buffer, current value fallbacks). Battery's
+        # subsequent ticks update last_seen_soc as usual.
         if (
             self.current is None
             and self._read_bool(self._vehicle_on) is True
             and self._read_float(self._odometer) is not None
-            and self._read_float(self._battery) is not None
         ):
             self._open_trip(dt_util.now())
             return
@@ -1076,7 +1083,17 @@ class EvTripLoggerCoordinator:
         the last idle reading and (re)schedule a finalize timer; when the
         timer fires after _SYNTH_COALESCE_WINDOW_S of no new growth, we log a
         single trip covering the full accumulated delta.
+
+        v0.5.30 (issue #4) — suppress synth when vehicle_on is ON.
+        The synthetic path is for "trip we missed" (vehicle_on never
+        flipped on). If the ignition is on, the live path should
+        handle the trip (retroactive _open_trip in metric_changed has
+        been relaxed to fire on odo alone). Without this guard, BYD's
+        offset cloud polls would still let synth race against the
+        live open and record duplicate / wrong rows.
         """
+        if self._read_bool(self._vehicle_on) is True:
+            return
         odo = self._read_float(self._odometer)
         if odo is None:
             return
@@ -1973,6 +1990,7 @@ class EvTripLoggerCoordinator:
         is_at_home_end = self._is_at_home(location_end)
         started_from_home = self._is_at_home(active.location_start)
         journey_id: int | None
+        stitched_orphan_home = False
         if self.current_journey_id is not None:
             # Open journey absorbs this stage regardless of where it
             # started. The journey only closes on a home arrival.
@@ -1991,6 +2009,7 @@ class EvTripLoggerCoordinator:
             # the closing stage of its own one-stage journey so journey
             # aggregates always include the arrival.
             journey_id = await self.storage.async_next_journey_id()
+            stitched_orphan_home = True
         else:
             # Orphan stage — not part of any journey. Happens when the
             # device_tracker missed the previous trip's home departure.
@@ -2060,6 +2079,21 @@ class EvTripLoggerCoordinator:
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        # v0.5.30 (issue #5) — when we just auto-stitched a new
+        # one-stage journey for this home arrival, retro-absorb any
+        # orphan trips (journey_id=NULL) since the last home arrival
+        # so the journey actually represents the full casa→…→casa
+        # chain instead of showing as a single-row 1-stage journey.
+        if stitched_orphan_home and journey_id is not None:
+            absorbed = await self.storage.async_absorb_orphans_into_journey(
+                journey_id, self.home_zone,
+            )
+            if absorbed:
+                _LOGGER.info(
+                    "Auto-stitch: absorbed %d orphan trip(s) into journey #%s",
+                    absorbed, journey_id,
+                )
 
         # Persist GPS route samples accumulated during the trip.
         if active.gps_samples:

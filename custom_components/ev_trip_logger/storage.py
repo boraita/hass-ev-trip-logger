@@ -660,6 +660,63 @@ class TripStorage:
             return None
         return float(total_kwh) / float(total_km) * 100.0
 
+    async def async_absorb_orphans_into_journey(
+        self, journey_id: int, home_zone: str
+    ) -> int:
+        """Retro-assign journey_id to orphan trips since the last home arrival.
+
+        Issue #5: a "journey" is the sequence of trips between leaving
+        home and returning home. With cloud-polled trackers, individual
+        trips can land with origin/destination = `not_home` (geofence
+        noise), so the journey state machine never opens an id and the
+        legs come out as journey_id=NULL.
+
+        When a trip finally arrives home, we mint a journey for it via
+        v0.5.16 auto-stitch — but that produces a 1-stage journey. This
+        helper walks back to the most recent home arrival BEFORE this
+        trip (or the start of history) and re-stamps every orphan
+        (journey_id IS NULL) in that window with the new id, so the
+        whole casa→…→casa chain ends up grouped.
+
+        Returns the number of trips updated (excluding the one already
+        carrying `journey_id`).
+        """
+        return await self._hass.async_add_executor_job(
+            self._absorb_orphans_into_journey, journey_id, home_zone,
+        )
+
+    def _absorb_orphans_into_journey(
+        self, journey_id: int, home_zone: str
+    ) -> int:
+        slug = (home_zone or "home").strip().casefold()
+        with self._connect() as conn:
+            # The "window start" is the most recent trip BEFORE this
+            # journey's leg whose destination was home. If there's no
+            # such trip, the window starts at the beginning of history.
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(id), 0) FROM trips
+                WHERE LOWER(destination) = ?
+                  AND id < (
+                      SELECT MIN(id) FROM trips WHERE journey_id = ?
+                  )
+                """,
+                (slug, journey_id),
+            ).fetchone()
+            anchor_id = int(row[0]) if row and row[0] else 0
+            cur = conn.execute(
+                """
+                UPDATE trips SET journey_id = ?
+                WHERE journey_id IS NULL
+                  AND id > ?
+                  AND id < (
+                      SELECT MIN(id) FROM trips WHERE journey_id = ?
+                  )
+                """,
+                (journey_id, anchor_id, journey_id),
+            )
+            return int(cur.rowcount or 0)
+
     async def async_resolve_open_journey_id(
         self, home_zone: str
     ) -> int | None:
