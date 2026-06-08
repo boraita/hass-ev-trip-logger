@@ -62,7 +62,17 @@ CREATE TABLE IF NOT EXISTS trips (
     -- haversine. Compared with the odometer-derived distance_km it
     -- reveals odo cadence issues (gps > odo means we have route
     -- points the odometer missed) or GPS noise (gps >> odo).
-    gps_distance_km REAL
+    gps_distance_km REAL,
+    -- v0.5.27: kWh added by charges that ended between the previous
+    -- trip's ended_at and THIS trip's started_at. Lets the dashboard
+    -- show "antes de este trip cargaste +24 kWh" so the user knows
+    -- a SoC bump between trips wasn't a measurement glitch.
+    kwh_charged_before REAL,
+    -- kWh added by charges that ended INSIDE this trip's window
+    -- (started_at ≤ charge.ended_at ≤ ended_at). Should be ~0 thanks
+    -- to v0.5.18 mutex (trip force-closes on charging=on), but
+    -- non-zero in edge cases — manual logs, force-close races, etc.
+    kwh_charged_during REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -139,6 +149,8 @@ class TripRecord:
     energy_source: str | None = None
     energy_from_power: float | None = None
     gps_distance_km: float | None = None
+    kwh_charged_before: float | None = None
+    kwh_charged_during: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -285,6 +297,9 @@ class TripStorage:
             conn.execute("ALTER TABLE trips ADD COLUMN energy_from_power REAL")
         if "gps_distance_km" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN gps_distance_km REAL")
+        for col in ("kwh_charged_before", "kwh_charged_during"):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
@@ -330,8 +345,8 @@ class TripStorage:
                     start_lat, start_lon, end_lat, end_lon,
                     start_address, end_address,
                     soc_start_source, energy_source, energy_from_power,
-                    gps_distance_km
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    gps_distance_km, kwh_charged_before, kwh_charged_during
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -365,6 +380,8 @@ class TripStorage:
                     record.energy_source,
                     record.energy_from_power,
                     record.gps_distance_km,
+                    record.kwh_charged_before,
+                    record.kwh_charged_during,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -401,7 +418,36 @@ class TripStorage:
         "avg_temp_c", "origin", "destination", "cost", "currency",
         "journey_id", "start_lat", "start_lon", "end_lat", "end_lon",
         "start_address", "end_address", "gps_distance_km",
+        "kwh_charged_before", "kwh_charged_during",
     })
+
+    async def async_charges_in_window(
+        self, since: datetime, until: datetime
+    ) -> dict[str, float | int]:
+        """Sum kWh of charges that ENDED within [since, until]. Used at
+        trip close to attribute pre-/intra-trip charging energy to the
+        trip record so SoC deltas can be interpreted correctly when a
+        charge happened in the middle (rare with v0.5.18 mutex, common
+        for journey-level analyses).
+        """
+        return await self._hass.async_add_executor_job(
+            self._charges_in_window, since, until
+        )
+
+    def _charges_in_window(
+        self, since: datetime, until: datetime
+    ) -> dict[str, float | int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(kwh), 0) AS kwh,
+                       COUNT(*) AS count
+                FROM charges
+                WHERE ended_at >= ? AND ended_at <= ?
+                """,
+                (since.isoformat(), until.isoformat()),
+            ).fetchone()
+        return {"kwh": float(row[0] or 0), "count": int(row[1] or 0)}
 
     async def async_update_trip(
         self, trip_id: int, fields: dict[str, Any]
@@ -1688,6 +1734,8 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         energy_source=row["energy_source"] if "energy_source" in row.keys() else None,
         energy_from_power=row["energy_from_power"] if "energy_from_power" in row.keys() else None,
         gps_distance_km=row["gps_distance_km"] if "gps_distance_km" in row.keys() else None,
+        kwh_charged_before=row["kwh_charged_before"] if "kwh_charged_before" in row.keys() else None,
+        kwh_charged_during=row["kwh_charged_during"] if "kwh_charged_during" in row.keys() else None,
     )
 
 

@@ -566,7 +566,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.26 "
+                    "hass-ev-trip-logger/0.5.27 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -1270,6 +1270,21 @@ class EvTripLoggerCoordinator:
                 if route and len(route) >= 2 else None
             ),
         )
+
+        # v0.5.27 — same charges-window attribution as the live close.
+        prev_end_synth = self.last_trip.ended_at if self.last_trip else None
+        if prev_end_synth is not None and prev_end_synth < started_at:
+            before_s = await self.storage.async_charges_in_window(
+                prev_end_synth, started_at,
+            )
+            record.kwh_charged_before = (
+                round(before_s["kwh"], 2) if before_s["kwh"] > 0 else None
+            )
+        during_s = await self.storage.async_charges_in_window(started_at, ended_at)
+        record.kwh_charged_during = (
+            round(during_s["kwh"], 2) if during_s["kwh"] > 0 else None
+        )
+
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
 
@@ -2021,6 +2036,26 @@ class EvTripLoggerCoordinator:
                 round(_route_distance_km(active.gps_samples), 2)
                 if active.gps_samples and len(active.gps_samples) >= 2 else None
             ),
+        )
+
+        # v0.5.27 — attribute pre/intra-trip charging energy. Lets the
+        # dashboard show "+24 kWh antes de este trip" so a SoC bump
+        # between consecutive trips is explained instead of looking
+        # like a sensor glitch. The during-window should be ~0 thanks
+        # to v0.5.18 mutex but we capture it for edge cases.
+        prev_end = self.last_trip.ended_at if self.last_trip else None
+        if prev_end is not None and prev_end < active.started_at:
+            before = await self.storage.async_charges_in_window(
+                prev_end, active.started_at,
+            )
+            record.kwh_charged_before = (
+                round(before["kwh"], 2) if before["kwh"] > 0 else None
+            )
+        during = await self.storage.async_charges_in_window(
+            active.started_at, now,
+        )
+        record.kwh_charged_during = (
+            round(during["kwh"], 2) if during["kwh"] > 0 else None
         )
 
         trip_id = await self.storage.async_insert(record)

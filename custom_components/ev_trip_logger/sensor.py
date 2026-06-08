@@ -596,6 +596,12 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         # haversine. May differ slightly from `distance_km` (odo-
         # derived); when both exist the dashboard can show both.
         "gps_distance_km": _r(getattr(trip, "gps_distance_km", None), 1),
+        # v0.5.27 — energy added BEFORE this trip (between the previous
+        # trip's end and this trip's start) and DURING this trip's
+        # window. Lets dashboards show "+24 kWh entre trips" and helps
+        # interpret SoC deltas when a charge happened in between.
+        "kwh_charged_before": _r(getattr(trip, "kwh_charged_before", None), 2),
+        "kwh_charged_during": _r(getattr(trip, "kwh_charged_during", None), 2),
     }
 
 
