@@ -38,7 +38,9 @@ from .const import (
     ABRP_MIN_SEND_INTERVAL_S,
     CONF_ABRP_API_KEY,
     CONF_ABRP_CAR_MODEL,
+    CONF_ABRP_PUSH_INTERVAL_S,
     CONF_ABRP_TOKEN,
+    DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
     CONF_CHARGE_SENSOR,
@@ -289,6 +291,17 @@ class EvTripLoggerCoordinator:
         # throttle: with BYD's bursty cloud-poll cadence (multiple
         # metric_changed events within ~1 s), we'd otherwise spam ABRP.
         self._abrp_last_send: float = 0.0
+        # v0.5.32 — user-configurable throttle (min seconds between
+        # consecutive pushes). Clamped to [5, 600].
+        self._abrp_interval_s: int = max(5, min(600, int(
+            merged.get(CONF_ABRP_PUSH_INTERVAL_S, DEFAULT_ABRP_PUSH_INTERVAL_S)
+        )))
+        # v0.5.32 — runtime kill-switch driven by the new
+        # switch.<device>_abrp_push entity. Defaults to ON so users
+        # who don't have an automation get the same UX as before;
+        # automations replicating the old plugin (vehicle_on=on →
+        # push on, charging V2C → push off) toggle this flag.
+        self.abrp_push_enabled: bool = True
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
         self._speed = merged.get(CONF_SPEED)
@@ -590,7 +603,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.31 "
+                    "hass-ev-trip-logger/0.5.32 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -1561,11 +1574,11 @@ class EvTripLoggerCoordinator:
         vehicle's raw cloud reading, so we pre-negate the W value here
         to cancel that negation and pass through the correct sign.
         """
-        if self._abrp is None:
+        if self._abrp is None or not self.abrp_push_enabled:
             return
         import time as _time  # noqa: PLC0415 — local to keep import light
         now_mono = _time.monotonic()
-        if now_mono - self._abrp_last_send < ABRP_MIN_SEND_INTERVAL_S:
+        if now_mono - self._abrp_last_send < self._abrp_interval_s:
             return
         # Snapshot every value we feed into ABRP up-front (read once).
         soc = self._read_float(self._battery)

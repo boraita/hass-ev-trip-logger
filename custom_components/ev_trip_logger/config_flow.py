@@ -35,8 +35,10 @@ from .const import (
     CONF_ODOMETER,
     CONF_ABRP_API_KEY,
     CONF_ABRP_CAR_MODEL,
+    CONF_ABRP_PUSH_INTERVAL_S,
     CONF_ABRP_TOKEN,
     CONF_PLUG_SENSOR,
+    DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_POWER,
     CONF_RECENT_LIMIT,
     CONF_SPEED,
@@ -194,6 +196,18 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             _optional(CONF_ABRP_TOKEN, TextSelector()): TextSelector(),
             _optional(CONF_ABRP_API_KEY, TextSelector()): TextSelector(),
             _optional(CONF_ABRP_CAR_MODEL, TextSelector()): TextSelector(),
+            vol.Required(
+                CONF_ABRP_PUSH_INTERVAL_S,
+                default=defaults.get(
+                    CONF_ABRP_PUSH_INTERVAL_S, DEFAULT_ABRP_PUSH_INTERVAL_S
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=5, max=600, step=5,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="s",
+                )
+            ),
         }
     )
 

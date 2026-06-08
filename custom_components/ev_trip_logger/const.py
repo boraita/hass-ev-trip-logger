@@ -5,7 +5,7 @@ from typing import Final
 
 DOMAIN: Final = "ev_trip_logger"
 
-PLATFORMS: Final = ["sensor", "calendar"]
+PLATFORMS: Final = ["sensor", "calendar", "switch"]
 
 CONF_NAME: Final = "name"
 CONF_ODOMETER: Final = "odometer_sensor"
@@ -27,7 +27,10 @@ CONF_ABRP_CAR_MODEL: Final = "abrp_car_model"
 # How often we push telemetry to ABRP. We hook off the existing
 # metric-change events (no new poll forced on the BYD cloud), but
 # throttle so we don't flood ABRP if the upstream emits bursts.
+# DEFAULT only — user can change via CONF_ABRP_PUSH_INTERVAL_S.
 ABRP_MIN_SEND_INTERVAL_S: Final = 30
+CONF_ABRP_PUSH_INTERVAL_S: Final = "abrp_push_interval_s"
+DEFAULT_ABRP_PUSH_INTERVAL_S: Final = 30
 # How often the next-charge sensor polls ABRP's get_next_charge.
 ABRP_NEXT_CHARGE_REFRESH_S: Final = 120
 

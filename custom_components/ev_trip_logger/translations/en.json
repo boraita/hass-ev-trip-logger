@@ -141,6 +141,7 @@
       "total_30d_regen": { "name": "Regen (30 days)" },
       "total_year_regen": { "name": "Regen this year" },
       "abrp_next_charge_soc": { "name": "ABRP next charge SoC" },
+      "abrp_push": { "name": "ABRP telemetry" },
       "last_charge_kwh": { "name": "Last charge energy" },
       "last_charge_cost": { "name": "Last charge cost" },
       "last_charge_price": { "name": "Last charge price per kWh" },
