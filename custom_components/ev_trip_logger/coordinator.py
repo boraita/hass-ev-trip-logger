@@ -120,6 +120,16 @@ _MAX_SYNTH_BASELINE_AGE = timedelta(hours=2)
 # into two short trips with a near-zero gap. The debounce coalesces
 # off-edges in this window into one close.
 _VEHICLE_ON_OFF_DEBOUNCE_S = 3.0
+# v0.5.25 — bounded GPS ring buffer fed by EVERY poll event (any
+# metric or location state change). At BYD-typical cadence (8-10 min)
+# 256 samples cover ~40 h. Live trips also append per-tick samples,
+# but the ring buffer is what powers synthetic-trip GPS and the
+# pre-trip start anchor.
+_GPS_BUFFER_MAX = 256
+# Look-back window for seeding active.gps_samples at trip open. A
+# sample within the last N minutes is recent enough to qualify as
+# "the car's position at trip start" — anything older is stale.
+_PRE_TRIP_GPS_LOOKBACK_S = 600  # 10 min
 # Minimum time a location zone must persist before we treat it as a real
 # arrival. Cloud-polled device_trackers occasionally bounce (e.g.
 # home→not_home→home in 40 s) when geofence math wobbles near the home
@@ -293,6 +303,17 @@ class EvTripLoggerCoordinator:
         # _resolve_soc_start to anchor trip start to the freshest
         # pre-vehicle_on reading available (cf. design doc § 1).
         self._soc_history: deque[tuple[datetime, float]] = deque(maxlen=_SOC_BUFFER_MAX)
+        # v0.5.25 — every poll event (battery / odo / location tick)
+        # snapshots the location entity into this ring buffer. Used to:
+        # (a) seed active.gps_samples at trip open so even the first
+        #     poll has a real start anchor,
+        # (b) reconstruct the route of synthetic trips that never had
+        #     a live tick, and
+        # (c) persist intermediate route points to trip_positions for
+        #     the dashboard map.
+        self._gps_history: deque[tuple[datetime, float, float]] = deque(
+            maxlen=_GPS_BUFFER_MAX
+        )
         self._listeners: list[Callable[[], None]] = []
         self._trip_log_listeners: list[Callable[[], None]] = []
 
@@ -514,7 +535,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.24 "
+                    "hass-ev-trip-logger/0.5.25 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -886,6 +907,13 @@ class EvTripLoggerCoordinator:
             if soc_val is not None:
                 self._soc_history.append((dt_util.now(), soc_val))
 
+        # v0.5.25 — every cloud poll snapshot the location entity. Most
+        # cloud-polled integrations refresh battery, odometer and
+        # location together, so a metric tick is a strong signal the
+        # tracker is also fresh. Captures the position even when no
+        # trip is open yet (synth-trip case).
+        self._capture_location_sample()
+
         if (
             self.current is None
             and self._read_bool(self._vehicle_on) is True
@@ -945,6 +973,11 @@ class EvTripLoggerCoordinator:
         in the interim (a flap), no amend fires. This stops the 40 s
         home→not_home→home GPS glitch from fragmenting a single drive.
         """
+        # v0.5.25 — every location tick feeds the GPS ring buffer
+        # (used to seed trip start anchors and to populate synthetic
+        # trip routes). Runs even when the rest of this handler short-
+        # circuits below — the route capture is unconditional.
+        self._capture_location_sample()
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _INVALID_STATES:
             return
@@ -1140,9 +1173,23 @@ class EvTripLoggerCoordinator:
         # we can't time-travel the device_tracker without HA recorder
         # lookups. The geocoder will still produce an end_address,
         # which the dashboard now prefers over the literal "not_home".
-        end_lat: float | None = None
-        end_lon: float | None = None
-        if self._location:
+        # v0.5.25 — pull the full route from the GPS ring buffer.
+        # Every cloud poll between started_at and ended_at fed a
+        # sample; we now have a chronological list of (ts,lat,lon)
+        # that covers the entire trip even though the live tick never
+        # ran (synth = no self.current).
+        route: list[tuple[datetime, float, float]] = [
+            (ts, la, lo)
+            for ts, la, lo in self._gps_history
+            if started_at <= ts <= ended_at
+        ]
+        start_lat: float | None = route[0][1] if route else None
+        start_lon: float | None = route[0][2] if route else None
+        end_lat: float | None = route[-1][1] if route else None
+        end_lon: float | None = route[-1][2] if route else None
+        if end_lat is None and self._location:
+            # Fall back to the tracker's current value when the buffer
+            # is empty (e.g. brand-new install with no history yet).
             loc_state = self.hass.states.get(self._location)
             if loc_state is not None:
                 try:
@@ -1183,11 +1230,19 @@ class EvTripLoggerCoordinator:
             cost=cost,
             currency=self._currency if cost is not None else None,
             journey_id=journey_id,
+            start_lat=start_lat,
+            start_lon=start_lon,
             end_lat=end_lat,
             end_lon=end_lon,
         )
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        # v0.5.25 — persist the route so the dashboard map can render
+        # intermediate waypoints, not just start/end. Same table that
+        # live trips use via _async_close_trip.
+        if route:
+            await self.storage.async_insert_positions(trip_id, route)
 
         # v0.5.19 — geocode the end coord so dashboards can show a
         # street/town instead of "not_home". Same pattern as in
@@ -1394,6 +1449,39 @@ class EvTripLoggerCoordinator:
             )
             self._notify_listeners()
 
+    @callback
+    def _capture_location_sample(self) -> None:
+        """Snapshot the location entity's lat/lon into the GPS buffer.
+
+        Cheap: skipped silently if no location entity configured, if
+        the entity is not reporting valid coords, or if the new sample
+        is identical to the last one in the buffer (no point storing
+        duplicate cloud-cached values).
+        """
+        if not self._location:
+            return
+        state = self.hass.states.get(self._location)
+        if state is None:
+            return
+        try:
+            lat = float(state.attributes.get("latitude"))
+            lon = float(state.attributes.get("longitude"))
+        except (TypeError, ValueError):
+            return
+        now = dt_util.now()
+        if self._gps_history:
+            _, prev_lat, prev_lon = self._gps_history[-1]
+            # ~1 m at the equator — drop duplicates from cloud cache
+            # without losing real movement.
+            if abs(lat - prev_lat) < 1e-5 and abs(lon - prev_lon) < 1e-5:
+                return
+        self._gps_history.append((now, lat, lon))
+        # If a trip is open, also feed the live samples list so the
+        # eventual close persists a dense route — bypasses the 30 s
+        # live_tick cadence whenever a cloud poll lands faster.
+        if self.current is not None:
+            self.current.gps_samples.append((now, lat, lon))
+
     async def _async_close_charge_then_open_trip(self, now: datetime) -> None:
         """Force-close any open charge, THEN open the trip.
 
@@ -1599,6 +1687,17 @@ class EvTripLoggerCoordinator:
             last_movement_ts=now,  # treat trip start as the first movement
             soc_start_source=soc_source,
         )
+        # v0.5.25 — seed gps_samples with the most-recent buffered
+        # sample (if any within the lookback window) so even very short
+        # trips that close before _async_live_tick fires still have a
+        # real start anchor. Live_tick continues appending while the
+        # trip runs.
+        cutoff = now - timedelta(seconds=_PRE_TRIP_GPS_LOOKBACK_S)
+        for ts, lat, lon in reversed(self._gps_history):
+            if ts < cutoff:
+                break
+            self.current.gps_samples.append((ts, lat, lon))
+            break  # most recent only — preserves "start of trip" semantics
         _LOGGER.debug(
             "Trip opened at %s odo=%s soc=%s (source=%s)",
             now, odometer, soc, soc_source,

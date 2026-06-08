@@ -218,6 +218,7 @@ async def async_setup_entry(
 
     entities.append(RecentTripsSensor(coordinator))
     entities.append(RecentChargesSensor(coordinator))
+    entities.append(LastTripRouteSensor(coordinator))
     entities.append(TripRecordsSensor(coordinator))
     entities.append(ChargeInProgressSensor(coordinator))
     entities.append(PlugStateSensor(coordinator))
@@ -973,6 +974,72 @@ class RecentTripsSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"trips": [_trip_to_attr(t) for t in self._trips]}
+
+
+class LastTripRouteSensor(_BaseTripSensor):
+    """Route waypoints (lat/lon timeline) of the most recent completed trip.
+
+    State is the number of waypoints; the full list lives in the
+    `points` attribute as [{ts, lat, lon, index}, …]. Downsampled to
+    `_MAX_POINTS` to keep the attribute under HA's 16 KB recorder cap
+    when state changes are written. Recorder exclusion below also
+    prevents the heavy blob from being persisted.
+    """
+
+    _unrecorded_attributes = frozenset({"points"})
+    _MAX_POINTS = 30
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="last_trip_route",
+            translation_key="last_trip_route",
+            icon="mdi:map-marker-path",
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_last_trip_route"
+        self._points: list[dict[str, Any]] = []
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._async_refresh()
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._listener)
+        )
+
+    @callback
+    def _listener(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self) -> None:
+        trip = self._coordinator.last_trip
+        if trip is None or trip.trip_id is None:
+            self._points = []
+        else:
+            raw = await self._coordinator.storage.async_trip_positions(trip.trip_id)
+            # Downsample evenly to _MAX_POINTS so a long trip doesn't
+            # blow up the attribute size. Keep first and last always.
+            if len(raw) > self._MAX_POINTS:
+                step = len(raw) / (self._MAX_POINTS - 1)
+                idxs = sorted({int(i * step) for i in range(self._MAX_POINTS - 1)} | {len(raw) - 1})
+                raw = [raw[i] for i in idxs if i < len(raw)]
+            self._points = [
+                {
+                    "index": i + 1,
+                    "ts": p.get("ts"),
+                    "lat": round(float(p["lat"]), 6),
+                    "lon": round(float(p["lon"]), 6),
+                }
+                for i, p in enumerate(raw)
+            ]
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return len(self._points)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"points": self._points}
 
 
 class RecentChargesSensor(_BaseTripSensor):
