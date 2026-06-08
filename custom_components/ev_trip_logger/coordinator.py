@@ -417,7 +417,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.18 "
+                    "hass-ev-trip-logger/0.5.19 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -1027,6 +1027,25 @@ class EvTripLoggerCoordinator:
         cost = energy * price_per_kwh if energy and energy > 0 else None
         location_start = self.last_trip.destination if self.last_trip else None
         location_end = self._read_str(self._location) if self._location else None
+        # v0.5.19 — sample the device_tracker's GPS coords at finalize
+        # time. Synth trips previously persisted with NULL lat/lon,
+        # which blocked the Nominatim backfill → every synth trip
+        # ended up labelled "not_home" because there was nothing for
+        # the geocoder to resolve. We only have the end coords (the
+        # tracker's current position); start coords stay NULL since
+        # we can't time-travel the device_tracker without HA recorder
+        # lookups. The geocoder will still produce an end_address,
+        # which the dashboard now prefers over the literal "not_home".
+        end_lat: float | None = None
+        end_lon: float | None = None
+        if self._location:
+            loc_state = self.hass.states.get(self._location)
+            if loc_state is not None:
+                try:
+                    end_lat = float(loc_state.attributes.get("latitude"))
+                    end_lon = float(loc_state.attributes.get("longitude"))
+                except (TypeError, ValueError):
+                    end_lat = end_lon = None
         started_from_home = self._is_at_home(location_start)
         is_at_home_end = self._is_at_home(location_end)
         # Same invariant as _async_close_trip — open journeys absorb
@@ -1060,9 +1079,30 @@ class EvTripLoggerCoordinator:
             cost=cost,
             currency=self._currency if cost is not None else None,
             journey_id=journey_id,
+            end_lat=end_lat,
+            end_lon=end_lon,
         )
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        # v0.5.19 — geocode the end coord so dashboards can show a
+        # street/town instead of "not_home". Same pattern as in
+        # _async_close_trip's _geocode_async helper.
+        if end_lat is not None and end_lon is not None:
+            async def _geocode_synth() -> None:
+                end_addr = await self._async_reverse_geocode(end_lat, end_lon)
+                if end_addr:
+                    await self.storage.async_update_trip_addresses(
+                        trip_id, end_address=end_addr,
+                    )
+                    if self.last_trip and self.last_trip.trip_id == trip_id:
+                        self.last_trip = replace(
+                            self.last_trip, end_address=end_addr,
+                        )
+                    self._notify_trip_log_listeners()
+
+            self.hass.async_create_task(_geocode_synth())
+
         self.last_trip = record
         if is_at_home_end and journey_id is not None:
             self.last_completed_journey_id = journey_id

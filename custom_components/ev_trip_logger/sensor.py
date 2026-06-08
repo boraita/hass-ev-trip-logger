@@ -343,8 +343,14 @@ class LastTripSensor(_BaseTripSensor):
         return {
             "started_at": trip.started_at.isoformat(),
             "ended_at": trip.ended_at.isoformat(),
-            "origin": trip.origin,
-            "destination": trip.destination,
+            "origin": _humanize_location(
+                trip.origin, getattr(trip, "start_address", None)
+            ),
+            "destination": _humanize_location(
+                trip.destination, getattr(trip, "end_address", None)
+            ),
+            "origin_raw": trip.origin,
+            "destination_raw": trip.destination,
         }
 
 
@@ -505,6 +511,25 @@ def _r(value: float | None, ndigits: int) -> float | None:
     return round(value, ndigits) if value is not None else None
 
 
+def _humanize_location(
+    raw: str | None, address: str | None
+) -> str | None:
+    """Turn device_tracker state + geocoded address into a friendly label.
+
+    Priority: a real zone name (anything that isn't `not_home`/`unknown`)
+    wins, else the geocoded address, else a Spanish fallback. This means
+    a trip ending in a named zone ("home", "Trabajo") shows the zone,
+    while a trip ending outside any zone shows the street/town.
+    """
+    NONZONE = {"not_home", "unknown", "unavailable", "none", ""}
+    raw_clean = (raw or "").strip()
+    if raw_clean and raw_clean.casefold() not in NONZONE:
+        return raw_clean
+    if address:
+        return address
+    return "Fuera de zonas conocidas"
+
+
 def _trip_to_attr(trip: Any) -> dict[str, Any]:
     """Serialise a TripRecord for sensor attributes.
 
@@ -513,6 +538,8 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
     (the historical key dashboards have been using since v0.1) for
     backwards compatibility — both point at the same DB primary key.
     """
+    start_addr = getattr(trip, "start_address", None)
+    end_addr = getattr(trip, "end_address", None)
     return {
         "id": trip.trip_id,
         "trip_id": trip.trip_id,
@@ -536,8 +563,16 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         "cost": _r(trip.cost, 2),
         "currency": trip.currency,
         "score": _r(trip.score, 1),
-        "origin": trip.origin,
-        "destination": trip.destination,
+        # v0.5.19 — origin/destination now show the geocoded address
+        # when the raw device_tracker state was `not_home` (= outside
+        # any HA zone). The raw value is preserved as `origin_raw` /
+        # `destination_raw` for backwards compatibility and journey
+        # logic. Dashboards that already read `origin` get street+town
+        # instead of "not_home" without any YAML changes.
+        "origin": _humanize_location(trip.origin, start_addr),
+        "destination": _humanize_location(trip.destination, end_addr),
+        "origin_raw": trip.origin,
+        "destination_raw": trip.destination,
         # GPS endpoints — populated only for trips logged after v0.5.3.
         # Lets the dashboard build a precise Google-Maps route link.
         "start_lat": _r(getattr(trip, "start_lat", None), 6),
@@ -546,8 +581,8 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         "end_lon": _r(getattr(trip, "end_lon", None), 6),
         # Reverse-geocoded human-readable labels (Nominatim, v0.5.12+).
         # NULL for older trips and for points inside a named HA zone.
-        "start_address": getattr(trip, "start_address", None),
-        "end_address": getattr(trip, "end_address", None),
+        "start_address": start_addr,
+        "end_address": end_addr,
         # v0.5.13+ provenance — see storage.py header. The dashboard
         # can surface these as a small badge so the user knows whether
         # consumption was anchored on charge-end SoC (most accurate),
@@ -1037,7 +1072,9 @@ class TripRecordsSensor(_BaseTripSensor):
             "trip_id": trip.trip_id,
             "ended_at": trip.ended_at.isoformat(),
             "distance_km": round(trip.distance_km, 1),
-            "destination": trip.destination,
+            "destination": _humanize_location(
+                trip.destination, getattr(trip, "end_address", None)
+            ),
         }
 
     @property
