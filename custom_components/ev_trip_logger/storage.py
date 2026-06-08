@@ -442,6 +442,36 @@ class TripStorage:
         "kwh_charged_before", "kwh_charged_during", "confidence",
     })
 
+    async def async_trip_overlaps(
+        self, start: datetime, end: datetime, tolerance_s: int = 120
+    ) -> bool:
+        """True if any existing trip overlaps [start, end] (with ±tolerance).
+
+        Used by recover_missing_trips so the recovery path never
+        duplicates a row that's already in storage. A 2-minute fudge
+        absorbs cloud-poll cadence wobble around the window boundaries.
+        """
+        return await self._hass.async_add_executor_job(
+            self._trip_overlaps, start, end, tolerance_s,
+        )
+
+    def _trip_overlaps(
+        self, start: datetime, end: datetime, tolerance_s: int
+    ) -> bool:
+        # Overlap if existing.started_at < end+tol AND existing.ended_at > start-tol
+        lo = (start - timedelta(seconds=tolerance_s)).isoformat()
+        hi = (end + timedelta(seconds=tolerance_s)).isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM trips
+                WHERE started_at <= ? AND ended_at >= ?
+                LIMIT 1
+                """,
+                (hi, lo),
+            ).fetchone()
+        return row is not None
+
     async def async_charges_in_window(
         self, since: datetime, until: datetime
     ) -> dict[str, float | int]:

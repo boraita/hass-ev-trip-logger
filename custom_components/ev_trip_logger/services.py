@@ -17,6 +17,7 @@ from .const import (
     SERVICE_LOG_CHARGE,
     SERVICE_LOG_MANUAL_TRIP,
     SERVICE_PURGE_TRIPS,
+    SERVICE_RECOVER_MISSING_TRIPS,
     SERVICE_SET_CHARGE,
     SERVICE_SET_LAST_CHARGE_PRICE,
     SERVICE_SET_TRIP,
@@ -299,6 +300,27 @@ def async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_SET_CHARGE, _set_charge, schema=_SCHEMA_SET_CHARGE
     )
 
+    async def _recover_missing_trips(call: ServiceCall) -> None:
+        for c in _resolve_coordinators(hass, call):
+            n = await c.async_recover_missing_trips_service(
+                since=call.data["since"],
+                until=call.data.get("until"),
+            )
+            _LOGGER.info(
+                "recover_missing_trips: %d trip(s) inserted for entry %s",
+                n, c.entry_id,
+            )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_RECOVER_MISSING_TRIPS, _recover_missing_trips,
+        schema=_SCHEMA_ENTRY.extend(
+            {
+                vol.Required("since"): cv.datetime,
+                vol.Optional("until"): cv.datetime,
+            }
+        ),
+    )
+
 
 @callback
 def async_unregister_services(hass: HomeAssistant) -> None:
@@ -315,6 +337,7 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_PURGE_TRIPS,
         SERVICE_SET_TRIP,
         SERVICE_SET_CHARGE,
+        SERVICE_RECOVER_MISSING_TRIPS,
     ):
         if hass.services.has_service(DOMAIN, name):
             hass.services.async_remove(DOMAIN, name)

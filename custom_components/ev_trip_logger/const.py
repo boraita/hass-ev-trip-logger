@@ -82,5 +82,6 @@ SERVICE_LOG_MANUAL_TRIP: Final = "log_manual_trip"
 SERVICE_PURGE_TRIPS: Final = "purge_trips"
 SERVICE_SET_TRIP: Final = "set_trip"
 SERVICE_SET_CHARGE: Final = "set_charge"
+SERVICE_RECOVER_MISSING_TRIPS: Final = "recover_missing_trips"
 
 STORAGE_FILENAME_TEMPLATE: Final = "ev_trip_logger.{entry_id}.db"

@@ -427,3 +427,29 @@ set_charge:
       name: Entry ID
       selector:
         text:
+
+recover_missing_trips:
+  name: Recover missing trips
+  description: >-
+    Recovery mode: scan HA's recorder for odometer growth that ISN'T
+    covered by any existing trip in [since, until], and insert
+    synthetic records with confidence='reconstructed_recovery'.
+    Existing trip rows are NEVER modified — recovery is purely
+    additive. Best-effort SoC / origin / destination resolution from
+    battery_level and device_tracker history at the boundaries.
+  fields:
+    since:
+      name: Since
+      description: Start of the recovery window. Older than the recorder retention (default ~10 days) will return nothing.
+      required: true
+      selector:
+        datetime:
+    until:
+      name: Until
+      description: End of the window. Defaults to "now" when omitted.
+      selector:
+        datetime:
+    entry_id:
+      name: Entry ID
+      selector:
+        text:

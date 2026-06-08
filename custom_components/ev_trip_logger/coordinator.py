@@ -608,7 +608,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.36 "
+                    "hass-ev-trip-logger/0.5.37 "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -2550,6 +2550,212 @@ class EvTripLoggerCoordinator:
             self._notify_listeners()
             self._notify_trip_log_listeners()
         return count
+
+    async def async_recover_missing_trips_service(
+        self, *, since: datetime, until: datetime | None = None,
+    ) -> int:
+        """Scan recorder history for odometer growth not covered by any
+        existing trip, and INSERT synth records with confidence
+        'reconstructed_recovery'. Existing rows are never modified.
+
+        Algorithm:
+          1. Pull odometer history in [since, until]. Drop unparseable.
+          2. Walk samples. A "segment" starts when odo grows from the
+             prior sample and ends after _SYNTH_COALESCE_WINDOW_S of
+             no further growth (or until the window ends).
+          3. For each segment, query storage: skip if any trip already
+             overlaps [seg_start, seg_end].
+          4. For surviving segments, pull battery + location at the
+             boundaries and persist a TripRecord.
+
+        Returns the number of trips inserted.
+        """
+        if self._odometer is None:
+            _LOGGER.warning("recover_missing_trips: no odometer configured")
+            return 0
+        if until is None:
+            until = dt_util.now()
+        if since >= until:
+            return 0
+        try:
+            from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+        except Exception:
+            return 0
+        recorder = get_instance(self.hass)
+        try:
+            result = await recorder.async_add_executor_job(
+                state_changes_during_period,
+                self.hass, since, until, self._odometer,
+            )
+        except Exception as exc:
+            _LOGGER.warning("recover_missing_trips: recorder query failed: %s", exc)
+            return 0
+        states = result.get(self._odometer, []) if isinstance(result, dict) else []
+        # Coerce to (ts, odo) pairs, drop unparseable.
+        pairs: list[tuple[datetime, float]] = []
+        for s in states:
+            try:
+                pairs.append((s.last_updated, float(s.state)))
+            except (TypeError, ValueError):
+                continue
+        if len(pairs) < 2:
+            return 0
+        pairs.sort(key=lambda x: x[0])
+
+        # Walk segments.
+        segments: list[tuple[datetime, datetime, float, float]] = []
+        seg_start_ts: datetime | None = None
+        seg_start_odo: float | None = None
+        seg_last_growth_ts: datetime | None = None
+        seg_last_odo: float | None = None
+        for ts, odo in pairs:
+            if seg_start_ts is None:
+                # First sample; arm baseline.
+                seg_start_ts = ts
+                seg_start_odo = odo
+                seg_last_growth_ts = ts
+                seg_last_odo = odo
+                continue
+            if seg_last_odo is None:
+                continue
+            if odo > seg_last_odo + 0.05:  # growth (more than rounding)
+                seg_last_growth_ts = ts
+                seg_last_odo = odo
+            elif (
+                seg_last_growth_ts is not None
+                and (ts - seg_last_growth_ts).total_seconds()
+                    > _SYNTH_COALESCE_WINDOW_S
+            ):
+                # Long plateau — finalise segment if it actually moved.
+                if seg_last_odo > seg_start_odo + self._min_distance:
+                    segments.append(
+                        (seg_start_ts, seg_last_growth_ts,
+                         seg_start_odo, seg_last_odo)
+                    )
+                seg_start_ts = ts
+                seg_start_odo = odo
+                seg_last_growth_ts = ts
+                seg_last_odo = odo
+        # Tail segment.
+        if (
+            seg_start_ts is not None and seg_last_growth_ts is not None
+            and seg_last_odo is not None and seg_start_odo is not None
+            and seg_last_odo > seg_start_odo + self._min_distance
+        ):
+            segments.append(
+                (seg_start_ts, seg_last_growth_ts,
+                 seg_start_odo, seg_last_odo)
+            )
+
+        _LOGGER.info(
+            "recover_missing_trips: %d candidate segment(s) in [%s, %s]",
+            len(segments), since.isoformat(), until.isoformat(),
+        )
+        inserted = 0
+        for s_ts, e_ts, s_odo, e_odo in segments:
+            # Skip if any existing trip covers this window.
+            if await self.storage.async_trip_overlaps(s_ts, e_ts):
+                continue
+            # Pull SoC + location at the endpoints (best-effort).
+            soc_start = None
+            soc_end = None
+            async def _scalar(eid: str, when: datetime) -> float | None:
+                try:
+                    r = await recorder.async_add_executor_job(
+                        state_changes_during_period,
+                        self.hass, when - timedelta(minutes=30),
+                        when + timedelta(minutes=5), eid,
+                    )
+                    sts = r.get(eid, []) if isinstance(r, dict) else []
+                    seen = sorted(
+                        ((x.last_updated, x.state) for x in sts),
+                        key=lambda y: y[0],
+                    )
+                    cand = [v for t, v in seen if t <= when] or [v for _, v in seen]
+                    if not cand:
+                        return None
+                    return float(cand[-1])
+                except Exception:
+                    return None
+            if self._battery:
+                soc_start = await _scalar(self._battery, s_ts)
+                soc_end = await _scalar(self._battery, e_ts)
+            start_lat = start_lon = end_lat = end_lon = None
+            origin = destination = None
+            if self._location:
+                try:
+                    r = await recorder.async_add_executor_job(
+                        state_changes_during_period,
+                        self.hass, s_ts - timedelta(minutes=30),
+                        e_ts + timedelta(minutes=5), self._location,
+                    )
+                    sts = r.get(self._location, []) if isinstance(r, dict) else []
+                    sorted_states = sorted(sts, key=lambda x: x.last_updated)
+                    # Pick nearest <= start for origin, last for end.
+                    pre = [x for x in sorted_states if x.last_updated <= s_ts]
+                    post = [x for x in sorted_states if x.last_updated <= e_ts]
+                    if pre:
+                        origin = pre[-1].state
+                        try:
+                            start_lat = float(pre[-1].attributes.get("latitude"))
+                            start_lon = float(pre[-1].attributes.get("longitude"))
+                        except (TypeError, ValueError):
+                            start_lat = start_lon = None
+                    if post:
+                        destination = post[-1].state
+                        try:
+                            end_lat = float(post[-1].attributes.get("latitude"))
+                            end_lon = float(post[-1].attributes.get("longitude"))
+                        except (TypeError, ValueError):
+                            end_lat = end_lon = None
+                except Exception:
+                    pass
+            distance = round(e_odo - s_odo, 1)
+            duration_min = max(0.0, (e_ts - s_ts).total_seconds() / 60.0)
+            soc_used = (
+                round(soc_start - soc_end, 1)
+                if soc_start is not None and soc_end is not None
+                and soc_start > soc_end else None
+            )
+            energy = (
+                round((soc_used / 100.0) * self._battery_capacity, 2)
+                if soc_used is not None else None
+            )
+            cost = (
+                round(energy * self._trip_cost_price_per_kwh(), 2)
+                if energy is not None and energy > 0 else None
+            )
+            record = TripRecord(
+                started_at=s_ts, ended_at=e_ts,
+                duration_min=duration_min, distance_km=distance,
+                odometer_start=s_odo, odometer_end=e_odo,
+                soc_start=soc_start, soc_end=soc_end, soc_used_pct=soc_used,
+                energy_kwh=energy,
+                consumption_kwh_100km=(
+                    round(energy / distance * 100, 1)
+                    if energy and distance > 0 else None
+                ),
+                origin=origin, destination=destination,
+                start_lat=start_lat, start_lon=start_lon,
+                end_lat=end_lat, end_lon=end_lon,
+                cost=cost,
+                currency=self._currency if cost else None,
+                confidence="reconstructed_recovery",
+            )
+            trip_id = await self.storage.async_insert(record)
+            inserted += 1
+            _LOGGER.info(
+                "recover_missing_trips: inserted #%s %s→%s (%.1fkm)",
+                trip_id, s_ts.isoformat(), e_ts.isoformat(), distance,
+            )
+        if inserted:
+            self.last_trip = await self.storage.async_get_last()
+            self._notify_listeners()
+            self._notify_trip_log_listeners()
+        return inserted
 
     async def async_log_manual_trip_service(
         self,
