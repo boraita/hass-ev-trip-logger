@@ -250,7 +250,7 @@ async def async_setup_entry(
     entities.append(TopsSensor(coordinator))
     for key in ("avg_distance_km", "avg_duration_min", "avg_speed_kmh", "driving_time_min"):
         entities.append(AvgTripMetricsSensor(coordinator, key=key))
-    for key in ("avg_kwh", "avg_cost"):
+    for key in ("avg_kwh", "avg_cost", "avg_soc_start", "avg_soc_end", "avg_soc_added"):
         entities.append(AvgChargeMetricsSensor(coordinator, key=key))
 
     entities.extend(
@@ -2137,6 +2137,30 @@ class AvgChargeMetricsSensor(_BaseTripSensor):
             "icon": "mdi:cash-multiple",
             "slug": "avg_charge_cost_30d",
             "precision": 2,
+        },
+        # v0.5.39 — per-session SoC averages so the user knows their
+        # typical charging behaviour: at what % do they plug in, to
+        # what % do they top up, and how many points they add per
+        # session.
+        "avg_soc_start": {
+            "unit": PERCENTAGE,
+            "device_class": SensorDeviceClass.BATTERY,
+            "icon": "mdi:battery-low",
+            "slug": "avg_charge_soc_start_30d",
+            "precision": 1,
+        },
+        "avg_soc_end": {
+            "unit": PERCENTAGE,
+            "device_class": SensorDeviceClass.BATTERY,
+            "icon": "mdi:battery-high",
+            "slug": "avg_charge_soc_end_30d",
+            "precision": 1,
+        },
+        "avg_soc_added": {
+            "unit": PERCENTAGE,
+            "icon": "mdi:battery-plus",
+            "slug": "avg_charge_soc_added_30d",
+            "precision": 1,
         },
     }
 

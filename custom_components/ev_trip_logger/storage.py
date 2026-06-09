@@ -1798,17 +1798,31 @@ class TripStorage:
         with sqlite3.connect(self._path) as conn:
             row = conn.execute(
                 """
-                SELECT AVG(kwh) AS k, AVG(total_cost) AS c, COUNT(*) AS n
+                SELECT
+                    AVG(kwh) AS k,
+                    AVG(total_cost) AS c,
+                    COUNT(*) AS n,
+                    AVG(soc_start) AS ss,
+                    AVG(soc_end)   AS se,
+                    AVG(CASE
+                            WHEN soc_start IS NOT NULL AND soc_end IS NOT NULL
+                                 AND soc_end > soc_start
+                            THEN soc_end - soc_start
+                            ELSE NULL
+                        END) AS sd
                 FROM charges
                 WHERE ended_at >= ?
                 """,
                 (since.isoformat(),),
             ).fetchone()
-        k, c, n = row
+        k, c, n, ss, se, sd = row
         return {
             "avg_kwh": float(k) if k else 0.0,
             "avg_cost": float(c) if c else 0.0,
             "count": int(n or 0),
+            "avg_soc_start": float(ss) if ss is not None else None,
+            "avg_soc_end": float(se) if se is not None else None,
+            "avg_soc_added": float(sd) if sd is not None else None,
         }
 
 
