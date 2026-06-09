@@ -115,6 +115,16 @@ _PRE_ON_LOOKBACK = timedelta(minutes=5)
 # either sat too long or someone discharged it externally).
 _POST_CHARGE_ANCHOR_WINDOW = timedelta(hours=12)
 _POST_CHARGE_DRAIN_BUDGET_PCT = 2.0
+# v0.5.40 — snap-on-short-park. When the previous trip ended very
+# recently and no charge has happened since, anchor the new trip's
+# soc_start to the previous trip's soc_end IF the apparent gap is
+# within integer-quantization + BMS-settle noise. Eliminates the
+# +1 % phantom drop observed on ~53 % of consecutive trips on BYD-
+# class integer-SoC integrations (BMS rounds down 1–2 % after the
+# pack relaxes; no real drain). Beyond 30 min parked, real vampire
+# drain becomes plausible, so we don't snap.
+_SHORT_PARK_SNAP_WINDOW = timedelta(minutes=30)
+_SHORT_PARK_SNAP_GAP_PCT = 2.0
 # Max age the synth-trip baseline can be before we discard it. Without
 # this, `_async_check_odo_jump` happily uses `_last_idle_odo` from
 # yesterday as the start anchor for today's drive, producing 10 h
@@ -1581,6 +1591,19 @@ class EvTripLoggerCoordinator:
             )
             self._notify_listeners()
 
+    def kick_abrp_push(self) -> None:
+        """Force the next ABRP push to fire ASAP, bypassing the throttle.
+
+        Called when a trip opens or the user flips the ABRP switch ON
+        so we don't wait for the next upstream metric tick to surface
+        a fresh datapoint. The push itself is scheduled as a task so
+        the caller stays sync-safe.
+        """
+        if self._abrp is None or not self.abrp_push_enabled:
+            return
+        self._abrp_last_send = 0.0
+        self.hass.async_create_task(self._async_maybe_send_abrp())
+
     async def _async_maybe_send_abrp(self) -> None:
         """Build a TLM payload from current sensor readings and push to ABRP.
 
@@ -1874,6 +1897,30 @@ class EvTripLoggerCoordinator:
             if plug_disconnected and drain_ok and not_below_current:
                 return soc_end_f, "last_charge_end"
 
+        # (a.5) Snap to previous trip's soc_end when parking was short
+        # and the apparent gap is within integer-quantization / BMS-
+        # settle noise. Most consecutive-trip pairs on integer-SoC
+        # integrations (BYD, …) show a phantom 1 % drop after a few
+        # minutes parked because the BMS rounds down after the pack
+        # relaxes; this branch erases the visible inconsistency.
+        # Conditions:
+        #   - last trip ended ≤ _SHORT_PARK_SNAP_WINDOW ago
+        #   - no charge ended since the last trip closed
+        #   - current SoC is in [last.soc_end - 2, last.soc_end]
+        #     (positive-only gap; real charges are handled by branch (a))
+        if (
+            lt is not None
+            and lt.ended_at is not None
+            and lt.soc_end is not None
+            and (now - lt.ended_at) <= _SHORT_PARK_SNAP_WINDOW
+            and (lc is None or lc.ended_at is None or lc.ended_at <= lt.ended_at)
+            and current is not None
+        ):
+            soc_end_f = float(lt.soc_end)
+            gap = soc_end_f - current
+            if 0.0 <= gap <= _SHORT_PARK_SNAP_GAP_PCT:
+                return soc_end_f, "snap_short_park"
+
         # (b) Freshest sample within the pre-on lookback window.
         cutoff = now - _PRE_ON_LOOKBACK
         for ts, soc in reversed(self._soc_history):
@@ -1945,6 +1992,11 @@ class EvTripLoggerCoordinator:
                 "location_start": location,
             },
         )
+        # v0.5.40 — kick ABRP immediately so the first telemetry point
+        # lands within seconds of ignition instead of waiting for the
+        # next upstream metric tick (BYD's median cadence is ~8 min;
+        # at the start of a drive that's a visible gap in ABRP).
+        self.kick_abrp_push()
         self._notify_listeners()
 
     def _schedule_close(self, now: datetime) -> None:

@@ -81,6 +81,10 @@ class AbrpPushSwitch(SwitchEntity, RestoreEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._coordinator.abrp_push_enabled = True
         self.async_write_ha_state()
+        # v0.5.40 — without this the next push waits for an upstream
+        # metric tick (median ~8 min on BYD), so the switch coming on
+        # mid-drive showed nothing in ABRP for minutes. Force a send.
+        self._coordinator.kick_abrp_push()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._coordinator.abrp_push_enabled = False

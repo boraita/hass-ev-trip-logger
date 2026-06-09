@@ -19,7 +19,7 @@ import logging
 import time
 from typing import Any
 
-from aiohttp import ClientError, ClientSession
+from aiohttp import ClientError, ClientSession, ClientTimeout
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +35,10 @@ _AUTH_FAIL_PAUSE_S = 600.0
 #: Start backing off after this many consecutive transient failures.
 _BACKOFF_THRESHOLD = 10
 _BACKOFF_MAX_S = 300.0
+#: HTTP request timeout. Without it, a hung TLS handshake on the first
+#: push after a network blip or after the switch turns on can stall the
+#: caller for tens of seconds (aiohttp's default is no total timeout).
+_HTTP_TIMEOUT = ClientTimeout(total=10.0)
 
 
 def build_tlm(
@@ -123,7 +127,9 @@ class AbrpClient:
             "tlm": json.dumps(tlm, separators=(",", ":")),
         }
         try:
-            async with self._session.post(SEND_ENDPOINT, params=params) as resp:
+            async with self._session.post(
+                SEND_ENDPOINT, params=params, timeout=_HTTP_TIMEOUT
+            ) as resp:
                 if resp.status == 401:
                     self._suppress_until = time.monotonic() + _AUTH_FAIL_PAUSE_S
                     _LOGGER.warning(
@@ -150,7 +156,9 @@ class AbrpClient:
             return self.next_charge_soc
         params = {"api_key": self._api_key, "token": self._token}
         try:
-            async with self._session.get(NEXT_CHARGE_ENDPOINT, params=params) as resp:
+            async with self._session.get(
+                NEXT_CHARGE_ENDPOINT, params=params, timeout=_HTTP_TIMEOUT
+            ) as resp:
                 if resp.status != 200:
                     return self.next_charge_soc
                 data = await resp.json(content_type=None)

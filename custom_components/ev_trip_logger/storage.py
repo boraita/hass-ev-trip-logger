@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS trips (
     -- v0.5.13: stale-SoC-at-trip-start fix.
     -- soc_start_source: which heuristic produced soc_start
     --   'last_charge_end'  → anchored to the prior charge's end SoC (best)
+    --   'snap_short_park'  → v0.5.40: snapped to prev trip's soc_end
+    --                        when parked < 30 min and apparent gap ≤ 2 %
+    --                        (kills integer-SoC quantization phantom drop)
     --   'pre_on_sample'    → buffer sample taken < 5 min before vehicle_on
     --   'post_on_sample'   → current/cached reading (legacy fallback)
     --   'unavailable'      → battery sensor unreadable at open
