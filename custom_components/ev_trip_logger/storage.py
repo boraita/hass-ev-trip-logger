@@ -91,6 +91,17 @@ CREATE TABLE IF NOT EXISTS trips (
     --                                     sensor was ON during the
     --                                     window, so even the route
     --                                     points are sparse.
+    --   'orphan'                        → v0.5.41: synthetic record
+    --                                     between two live trips when
+    --                                     the odometer showed a real
+    --                                     km gap whose SoC drop
+    --                                     matched expected consumption
+    --                                     (missed on→off→on cycle).
+    --   'orphan_odo_only'               → v0.5.41: km gap detected
+    --                                     but SoC didn't track —
+    --                                     previous odo_end was stale,
+    --                                     km belong to the prior
+    --                                     drive. Energy fields NULL.
     confidence TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);

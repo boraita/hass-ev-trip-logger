@@ -80,6 +80,19 @@ _LOGGER = logging.getLogger(__name__)
 
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""}
 _LIVE_TICK = timedelta(seconds=30)
+# v0.5.41 — force a fresh upstream poll on the location entity every
+# N ticks while a trip is open. Cloud-polled integrations (BYD,
+# Tesla Fleet) typically push location every ~8 min on their natural
+# cadence; without a nudge we get 3–4 GPS points on a 30 min drive.
+# update_entity asks the platform to refresh on demand; integrations
+# that support it (BYD does) push fresh lat/lon shortly after. Every
+# 4 ticks (= 120 s) yields ~15 GPS samples on a 30 min drive without
+# spamming the upstream so hard that we risk rate-limiting.
+_LOCATION_REFRESH_EVERY_N_TICKS = 4
+# ~1 m at the equator — drop duplicates from cloud cache without
+# losing real movement. Shared between _capture_location_sample and
+# _async_live_tick so both branches dedupe consistently.
+_GPS_DUP_EPSILON = 1e-5
 # Wait this long without further odo growth before committing a synthetic
 # trip. Cloud-polling sources emit small odo deltas every ~1-2 min during a
 # drive; the window must be longer than the polling interval so we don't
@@ -125,6 +138,38 @@ _POST_CHARGE_DRAIN_BUDGET_PCT = 2.0
 # drain becomes plausible, so we don't snap.
 _SHORT_PARK_SNAP_WINDOW = timedelta(minutes=30)
 _SHORT_PARK_SNAP_GAP_PCT = 2.0
+# v0.5.41 — orphan-trip detection between consecutive trips. When a
+# new trip opens and the captured odometer_start is materially larger
+# than the previous trip's odometer_end, a real drive was missed (a
+# full on→off→on cycle slipped between two upstream cloud polls, or
+# the previous close captured a stale odometer reading). We insert a
+# synthetic TripRecord between them rather than absorb the km/SoC
+# into the new trip (which would inflate its consumption) or leave
+# the gap unexplained on the dashboard.
+#
+# Lower bound 0.3 km keeps quantization noise from triggering. Upper
+# bound 200 km guards against odometer sensor glitches / unit-changes
+# (anything bigger is implausibly large vs idle drain or a missed
+# drive, and we'd rather log a warning than fabricate a trip record).
+_ORPHAN_MIN_KM_GAP = 0.3
+_ORPHAN_MAX_KM_GAP = 200.0
+# How long after the previous trip closed we still attempt to classify
+# an orphan. Beyond 12 h the SoC↔km correlation becomes noisy (vampire
+# drain compounds, the user may have manually shuffled the car around
+# in ways we can't model), so we leave the gap unexplained.
+_ORPHAN_MAX_DURATION_S = 12 * 3600
+# Default consumption when we don't have a recent 30 d average yet
+# (used to compute the expected SoC drop for the missed km). 15 kWh/100km
+# is the typical EV range; the ratio gate below accepts ±2x of this so
+# the precise default barely matters in practice.
+_ORPHAN_DEFAULT_KWH_100KM = 15.0
+# Orphan-classification ratio (observed SoC drop / expected SoC drop
+# from km × consumption). Anything outside this band is treated as
+# inconsistent — we still record the orphan, but with confidence
+# 'orphan_odo_only' (km only, energy fields left NULL) to flag that
+# the SoC didn't track the km the way a real drive would.
+_ORPHAN_RATIO_MIN = 0.5
+_ORPHAN_RATIO_MAX = 2.0
 # Max age the synth-trip baseline can be before we discard it. Without
 # this, `_async_check_odo_jump` happily uses `_last_idle_odo` from
 # yesterday as the start anchor for today's drive, producing 10 h
@@ -249,6 +294,10 @@ class TripInProgress:
     # never under-reported due to stale SoC.
     energy_from_power_kwh: float = 0.0
     last_abs_power_kw: float | None = None
+    # v0.5.41 — counts live_tick invocations to schedule periodic
+    # update_entity force-refreshes (denser GPS during the drive
+    # than the upstream's natural cadence delivers).
+    live_tick_count: int = 0
 
 
 @dataclass
@@ -1835,7 +1884,7 @@ class EvTripLoggerCoordinator:
         self._notify_listeners()
 
     def _resolve_soc_start(
-        self, now: datetime
+        self, now: datetime, *, suppress_snap: bool = False
     ) -> tuple[float | None, str]:
         """Return (soc_pct, source_tag) for a trip about to open.
 
@@ -1908,8 +1957,14 @@ class EvTripLoggerCoordinator:
         #   - no charge ended since the last trip closed
         #   - current SoC is in [last.soc_end - 2, last.soc_end]
         #     (positive-only gap; real charges are handled by branch (a))
+        #
+        # v0.5.41 — suppress_snap is True when _open_trip already
+        # detected a km gap and will insert an orphan trip to absorb
+        # the missing distance + SoC. Snapping in that case would
+        # steal the SoC the orphan needs.
         if (
-            lt is not None
+            not suppress_snap
+            and lt is not None
             and lt.ended_at is not None
             and lt.soc_end is not None
             and (now - lt.ended_at) <= _SHORT_PARK_SNAP_WINDOW
@@ -1938,6 +1993,149 @@ class EvTripLoggerCoordinator:
             return float(current), "post_on_sample"
         return None, "unavailable"
 
+    def _detect_orphan_gap(
+        self, now: datetime, odometer: float | None
+    ) -> tuple[TripRecord, float] | None:
+        """Decide whether a km gap with the previous trip warrants an
+        orphan-trip record. Returns (last_trip, km_gap) if yes, else None.
+
+        Conditions:
+          - last_trip exists with ended_at + odometer_end
+          - elapsed since prev close ≤ _ORPHAN_MAX_DURATION_S
+          - km_gap ∈ (_ORPHAN_MIN_KM_GAP, _ORPHAN_MAX_KM_GAP]
+
+        Anything outside these guards is either pure noise (snap_short_park
+        territory) or implausible (odometer glitch) and should not produce
+        a synthetic record.
+        """
+        lt = self.last_trip
+        if lt is None or lt.ended_at is None or lt.odometer_end is None:
+            return None
+        if odometer is None:
+            return None
+        elapsed_s = (now - lt.ended_at).total_seconds()
+        if elapsed_s <= 0 or elapsed_s > _ORPHAN_MAX_DURATION_S:
+            return None
+        km_gap = float(odometer) - float(lt.odometer_end)
+        if not (_ORPHAN_MIN_KM_GAP < km_gap <= _ORPHAN_MAX_KM_GAP):
+            return None
+        return lt, km_gap
+
+    async def _async_insert_orphan_trip(
+        self,
+        last_trip: TripRecord,
+        now: datetime,
+        new_odo: float | None,
+        new_soc: float | None,
+        km_gap: float,
+    ) -> None:
+        """Persist a synthetic trip covering the gap between two real
+        trips. Classifies via the observed SoC drop against the expected
+        drop from km × default consumption.
+
+        Confidence tags:
+          'orphan'         → km and SoC both consistent → real missed drive.
+          'orphan_odo_only'→ km present but SoC drop ≈ 0 → previous trip's
+                             odometer_end was stale (the km are really the
+                             tail of the previous drive). Energy fields
+                             stay NULL to avoid double-counting.
+
+        Bails (without inserting) when the SoC moves UP between trips
+        (a charge happened — handled by _resolve_soc_start's branch a)
+        or when the SoC↔km ratio is so far off that we can't tell what
+        kind of event we're looking at.
+        """
+        if last_trip.ended_at is None or last_trip.odometer_end is None:
+            return
+        if new_odo is None:
+            return
+        # SoC going UP between trips means a charge slipped through.
+        # Branch (a) of _resolve_soc_start handles that anchor; we do
+        # not want to invent an orphan over a charge.
+        soc_gap: float | None = None
+        if last_trip.soc_end is not None and new_soc is not None:
+            soc_gap = float(last_trip.soc_end) - float(new_soc)
+            if soc_gap < -0.5:
+                _LOGGER.info(
+                    "Orphan skipped: SoC rose %.1f%% between trips "
+                    "(charge likely happened — handled by anchor branch)",
+                    -soc_gap,
+                )
+                return
+
+        duration_s = max(0.0, (now - last_trip.ended_at).total_seconds())
+        duration_min = duration_s / 60.0
+
+        # Classify by SoC↔km consistency.
+        confidence: str
+        soc_used_pct: float | None
+        energy_kwh: float | None
+        consumption: float | None
+        if soc_gap is None or soc_gap < 0.5:
+            confidence = "orphan_odo_only"
+            soc_used_pct = None
+            energy_kwh = None
+            consumption = None
+        else:
+            expected_soc = km_gap * _ORPHAN_DEFAULT_KWH_100KM / self._battery_capacity
+            ratio = (
+                soc_gap / expected_soc if expected_soc > 0 else float("inf")
+            )
+            if _ORPHAN_RATIO_MIN <= ratio <= _ORPHAN_RATIO_MAX:
+                confidence = "orphan"
+                soc_used_pct = soc_gap
+                energy_kwh = (soc_gap / 100.0) * self._battery_capacity
+                consumption = (
+                    (energy_kwh / km_gap * 100.0) if km_gap > 0 else None
+                )
+            else:
+                # Inconsistent — log + skip rather than fabricate numbers
+                # that the dashboard can't reason about.
+                _LOGGER.info(
+                    "Orphan candidate rejected: km_gap=%.2f soc_gap=%.2f "
+                    "expected=%.2f ratio=%.2f",
+                    km_gap, soc_gap, expected_soc, ratio,
+                )
+                return
+
+        avg_speed = (
+            (km_gap / (duration_min / 60.0))
+            if duration_min > 0 and km_gap > 0
+            else None
+        )
+        # Reject implausible average speeds (sensor glitch / overlap).
+        if avg_speed is not None and avg_speed > 300:
+            avg_speed = None
+
+        record = TripRecord(
+            started_at=last_trip.ended_at,
+            ended_at=now,
+            duration_min=duration_min,
+            distance_km=km_gap,
+            odometer_start=last_trip.odometer_end,
+            odometer_end=new_odo,
+            soc_start=last_trip.soc_end,
+            soc_end=new_soc,
+            soc_used_pct=soc_used_pct,
+            energy_kwh=energy_kwh,
+            consumption_kwh_100km=consumption,
+            avg_speed_kmh=avg_speed,
+            origin=last_trip.destination,
+            destination=None,
+            confidence=confidence,
+        )
+        try:
+            trip_id = await self.storage.async_insert(record)
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.warning("Orphan trip insert failed: %s", exc)
+            return
+        record.trip_id = trip_id
+        _LOGGER.info(
+            "Orphan trip inserted (%s): %.2f km, soc %s→%s, duration %.1f min",
+            confidence, km_gap, last_trip.soc_end, new_soc, duration_min,
+        )
+        self._notify_trip_log_listeners()
+
     def _open_trip(self, now: datetime) -> None:
         # If a synth-trip finalize was pending, cancel it — the live trip
         # will own the distance from here on.
@@ -1946,7 +2144,19 @@ class EvTripLoggerCoordinator:
             self._unsub_synth_finalize = None
         self._synth_baseline = None
         odometer = self._read_float(self._odometer)
-        soc, soc_source = self._resolve_soc_start(now)
+        # v0.5.41 — detect a km gap with the previous trip BEFORE
+        # resolving SoC. If a gap is found, suppress the snap-on-
+        # short-park branch (otherwise it would consume the SoC the
+        # orphan needs to absorb) and schedule the orphan insert.
+        orphan_payload = self._detect_orphan_gap(now, odometer)
+        soc, soc_source = self._resolve_soc_start(
+            now, suppress_snap=orphan_payload is not None
+        )
+        if orphan_payload is not None:
+            last_trip, km_gap = orphan_payload
+            self.hass.async_create_task(
+                self._async_insert_orphan_trip(last_trip, now, odometer, soc, km_gap)
+            )
         location = self._read_str(self._location) if self._location else None
         temp = self._read_float(self._temp) if self._temp else None
 
@@ -2055,19 +2265,74 @@ class EvTripLoggerCoordinator:
         # GPS sampling — read configured location entity's lat/lon attributes
         # and store one sample per tick while the trip is open. The samples
         # are persisted on close via storage.async_insert_positions.
+        #
+        # v0.5.41 — dedupe against the most recent sample to avoid storing
+        # 60 identical points per 30 min trip (the upstream cadence is ~8
+        # min on BYD, so 90 % of 30 s ticks landed on stale state). Also
+        # force-refresh the upstream every _LOCATION_REFRESH_EVERY_N_TICKS
+        # so the dashboard route is denser than the natural cadence.
         if self._location:
             state = self.hass.states.get(self._location)
             if state is not None:
-                lat = state.attributes.get("latitude")
-                lon = state.attributes.get("longitude")
-                if lat is not None and lon is not None:
+                lat_raw = state.attributes.get("latitude")
+                lon_raw = state.attributes.get("longitude")
+                if lat_raw is not None and lon_raw is not None:
                     try:
-                        self.current.gps_samples.append(
-                            (now, float(lat), float(lon))
-                        )
+                        lat = float(lat_raw)
+                        lon = float(lon_raw)
                     except (TypeError, ValueError):
-                        pass
+                        lat = lon = None  # type: ignore[assignment]
+                    if lat is not None and lon is not None:
+                        prev = (
+                            self.current.gps_samples[-1]
+                            if self.current.gps_samples else None
+                        )
+                        if prev is None or (
+                            abs(lat - prev[1]) >= _GPS_DUP_EPSILON
+                            or abs(lon - prev[2]) >= _GPS_DUP_EPSILON
+                        ):
+                            self.current.gps_samples.append((now, lat, lon))
+        # Periodic upstream poll-nudge so denser GPS data lands while
+        # the trip is in progress (above & beyond what the integration
+        # natively reports).
+        self.current.live_tick_count += 1
+        if (
+            self.current.live_tick_count % _LOCATION_REFRESH_EVERY_N_TICKS == 0
+            and self._location
+        ):
+            self.hass.async_create_task(self._async_force_refresh_location())
         self._notify_listeners()
+
+    async def _async_force_refresh_location(self) -> None:
+        """Ask HA to refresh the location entity (and battery/odometer
+        when available) so denser samples land mid-trip. Cloud-polled
+        integrations (BYD, Tesla Fleet) honour homeassistant.update_entity
+        by triggering a fresh upstream fetch.
+
+        Best-effort — any error is swallowed; if the platform doesn't
+        support update_entity we still have the natural cadence.
+        """
+        targets: list[str] = []
+        if self._location:
+            targets.append(self._location)
+        # Including battery + odometer here means SoC samples are also
+        # denser during the drive — feeds _resolve_soc_start's ring
+        # buffer for the next trip too.
+        if self._battery:
+            targets.append(self._battery)
+        if self._odometer:
+            targets.append(self._odometer)
+        if not targets:
+            return
+        try:
+            await self.hass.services.async_call(
+                "homeassistant",
+                "update_entity",
+                {"entity_id": targets},
+                blocking=False,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug("update_entity refresh failed: %s", exc)
 
     def _cancel_live_tick(self) -> None:
         if self._unsub_live_tick is not None:
