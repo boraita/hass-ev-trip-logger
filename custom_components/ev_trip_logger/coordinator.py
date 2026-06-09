@@ -85,10 +85,12 @@ _LIVE_TICK = timedelta(seconds=30)
 # Tesla Fleet) typically push location every ~8 min on their natural
 # cadence; without a nudge we get 3–4 GPS points on a 30 min drive.
 # update_entity asks the platform to refresh on demand; integrations
-# that support it (BYD does) push fresh lat/lon shortly after. Every
-# 4 ticks (= 120 s) yields ~15 GPS samples on a 30 min drive without
-# spamming the upstream so hard that we risk rate-limiting.
-_LOCATION_REFRESH_EVERY_N_TICKS = 4
+# that support it (BYD does) push fresh lat/lon shortly after.
+# v0.5.42 — relaxed to 10 ticks (= 300 s / 5 min). Every-2-min was
+# polling BYD ~4x harder than its natural cadence; 5 min still adds
+# 1–2 extra samples per 30 min trip without risking rate-limit on the
+# shared BYD account.
+_LOCATION_REFRESH_EVERY_N_TICKS = 10
 # ~1 m at the equator — drop duplicates from cloud cache without
 # losing real movement. Shared between _capture_location_sample and
 # _async_live_tick so both branches dedupe consistently.
