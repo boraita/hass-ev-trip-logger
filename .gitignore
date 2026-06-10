@@ -20,3 +20,4 @@ htmlcov/
 .dev/config/*
 !.dev/config/configuration.yaml
 
+.venv-test/

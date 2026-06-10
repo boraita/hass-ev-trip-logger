@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .const import STORAGE_FILENAME_TEMPLATE
 
@@ -102,7 +103,12 @@ CREATE TABLE IF NOT EXISTS trips (
     --                                     previous odo_end was stale,
     --                                     km belong to the prior
     --                                     drive. Energy fields NULL.
-    confidence TEXT
+    confidence TEXT,
+    -- v0.5.43: who drove. State of the configured driver sensor
+    -- (e.g. the car's "connected bluetooth device" entity) captured
+    -- while the trip was open. NULL when no sensor is configured or
+    -- nobody was identified. Powers the per-driver km/hours stats.
+    driver TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -182,6 +188,8 @@ class TripRecord:
     kwh_charged_before: float | None = None
     kwh_charged_during: float | None = None
     confidence: str | None = None
+    # v0.5.43: driver identity captured from the configured driver sensor.
+    driver: str | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -223,6 +231,7 @@ class TripRecord:
             "soc_start_source": self.soc_start_source,
             "energy_source": self.energy_source,
             "energy_from_power": self.energy_from_power,
+            "driver": self.driver,
         }
 
 
@@ -333,6 +342,9 @@ class TripStorage:
                 conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
         if "confidence" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN confidence TEXT")
+        # v0.5.43: per-trip driver identity.
+        if "driver" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN driver TEXT")
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
@@ -379,8 +391,8 @@ class TripStorage:
                     start_address, end_address,
                     soc_start_source, energy_source, energy_from_power,
                     gps_distance_km, kwh_charged_before, kwh_charged_during,
-                    confidence
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    confidence, driver
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -417,6 +429,7 @@ class TripStorage:
                     record.kwh_charged_before,
                     record.kwh_charged_during,
                     record.confidence,
+                    record.driver,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -454,6 +467,7 @@ class TripStorage:
         "journey_id", "start_lat", "start_lon", "end_lat", "end_lon",
         "start_address", "end_address", "gps_distance_km",
         "kwh_charged_before", "kwh_charged_during", "confidence",
+        "driver",
     })
 
     async def async_trip_overlaps(
@@ -599,10 +613,13 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._get_last)
 
     def _get_last(self) -> TripRecord | None:
+        # Chronologically newest, NOT highest id: a manual backfill or a
+        # recovery insert can add an OLDER trip with a higher rowid, and
+        # the journey/SoC state machines key off last_trip.ended_at.
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT * FROM trips ORDER BY id DESC LIMIT 1"
+                "SELECT * FROM trips ORDER BY ended_at DESC, id DESC LIMIT 1"
             ).fetchone()
         return _row_to_record(row) if row else None
 
@@ -1000,10 +1017,11 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._get_last_charge)
 
     def _get_last_charge(self) -> ChargeRecord | None:
+        # Chronologically newest — see _get_last for why id-order is wrong.
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT * FROM charges ORDER BY id DESC LIMIT 1"
+                "SELECT * FROM charges ORDER BY ended_at DESC, id DESC LIMIT 1"
             ).fetchone()
         return _row_to_charge(row) if row else None
 
@@ -1646,7 +1664,10 @@ class TripStorage:
 
     def _daily_km_window(self, days: int) -> list[dict[str, Any]]:
         from datetime import timedelta as _td
-        cutoff = (datetime.now() - _td(days=days)).date().isoformat()
+        # dt_util.now() (HA-configured timezone), NOT datetime.now()
+        # (host OS timezone) — stored timestamps come from dt_util.now(),
+        # so day boundaries must use the same clock.
+        cutoff = (dt_util.now() - _td(days=days)).date().isoformat()
         with sqlite3.connect(self._path) as conn:
             rows = conn.execute(
                 """
@@ -1662,7 +1683,7 @@ class TripStorage:
         # Zero-fill the full window so chart renderers don't draw gaps.
         out: list[dict[str, Any]] = []
         for i in range(days, -1, -1):
-            d = (datetime.now() - _td(days=i)).date().isoformat()
+            d = (dt_util.now() - _td(days=i)).date().isoformat()
             out.append({"day": d, "distance_km": round(by_day.get(d, 0.0), 1)})
         return out
 
@@ -1682,7 +1703,7 @@ class TripStorage:
 
     def _trip_patterns(self, days: int) -> dict[str, Any]:
         from datetime import timedelta as _td
-        cutoff = (datetime.now() - _td(days=days)).isoformat()
+        cutoff = (dt_util.now() - _td(days=days)).isoformat()
         with sqlite3.connect(self._path) as conn:
             rows = conn.execute(
                 "SELECT started_at, distance_km FROM trips WHERE started_at >= ?",
@@ -1729,6 +1750,7 @@ class TripStorage:
                     AVG(energy_kwh) AS e,
                     AVG(consumption_kwh_100km) AS c,
                     AVG(avg_speed_kmh) AS s,
+                    AVG(regen_kwh) AS r,
                     SUM(duration_min) AS total_driving,
                     COUNT(*) AS n
                 FROM trips
@@ -1736,16 +1758,64 @@ class TripStorage:
                 """,
                 (since.isoformat(),),
             ).fetchone()
-        d, dur, e, c, s, total_driving, n = row
+        d, dur, e, c, s, r, total_driving, n = row
         return {
             "avg_distance_km": float(d) if d else None,
             "avg_duration_min": float(dur) if dur else None,
             "avg_energy_kwh": float(e) if e else None,
             "avg_consumption_kwh_100km": float(c) if c else None,
             "avg_speed_kmh": float(s) if s else None,
+            # AVG() skips NULL rows, so trips without a power sensor
+            # don't drag the regen mean toward zero.
+            "avg_regen_kwh": float(r) if r else None,
             "driving_time_min": float(total_driving) if total_driving else 0.0,
             "count": int(n or 0),
         }
+
+    async def async_driver_stats(
+        self, since: datetime
+    ) -> list[dict[str, Any]]:
+        """Per-driver usage over the window: trips, km, driving hours, energy.
+
+        v0.5.43 — powers the 'who drives how much' panel. Trips with
+        driver=NULL (no driver sensor configured, or nobody identified)
+        are grouped under the 'unknown' bucket so totals still add up.
+        """
+        return await self._hass.async_add_executor_job(
+            self._driver_stats, since
+        )
+
+    def _driver_stats(self, since: datetime) -> list[dict[str, Any]]:
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    COALESCE(driver, 'unknown') AS drv,
+                    COUNT(*) AS trips,
+                    COALESCE(SUM(distance_km), 0) AS km,
+                    COALESCE(SUM(duration_min), 0) AS minutes,
+                    COALESCE(SUM(energy_kwh), 0) AS kwh,
+                    AVG(consumption_kwh_100km) AS cons
+                FROM trips
+                WHERE started_at >= ?
+                GROUP BY drv
+                ORDER BY km DESC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+        return [
+            {
+                "driver": r[0],
+                "trips": int(r[1]),
+                "distance_km": round(float(r[2]), 1),
+                "hours": round(float(r[3]) / 60.0, 1),
+                "energy_kwh": round(float(r[4]), 2),
+                "avg_consumption_kwh_100km": (
+                    round(float(r[5]), 1) if r[5] is not None else None
+                ),
+            }
+            for r in rows
+        ]
 
     async def async_tops_lists(self, limit: int = 9) -> dict[str, list[dict[str, Any]]]:
         """Top-N trips per criterion (distance, duration, consumption, efficiency, speed)."""
@@ -1877,6 +1947,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         kwh_charged_before=row["kwh_charged_before"] if "kwh_charged_before" in row.keys() else None,
         kwh_charged_during=row["kwh_charged_during"] if "kwh_charged_during" in row.keys() else None,
         confidence=row["confidence"] if "confidence" in row.keys() else None,
+        driver=row["driver"] if "driver" in row.keys() else None,
     )
 
 

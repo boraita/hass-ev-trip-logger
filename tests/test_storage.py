@@ -121,6 +121,7 @@ async def test_aggregates_when_empty(storage: TripStorage) -> None:
     assert aggs == {
         "distance_km": 0.0,
         "energy_kwh": 0.0,
+        "regen_kwh": 0.0,
         "cost": 0.0,
         "count": 0,
         "avg_consumption_kwh_100km": 0.0,

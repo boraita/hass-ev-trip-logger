@@ -19,6 +19,7 @@
           "charge_sensor": "Charging binary sensor (for auto-detect)",
           "location_tracker": "Location entity (device_tracker, person, input_select…)",
           "exterior_temp_sensor": "Exterior temperature sensor",
+          "driver_sensor": "Driver sensor (e.g. bluetooth connected device)",
           "battery_capacity_kwh": "Battery capacity (kWh)",
           "min_trip_distance_km": "Minimum trip distance (km)",
           "idle_timeout_minutes": "Idle timeout (min)",
@@ -130,7 +131,10 @@
       "recent_journeys": { "name": "Recent journeys" },
       "battery_energy": { "name": "Battery energy" },
       "energy_to_full": { "name": "Energy to full charge" },
-      "battery_state": { "name": "Battery percent" }
+      "battery_state": { "name": "Battery percent" },
+      "current_driver": { "name": "Current driver" },
+      "driver_stats": { "name": "Driver stats (30 days)" },
+      "avg_trip_regen": { "name": "Avg trip regen (30 days)" }
     }
   }
 }

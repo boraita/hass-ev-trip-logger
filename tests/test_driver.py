@@ -1,0 +1,163 @@
+"""Tests for v0.5.43 driver capture and the zero-reading close fix."""
+from __future__ import annotations
+
+from datetime import timedelta
+
+import pytest
+from homeassistant.const import STATE_OFF, STATE_ON
+from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
+
+from custom_components.ev_trip_logger.const import (
+    CONF_BATTERY,
+    CONF_BATTERY_CAPACITY,
+    CONF_DRIVER_SENSOR,
+    CONF_IDLE_TIMEOUT,
+    CONF_MIN_TRIP_DISTANCE,
+    CONF_NAME,
+    CONF_ODOMETER,
+    CONF_VEHICLE_ON,
+    DOMAIN,
+)
+
+ODO = "sensor.odometer"
+BAT = "sensor.battery"
+VOK = "binary_sensor.vehicle_on"
+DRV = "sensor.bt_connected_device"
+
+
+async def _setup(hass: HomeAssistant, **overrides) -> MockConfigEntry:
+    hass.states.async_set(ODO, str(overrides.pop("odo", 1000.0)))
+    hass.states.async_set(BAT, str(overrides.pop("bat", 80.0)))
+    hass.states.async_set(VOK, STATE_ON if overrides.pop("on", False) else STATE_OFF)
+    data = {
+        CONF_NAME: "Test EV",
+        CONF_ODOMETER: ODO,
+        CONF_BATTERY: BAT,
+        CONF_VEHICLE_ON: VOK,
+        CONF_BATTERY_CAPACITY: 75.0,
+        CONF_MIN_TRIP_DISTANCE: 0.5,
+        CONF_IDLE_TIMEOUT: 1,
+        CONF_DRIVER_SENSOR: DRV,
+    }
+    data.update(overrides)
+    entry = MockConfigEntry(domain=DOMAIN, data=data, title="Test EV")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
+
+
+async def _advance(hass: HomeAssistant, minutes: float) -> None:
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=minutes))
+    await hass.async_block_till_done()
+
+
+async def _drive(hass: HomeAssistant, *, odo_end: str, bat_end: str) -> None:
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, odo_end)
+    hass.states.async_set(BAT, bat_end)
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    # Idle window (1 min) must elapse before the close fires.
+    await _advance(hass, 2)
+
+
+async def test_driver_captured_at_trip_open(hass: HomeAssistant) -> None:
+    """Driver sensor state at ignition is persisted on the trip record."""
+    hass.states.async_set(DRV, "Rafa iPhone")
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    await _drive(hass, odo_end="1015", bat_end="70")
+
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.driver == "Rafa iPhone"
+
+    stored = await coordinator.storage.async_get_last()
+    assert stored is not None
+    assert stored.driver == "Rafa iPhone"
+
+
+async def test_driver_none_states_ignored(hass: HomeAssistant) -> None:
+    """'not_connected'-style states mean nobody identified — driver stays NULL."""
+    hass.states.async_set(DRV, "not_connected")
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    await _drive(hass, odo_end="1015", bat_end="70")
+
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.driver is None
+
+
+async def test_driver_resolved_late_via_close_read(hass: HomeAssistant) -> None:
+    """BT pairs after ignition: unknown at open, resolved by trip close."""
+    hass.states.async_set(DRV, "not_connected")
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current is not None
+    assert coordinator.current.driver is None
+
+    # Phone connects mid-trip.
+    hass.states.async_set(DRV, "Maria Pixel")
+    hass.states.async_set(ODO, "1015")
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 2)
+
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.driver == "Maria Pixel"
+
+
+async def test_driver_stats_groups_by_driver(hass: HomeAssistant) -> None:
+    """async_driver_stats aggregates km/hours per driver with unknown bucket."""
+    hass.states.async_set(DRV, "Rafa iPhone")
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    await _drive(hass, odo_end="1015", bat_end="70")
+    hass.states.async_set(DRV, "Maria Pixel")
+    await _drive(hass, odo_end="1035", bat_end="60")
+
+    rows = await coordinator.storage.async_driver_stats(
+        dt_util.now() - timedelta(days=1)
+    )
+    by_driver = {r["driver"]: r for r in rows}
+    assert by_driver["Rafa iPhone"]["distance_km"] == pytest.approx(15.0)
+    assert by_driver["Rafa iPhone"]["trips"] == 1
+    assert by_driver["Maria Pixel"]["distance_km"] == pytest.approx(20.0)
+
+
+async def test_zero_soc_at_close_is_not_discarded(hass: HomeAssistant) -> None:
+    """A legitimate 0 % SoC reading at close must not fall back to stale data."""
+    entry = await _setup(hass, bat=10.0)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(DRV, "Rafa iPhone")
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+
+    hass.states.async_set(ODO, "1060")
+    hass.states.async_set(BAT, "0")
+    await hass.async_block_till_done()
+
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 2)
+
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.soc_end == pytest.approx(0.0)
+    assert coordinator.last_trip.soc_used_pct == pytest.approx(10.0)

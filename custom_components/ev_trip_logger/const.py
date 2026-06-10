@@ -24,6 +24,18 @@ CONF_PLUG_SENSOR: Final = "plug_sensor"
 # 'reconstructed_polling_paused' so the dashboard can show low
 # confidence.
 CONF_POLLING_PAUSED_SENSOR: Final = "polling_paused_sensor"
+# v0.5.43 — optional driver-identity sensor. Any entity whose state
+# names the person currently using the car: the manufacturer
+# integration's "connected bluetooth device" sensor, an input_select
+# the household toggles, or a template sensor mapping BT MAC → person.
+# Captured at trip open (re-checked during the trip until it resolves)
+# and persisted per trip, enabling per-driver km/hours stats.
+CONF_DRIVER_SENSOR: Final = "driver_sensor"
+# Driver-sensor states that mean "nobody identified". Compared
+# case-insensitively after stripping.
+DRIVER_NONE_STATES: Final = frozenset(
+    {"none", "off", "not_connected", "disconnected", "no_device", "-", "null"}
+)
 # v0.5.38 — optional list of numeric sensors whose 7d / 30d averages
 # the integration will expose. Typical use: BYD's energy snapshot
 # entities (today's consumption, last-50km kWh, lifetime average,

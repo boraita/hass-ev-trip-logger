@@ -95,6 +95,7 @@ _SCHEMA_LOG_MANUAL_TRIP = _SCHEMA_ENTRY.extend(
         vol.Optional("avg_temp_c"): vol.Coerce(float),
         vol.Optional("origin"): cv.string,
         vol.Optional("destination"): cv.string,
+        vol.Optional("driver"): cv.string,
     }
 )
 
@@ -134,6 +135,7 @@ _SCHEMA_SET_TRIP = vol.All(
             vol.Optional("end_lon"): vol.Coerce(float),
             vol.Optional("start_address"): cv.string,
             vol.Optional("end_address"): cv.string,
+            vol.Optional("driver"): cv.string,
         }
     ),
 )
@@ -248,6 +250,7 @@ def async_register_services(hass: HomeAssistant) -> None:
                 avg_temp_c=call.data.get("avg_temp_c"),
                 origin=call.data.get("origin"),
                 destination=call.data.get("destination"),
+                driver=call.data.get("driver"),
             )
 
     hass.services.async_register(DOMAIN, SERVICE_START_TRIP, _start, schema=_SCHEMA_ENTRY)

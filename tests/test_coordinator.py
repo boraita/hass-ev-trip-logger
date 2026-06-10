@@ -140,7 +140,8 @@ async def test_vehicle_off_closes_trip_immediately(hass: HomeAssistant) -> None:
     hass.states.async_set(VOK, STATE_OFF)
     await hass.async_block_till_done()
 
-    # No idle window — closed immediately.
+    # Off-edge debounce (3 s) + idle window (1 min) must elapse.
+    await _advance(hass, 2)
     assert coordinator.current is None
     assert coordinator.last_trip is not None
     assert coordinator.last_trip.distance_km == pytest.approx(15.0)
@@ -1252,7 +1253,10 @@ async def test_recent_trips_attr_exposes_full_schema(hass: HomeAssistant) -> Non
         assert key in t, f"missing key: {key}"
     assert t["max_speed_kmh"] in (118, 119)  # banker's rounding 118.5→118
     assert t["regen_kwh"] == 1.84
-    assert t["destination"] == "Trabajo ele "
+    # v0.5.19 — `destination` is humanized (stripped); the raw
+    # device_tracker state (trailing space included) lives in _raw.
+    assert t["destination"] == "Trabajo ele"
+    assert t["destination_raw"] == "Trabajo ele "
 
 
 async def test_recent_charges_attr_exposes_full_schema(hass: HomeAssistant) -> None:
@@ -1439,7 +1443,7 @@ async def test_v050_calendar_entity_emits_daily_events(hass: HomeAssistant) -> N
     )
     # Two days have activity → two events.
     assert len(events) == 2
-    # Today event should mention 2 viajes + 23 km.
+    # Today event should mention 2 trips + 23 km.
     today_evt = [e for e in events if e.start == today.date()][0]
-    assert "2 viajes" in today_evt.summary
+    assert "2 trips" in today_evt.summary
     assert "23" in today_evt.summary  # 12 + 11 km

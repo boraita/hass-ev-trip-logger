@@ -5,6 +5,7 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.loader import async_get_integration
 
 from .const import DOMAIN, PLATFORMS
 from .coordinator import EvTripLoggerCoordinator
@@ -19,7 +20,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     storage = TripStorage(hass, entry.entry_id)
     await storage.async_init()
 
-    coordinator = EvTripLoggerCoordinator(hass, entry, storage)
+    integration = await async_get_integration(hass, DOMAIN)
+    coordinator = EvTripLoggerCoordinator(
+        hass, entry, storage, version=str(integration.version)
+    )
     await coordinator.async_start()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator

@@ -19,6 +19,7 @@
           "charge_sensor": "Charging binary sensor (for auto-detect)",
           "location_tracker": "Location entity (device_tracker, person, input_select…)",
           "exterior_temp_sensor": "Exterior temperature sensor",
+          "driver_sensor": "Driver sensor (e.g. bluetooth connected device)",
           "battery_capacity_kwh": "Battery capacity (kWh)",
           "min_trip_distance_km": "Minimum trip distance (km)",
           "idle_timeout_minutes": "Idle timeout (min)",
@@ -49,6 +50,7 @@
           "plug_sensor": "Cable-plugged binary sensor — merges pulses while cable stays connected",
           "location_tracker": "Location entity (device_tracker, person, input_select…) — origin/destination + journey close on home",
           "exterior_temp_sensor": "Outside temperature sensor — enables avg_temp and consumption-by-temp",
+          "driver_sensor": "Driver sensor — entity whose state names who is driving (BT connected device, input_select...)",
           "speed_sensor": "Speed sensor (km/h) — enables max_speed",
           "battery_capacity_kwh": "Battery capacity (kWh)",
           "min_trip_distance_km": "Minimum trip distance (km)",
@@ -189,9 +191,12 @@
       "avg_trip_distance": { "name": "Avg trip distance (30 days)" },
       "avg_trip_duration": { "name": "Avg trip duration (30 days)" },
       "avg_trip_speed": { "name": "Avg trip speed (30 days)" },
+      "avg_trip_regen": { "name": "Avg trip regen (30 days)" },
       "driving_time_30d": { "name": "Driving time (30 days)" },
       "avg_charge_kwh_30d": { "name": "Avg charge energy (30 days)" },
-      "avg_charge_cost_30d": { "name": "Avg charge cost (30 days)" }
+      "avg_charge_cost_30d": { "name": "Avg charge cost (30 days)" },
+      "current_driver": { "name": "Current driver" },
+      "driver_stats": { "name": "Driver stats (30 days)" }
     },
     "calendar": {
       "activity": { "name": "Activity" }

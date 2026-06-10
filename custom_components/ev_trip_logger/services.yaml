@@ -262,6 +262,11 @@ log_manual_trip:
       description: Free-text location label.
       selector:
         text:
+    driver:
+      name: Driver
+      description: Who drove (free text, e.g. the person's name).
+      selector:
+        text:
     entry_id:
       name: Entry ID
       description: Restrict the action to a specific config entry.
@@ -348,6 +353,11 @@ set_trip:
         text:
     destination:
       name: Destination
+      selector:
+        text:
+    driver:
+      name: Driver
+      description: Who drove (free text). Use to backfill or correct trips.
       selector:
         text:
     cost:

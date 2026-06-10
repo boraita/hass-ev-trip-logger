@@ -19,6 +19,7 @@
           "charge_sensor": "Binary sensor de carga (para auto-detección)",
           "location_tracker": "Entidad de ubicación (device_tracker, person, input_select…)",
           "exterior_temp_sensor": "Sensor de temperatura exterior",
+          "driver_sensor": "Sensor de conductor (p. ej. dispositivo bluetooth conectado)",
           "battery_capacity_kwh": "Capacidad de batería (kWh)",
           "min_trip_distance_km": "Distancia mínima por viaje (km)",
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
@@ -49,6 +50,7 @@
           "plug_sensor": "Binary sensor cable enchufado — fusiona pulsos mientras el cable siga conectado",
           "location_tracker": "Entidad de ubicación (device_tracker, person, input_select…) — origen/destino + cierre de journey al llegar a casa",
           "exterior_temp_sensor": "Sensor de temperatura exterior — habilita avg_temp y consumo por temperatura",
+          "driver_sensor": "Sensor de conductor — entidad cuyo estado indica quién conduce (BT conectado, input_select...)",
           "speed_sensor": "Sensor de velocidad (km/h) — habilita max_speed",
           "battery_capacity_kwh": "Capacidad de batería (kWh)",
           "min_trip_distance_km": "Distancia mínima por viaje (km)",
@@ -189,9 +191,12 @@
       "avg_trip_distance": { "name": "Distancia media por viaje (30 días)" },
       "avg_trip_duration": { "name": "Duración media por viaje (30 días)" },
       "avg_trip_speed": { "name": "Velocidad media por viaje (30 días)" },
+      "avg_trip_regen": { "name": "Regeneración media por viaje (30 días)" },
       "driving_time_30d": { "name": "Tiempo conduciendo (30 días)" },
       "avg_charge_kwh_30d": { "name": "Energía media por carga (30 días)" },
-      "avg_charge_cost_30d": { "name": "Coste medio por carga (30 días)" }
+      "avg_charge_cost_30d": { "name": "Coste medio por carga (30 días)" },
+      "current_driver": { "name": "Conductor actual" },
+      "driver_stats": { "name": "Estadísticas por conductor (30 días)" }
     },
     "calendar": {
       "activity": { "name": "Actividad" }

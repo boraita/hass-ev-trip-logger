@@ -242,13 +242,25 @@ async def async_setup_entry(
     entities.append(BatteryPercentSensor(coordinator))
     entities.append(RangeAtRecentEfficiencySensor(coordinator))
     entities.append(ConsumptionByTempBucketSensor(coordinator))
+    # v0.5.43 — driver identity. Stats work off the DB column (fillable
+    # via set_trip even without a live sensor); the live sensor only
+    # makes sense when a driver sensor is wired.
+    entities.append(DriverStatsSensor(coordinator))
+    if coordinator._driver_sensor:
+        entities.append(CurrentDriverSensor(coordinator))
 
     # v0.5.0 — dashboard-driven additions
     entities.append(MonthlyHistorySensor(coordinator))
     entities.append(DailyKm60dSensor(coordinator))
     entities.append(TripPatternsSensor(coordinator))
     entities.append(TopsSensor(coordinator))
-    for key in ("avg_distance_km", "avg_duration_min", "avg_speed_kmh", "driving_time_min"):
+    for key in (
+        "avg_distance_km",
+        "avg_duration_min",
+        "avg_speed_kmh",
+        "avg_regen_kwh",
+        "driving_time_min",
+    ):
         entities.append(AvgTripMetricsSensor(coordinator, key=key))
     for key in ("avg_kwh", "avg_cost", "avg_soc_start", "avg_soc_end", "avg_soc_added"):
         entities.append(AvgChargeMetricsSensor(coordinator, key=key))
@@ -364,6 +376,7 @@ class LastTripSensor(_BaseTripSensor):
             ),
             "origin_raw": trip.origin,
             "destination_raw": trip.destination,
+            "driver": getattr(trip, "driver", None),
         }
 
 
@@ -465,7 +478,11 @@ class AggregateSensor(_BaseTripSensor):
         "energy_kwh": SensorStateClass.TOTAL_INCREASING,
         "regen_kwh": SensorStateClass.TOTAL_INCREASING,
         "cost": SensorStateClass.TOTAL,
-        "count": SensorStateClass.MEASUREMENT,
+        # v0.5.43 — TOTAL_INCREASING (was MEASUREMENT): the count climbs
+        # within the period and resets at the boundary, which is exactly
+        # the reset semantics LTS understands. Lets statistics-graph
+        # draw monthly trip-count bars (CONTRACT.md §3b).
+        "count": SensorStateClass.TOTAL_INCREASING,
         "avg_consumption_kwh_100km": SensorStateClass.MEASUREMENT,
     }
 
@@ -621,6 +638,9 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         # 'reconstructed_polling_paused'. Dashboards can color rows
         # accordingly.
         "confidence": getattr(trip, "confidence", None),
+        # v0.5.43 — who drove (state of the configured driver sensor,
+        # e.g. the BT-connected phone). NULL when unidentified.
+        "driver": getattr(trip, "driver", None),
     }
 
 
@@ -1608,28 +1628,39 @@ class ChargesAggregateSensor(_BaseTripSensor):
         },
         "count": {
             "device_class": None,
-            "state_class": SensorStateClass.MEASUREMENT,
+            # v0.5.43 — same period-reset semantics as the trip count;
+            # TOTAL_INCREASING gives LTS for monthly charge-count bars.
+            "state_class": SensorStateClass.TOTAL_INCREASING,
             "icon": "mdi:counter",
             "precision": 0,
             "slug": "charges",
         },
+        # v0.5.43 — avg prices switched from MONETARY/no-state-class to
+        # plain MEASUREMENT with a <currency>/kWh unit (CONTRACT.md §3b):
+        # MONETARY forbids MEASUREMENT in HA, and without a state_class
+        # the recorder kept no long-term statistics, so price-trend
+        # graphs were impossible. A price-per-kWh isn't a monetary total
+        # anyway.
         "avg_price_per_kwh": {
-            "device_class": SensorDeviceClass.MONETARY,
-            "state_class": None,
+            "device_class": None,
+            "state_class": SensorStateClass.MEASUREMENT,
+            "per_kwh_unit": True,
             "icon": "mdi:cash",
             "precision": 4,
             "slug": "avg_charge_price",
         },
         "avg_ac_price_per_kwh": {
-            "device_class": SensorDeviceClass.MONETARY,
-            "state_class": None,
+            "device_class": None,
+            "state_class": SensorStateClass.MEASUREMENT,
+            "per_kwh_unit": True,
             "icon": "mdi:home-lightning-bolt",
             "precision": 4,
             "slug": "avg_ac_charge_price",
         },
         "avg_dc_price_per_kwh": {
-            "device_class": SensorDeviceClass.MONETARY,
-            "state_class": None,
+            "device_class": None,
+            "state_class": SensorStateClass.MEASUREMENT,
+            "per_kwh_unit": True,
             "icon": "mdi:ev-station",
             "precision": 4,
             "slug": "avg_dc_charge_price",
@@ -1666,6 +1697,8 @@ class ChargesAggregateSensor(_BaseTripSensor):
             native_unit_of_measurement=(
                 cfg.get("unit")
                 if key == "kwh"
+                else f"{coordinator.currency}/kWh"
+                if cfg.get("per_kwh_unit")
                 else (coordinator.currency if key != "count" else None)
             ),
             device_class=cfg.get("device_class"),
@@ -2013,6 +2046,15 @@ class AvgTripMetricsSensor(_BaseTripSensor):
             "slug": "avg_trip_speed",
             "precision": 1,
         },
+        # v0.5.43 — mean regen recovered per trip over the window. No
+        # ENERGY device_class: HA forbids MEASUREMENT on ENERGY, and an
+        # average is a measurement, not an accumulating total.
+        "avg_regen_kwh": {
+            "unit": UnitOfEnergy.KILO_WATT_HOUR,
+            "icon": "mdi:battery-charging",
+            "slug": "avg_trip_regen",
+            "precision": 2,
+        },
         "driving_time_min": {
             "unit": UnitOfTime.MINUTES,
             "device_class": SensorDeviceClass.DURATION,
@@ -2214,3 +2256,87 @@ class AvgChargeMetricsSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"sample_count": self._count, "window_days": self._WINDOW_DAYS}
+
+
+class CurrentDriverSensor(_BaseTripSensor):
+    """Who is driving right now (v0.5.43).
+
+    State mirrors the active trip's captured driver — i.e. the person
+    whose phone the car's bluetooth picked up. Unknown while idle or
+    when nobody was identified. The last completed trip's driver is
+    exposed as an attribute for "who parked it" questions.
+    """
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="current_driver",
+            translation_key="current_driver",
+            icon="mdi:account-tie-hat",
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_current_driver"
+
+    @property
+    def native_value(self) -> str | None:
+        active = self._coordinator.current
+        if active is not None:
+            return active.driver
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        last = self._coordinator.last_trip
+        return {
+            "trip_active": self._coordinator.current is not None,
+            "last_trip_driver": getattr(last, "driver", None) if last else None,
+        }
+
+
+class DriverStatsSensor(_BaseTripSensor):
+    """Per-driver usage over the last 30 days (v0.5.43).
+
+    State = number of identified drivers in the window. The heavy
+    payload lives in attributes: one row per driver with trips, km,
+    driving hours, energy and mean consumption, plus an 'unknown'
+    bucket so totals always add up. Powers the dashboard's
+    "quién usa el coche" panel.
+    """
+
+    _unrecorded_attributes = frozenset({"drivers"})
+    _WINDOW_DAYS = 30
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="driver_stats",
+            translation_key="driver_stats",
+            icon="mdi:account-group",
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_driver_stats"
+        self._rows: list[dict[str, Any]] = []
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        since = dt_util.now() - timedelta(days=self._WINDOW_DAYS)
+        self._rows = await self._coordinator.storage.async_driver_stats(since)
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return sum(1 for r in self._rows if r.get("driver") != "unknown")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"drivers": self._rows, "window_days": self._WINDOW_DAYS}

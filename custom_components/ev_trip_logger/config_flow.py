@@ -25,6 +25,7 @@ from .const import (
     CONF_BATTERY_CAPACITY,
     CONF_CHARGE_SENSOR,
     CONF_CURRENCY,
+    CONF_DRIVER_SENSOR,
     CONF_ENERGY_PRICE,
     CONF_HOME_ZONE,
     CONF_IDLE_TIMEOUT,
@@ -140,6 +141,22 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="temperature")
+            ),
+            # v0.5.43 — driver identity. Any entity whose state names the
+            # person using the car: the manufacturer's "connected
+            # bluetooth device" sensor, an input_select, or a template
+            # sensor mapping BT MAC → person.
+            _optional(
+                CONF_DRIVER_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(
+                        domain=["sensor", "input_select", "select", "input_text"]
+                    )
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(
+                    domain=["sensor", "input_select", "select", "input_text"]
+                )
             ),
             _optional(
                 CONF_SPEED,

@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from homeassistant.config_entries import ConfigEntry
@@ -50,6 +51,7 @@ from .const import (
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
+    CONF_DRIVER_SENSOR,
     CONF_PLUG_SENSOR,
     CONF_POLLING_PAUSED_SENSOR,
     CONF_TRACKED_SENSORS,
@@ -70,6 +72,7 @@ from .const import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_MIN_TRIP_DISTANCE,
     DEFAULT_RECENT_LIMIT,
+    DRIVER_NONE_STATES,
     EVENT_CHARGE_LOGGED,
     EVENT_TRIP_ENDED,
     EVENT_TRIP_STARTED,
@@ -214,10 +217,11 @@ def _haversine_km(
 
 
 def _route_distance_km(
-    samples: list[tuple[datetime, float, float]] | list[tuple[float, float, float]],
+    samples: "Sequence[tuple[Any, float, float]]",
 ) -> float | None:
     """Sum haversine segments across a sequence of (ts, lat, lon).
-    None if fewer than 2 points.
+    None if fewer than 2 points. Accepts any indexable sequence (list,
+    deque) of (ts, lat, lon)-shaped tuples.
     """
     if not samples or len(samples) < 2:
         return None
@@ -256,6 +260,15 @@ _MAX_POWER_TRAPEZOID_DT_H = 20.0 / 60.0
 # throttle for 10 min" territory, beyond which the sample is junk.
 _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH = 5.0
 
+# v0.5.43 — hard caps on the per-trip in-memory accumulators. A trip
+# whose vehicle_on gets stuck "on" for days (the known BYD cloud failure
+# mode) would otherwise grow gps_samples/temp_samples without bound:
+# the idle watchdog only force-closes when vehicle_on is OFF. 2880
+# samples = 24 h at the 30 s live tick; beyond that the trip is junk
+# anyway and we just stop wasting memory (deque evicts oldest).
+_TRIP_GPS_SAMPLES_MAX = 2880
+_TRIP_TEMP_SAMPLES_MAX = 2880
+
 
 @dataclass
 class TripInProgress:
@@ -265,7 +278,9 @@ class TripInProgress:
     odometer_start: float | None
     soc_start: float | None
     location_start: str | None
-    temp_samples: list[float] = field(default_factory=list)
+    temp_samples: deque[float] = field(
+        default_factory=lambda: deque(maxlen=_TRIP_TEMP_SAMPLES_MAX)
+    )
     max_power: float = 0.0
     max_speed_kmh: float = 0.0
     # Trapezoidal-integrated negative-side battery power (kWh recovered via
@@ -282,11 +297,13 @@ class TripInProgress:
     # because vehicle_on stays "on" through real stops. Updated on every
     # metric-change tick; checked by the idle watchdog.
     last_movement_ts: datetime | None = None
-    # GPS samples accumulated during the trip — list of (ts, lat, lon).
+    # GPS samples accumulated during the trip — (ts, lat, lon) tuples.
     # Persisted to trip_positions on close so the dashboard can render the
     # route map. Sampled by the live-tick callback so cadence is bound to
-    # _LIVE_TICK (30 s by default).
-    gps_samples: list[tuple[datetime, float, float]] = field(default_factory=list)
+    # _LIVE_TICK (30 s by default). Bounded deque: see _TRIP_GPS_SAMPLES_MAX.
+    gps_samples: deque[tuple[datetime, float, float]] = field(
+        default_factory=lambda: deque(maxlen=_TRIP_GPS_SAMPLES_MAX)
+    )
     # v0.5.13: provenance of soc_start, set by resolve_soc_start.
     soc_start_source: str | None = None
     # v0.5.13: independent kWh estimator via ∫|power| dt. When a power
@@ -300,6 +317,11 @@ class TripInProgress:
     # update_entity force-refreshes (denser GPS during the drive
     # than the upstream's natural cadence delivers).
     live_tick_count: int = 0
+    # v0.5.43 — driver identity from the configured driver sensor
+    # (e.g. the car's bluetooth-connected-device entity). Captured at
+    # open; re-checked on every live tick until it resolves, since BT
+    # pairing often completes a few seconds after ignition.
+    driver: str | None = None
 
 
 @dataclass
@@ -323,10 +345,15 @@ class EvTripLoggerCoordinator:
         hass: HomeAssistant,
         entry: ConfigEntry,
         storage: TripStorage,
+        version: str = "unknown",
     ) -> None:
         self.hass = hass
         self.entry = entry
         self.storage = storage
+        # Integration version from manifest.json (passed by async_setup_entry)
+        # — used for outbound User-Agent strings. Never hardcode it here:
+        # the release workflow only bumps the manifest.
+        self._version = version
 
         merged = {**entry.data, **entry.options}
         self._odometer = merged[CONF_ODOMETER]
@@ -382,6 +409,9 @@ class EvTripLoggerCoordinator:
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
         self._speed = merged.get(CONF_SPEED)
+        # v0.5.43 — optional driver-identity sensor (BT connected device,
+        # input_select, template sensor...). State == driver name.
+        self._driver_sensor = merged.get(CONF_DRIVER_SENSOR)
 
         self._battery_capacity = float(
             merged.get(CONF_BATTERY_CAPACITY, DEFAULT_BATTERY_CAPACITY)
@@ -680,7 +710,7 @@ class EvTripLoggerCoordinator:
             }
             headers = {
                 "User-Agent": (
-                    "hass-ev-trip-logger/0.5.39 "
+                    f"hass-ev-trip-logger/{self._version} "
                     "(https://github.com/boraita/hass-ev-trip-logger)"
                 ),
             }
@@ -1455,7 +1485,7 @@ class EvTripLoggerCoordinator:
 
             self.hass.async_create_task(_geocode_synth())
 
-        self.last_trip = record
+        self._adopt_last_trip(record)
         if is_at_home_end and journey_id is not None:
             self.last_completed_journey_id = journey_id
             self.current_journey_id = None
@@ -1801,7 +1831,9 @@ class EvTripLoggerCoordinator:
         if active is None:
             return
         self.current_charge = None
-        soc_end = self._read_float(self._battery) or active.last_seen_soc
+        # None check, not `or` — 0 % is a valid (if grim) reading.
+        soc_read = self._read_float(self._battery)
+        soc_end = soc_read if soc_read is not None else active.last_seen_soc
         # Need at least 2 % SoC delta to count — cloud-polling can wobble by 1 %
         # while sitting plugged in (battery balancing, etc.) and we don't want
         # phantom 0.8 kWh "charges" stomping the user's price corrections.
@@ -1984,11 +2016,12 @@ class EvTripLoggerCoordinator:
             if ts < cutoff:
                 break
             # SoC should be ≥ current — the car only drains after on.
-            # If pre < current, the buffer entry is stale or a top-up
-            # we missed; fall through.
+            # If pre < current, the buffer entry is stale or a noisy dip
+            # (78→77→78 across polls); keep scanning back to the cutoff
+            # for an older-but-valid sample instead of giving up on the
+            # first miss.
             if current is None or soc >= current - 0.5:
                 return float(soc), "pre_on_sample"
-            break
 
         # (c) Fallback to whatever the integration currently reports.
         if current is not None:
@@ -2167,11 +2200,17 @@ class EvTripLoggerCoordinator:
             odometer_start=odometer,
             soc_start=soc,
             location_start=location,
-            temp_samples=[temp] if temp is not None else [],
+            temp_samples=deque(
+                [temp] if temp is not None else [],
+                maxlen=_TRIP_TEMP_SAMPLES_MAX,
+            ),
             last_seen_odometer=odometer,
             last_seen_soc=soc,
             last_movement_ts=now,  # treat trip start as the first movement
             soc_start_source=soc_source,
+            # v0.5.43 — may still be None here (BT pairs a few seconds
+            # after ignition); the live tick keeps retrying.
+            driver=self._read_driver(),
         )
         # v0.5.25 — seed gps_samples with the most-recent buffered
         # sample (if any within the lookback window) so even very short
@@ -2294,6 +2333,12 @@ class EvTripLoggerCoordinator:
                             or abs(lon - prev[2]) >= _GPS_DUP_EPSILON
                         ):
                             self.current.gps_samples.append((now, lat, lon))
+        # v0.5.43 — driver capture retry. BT pairing often completes a
+        # few seconds after ignition, so the open-time read may have
+        # missed it. First non-empty value wins (mid-trip BT handoffs
+        # to a passenger's phone shouldn't reassign the trip).
+        if self.current.driver is None and self._driver_sensor:
+            self.current.driver = self._read_driver()
         # Periodic upstream poll-nudge so denser GPS data lands while
         # the trip is in progress (above & beyond what the integration
         # natively reports).
@@ -2347,8 +2392,13 @@ class EvTripLoggerCoordinator:
             return
         self._cancel_live_tick()
 
-        odometer_end = self._read_float(self._odometer) or active.last_seen_odometer
-        soc_end = self._read_float(self._battery) or active.last_seen_soc
+        # Explicit None checks — `or` would treat a legitimate 0 reading
+        # (0 % SoC, reset odometer) as "unreadable" and silently replace
+        # it with the stale last_seen value.
+        odo_read = self._read_float(self._odometer)
+        odometer_end = odo_read if odo_read is not None else active.last_seen_odometer
+        soc_read = self._read_float(self._battery)
+        soc_end = soc_read if soc_read is not None else active.last_seen_soc
         location_end = self._read_str(self._location) if self._location else None
 
         distance = (
@@ -2537,6 +2587,9 @@ class EvTripLoggerCoordinator:
             # v0.5.35 — live path always tags as 'live' (precise
             # times + full metrics).
             confidence="live",
+            # v0.5.43 — last-chance read in case the live tick never
+            # caught the BT connection (very short trips).
+            driver=active.driver if active.driver is not None else self._read_driver(),
         )
 
         # v0.5.27 — attribute pre/intra-trip charging energy. Lets the
@@ -3101,6 +3154,7 @@ class EvTripLoggerCoordinator:
         avg_temp_c: float | None = None,
         origin: str | None = None,
         destination: str | None = None,
+        driver: str | None = None,
     ) -> TripRecord:
         """Backfill a trip that the live detector missed.
 
@@ -3193,6 +3247,7 @@ class EvTripLoggerCoordinator:
             currency=cost_currency if cost is not None else None,
             journey_id=journey_id,
             confidence="live",  # manual entries are intentional, treat as live
+            driver=driver,
         )
 
         trip_id = await self.storage.async_insert(record)
@@ -3209,7 +3264,7 @@ class EvTripLoggerCoordinator:
         else:
             self.current_journey_id = journey_id
 
-        self.last_trip = record
+        self._adopt_last_trip(record)
         self.hass.bus.async_fire(
             EVENT_TRIP_ENDED,
             {"entry_id": self.entry_id, **record.to_dict()},
@@ -3220,6 +3275,36 @@ class EvTripLoggerCoordinator:
         self._notify_listeners()
         self._notify_trip_log_listeners()
         return record
+
+    def _adopt_last_trip(self, record: TripRecord) -> None:
+        """Set last_trip only when `record` is chronologically newest.
+
+        Manual backfills and synthetic inserts can be OLDER than the
+        genuine most-recent trip; blindly adopting them corrupts the
+        journey grouping, the snap-on-short-park SoC anchor and orphan
+        detection, which all key off last_trip.ended_at/odometer_end.
+        """
+        prev = self.last_trip
+        if prev is None:
+            self.last_trip = record
+            return
+        try:
+            is_newer = record.ended_at >= prev.ended_at
+        except TypeError:
+            # naive vs aware mix (manual service input) — compare wall
+            # clocks; good enough for a guard.
+            is_newer = (
+                record.ended_at.replace(tzinfo=None)
+                >= prev.ended_at.replace(tzinfo=None)
+            )
+        if is_newer:
+            self.last_trip = record
+        else:
+            _LOGGER.debug(
+                "Not adopting trip #%s as last_trip: ended_at %s is older "
+                "than current last_trip %s",
+                record.trip_id, record.ended_at, prev.ended_at,
+            )
 
     def _read_state(self, entity_id: str | None) -> str | None:
         if not entity_id:
@@ -3241,6 +3326,20 @@ class EvTripLoggerCoordinator:
     def _read_str(self, entity_id: str | None) -> str | None:
         return self._read_state(entity_id)
 
+    def _read_driver(self) -> str | None:
+        """Current driver name from the configured driver sensor.
+
+        Returns None when no sensor is wired, the state is unavailable,
+        or the state is one of the 'nobody connected' markers.
+        """
+        raw = self._read_state(self._driver_sensor)
+        if raw is None:
+            return None
+        cleaned = raw.strip()
+        if not cleaned or cleaned.casefold() in DRIVER_NONE_STATES:
+            return None
+        return cleaned
+
     def _read_bool(self, entity_id: str | None) -> bool | None:
         raw = self._read_state(entity_id)
         if raw is None:
@@ -3253,8 +3352,11 @@ class EvTripLoggerCoordinator:
         if active is None:
             return None
 
-        odometer_now = self._read_float(self._odometer) or active.last_seen_odometer
-        soc_now = self._read_float(self._battery) or active.last_seen_soc
+        # None checks, not `or` — 0 is a valid reading for both.
+        odo_read = self._read_float(self._odometer)
+        odometer_now = odo_read if odo_read is not None else active.last_seen_odometer
+        soc_read = self._read_float(self._battery)
+        soc_now = soc_read if soc_read is not None else active.last_seen_soc
         if odometer_now is not None:
             active.last_seen_odometer = odometer_now
         if soc_now is not None:
@@ -3321,6 +3423,7 @@ class EvTripLoggerCoordinator:
             "regen_kwh": active.regen_kwh or None,
             "cost": cost,
             "score": score,
+            "driver": active.driver,
         }
 
     def current_charge_snapshot(self) -> dict[str, Any] | None:
