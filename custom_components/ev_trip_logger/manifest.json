@@ -1,6 +1,9 @@
 {
   "domain": "ev_trip_logger",
   "name": "EV Trip Logger",
+  "after_dependencies": [
+    "recorder"
+  ],
   "codeowners": [
     "@boraita"
   ],

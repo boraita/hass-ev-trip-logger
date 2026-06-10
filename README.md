@@ -4,6 +4,16 @@
 
 # EV Trip Logger for Home Assistant
 
+<p>
+  <a href="https://github.com/boraita/hass-ev-trip-logger/actions/workflows/validate.yml"><img src="https://github.com/boraita/hass-ev-trip-logger/actions/workflows/validate.yml/badge.svg?branch=main" alt="Validate (hassfest + HACS + tests)"></a>
+  <a href="https://github.com/boraita/hass-ev-trip-logger/actions/workflows/release.yml"><img src="https://github.com/boraita/hass-ev-trip-logger/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://github.com/boraita/hass-ev-trip-logger/releases/latest"><img src="https://img.shields.io/github/v/release/boraita/hass-ev-trip-logger?label=version" alt="Latest release"></a>
+  <a href="https://github.com/hacs/integration"><img src="https://img.shields.io/badge/HACS-custom-41BDF5.svg" alt="HACS custom repository"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/boraita/hass-ev-trip-logger" alt="License"></a>
+</p>
+
+**Health at a glance:** the *Validate* badge runs on every push and every night (hassfest, HACS validation, and the full pytest suite) — green means the integration installs and its trip/charge logic passes all tests against the latest Home Assistant.
+
 A vehicle-agnostic Home Assistant custom integration that records every drive and charge from the entities your manufacturer integration already exposes, derives accurate consumption / cost / journey aggregates from them, and surfaces everything through standard HA sensors so any dashboard can consume the data.
 
 Works with **any cloud-polled EV integration** — BYD, Tesla Fleet, OVMS, Bouncie, native CAN-bus dongles, even a manual setup. You point it at the entities you already have; it does the rest.
