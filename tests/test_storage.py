@@ -277,3 +277,30 @@ def test_period_start_month_year_30d() -> None:
 def test_period_start_unknown_raises() -> None:
     with pytest.raises(ValueError):
         period_start(dt_util.now(), "decade")
+
+
+async def test_extend_last_charge_uses_absolute_soc_end(
+    storage: TripStorage,
+) -> None:
+    """v0.5.45 — soc_end is the new ABSOLUTE reading, not prev + delta.
+
+    The old delta semantics compounded across merged pulses and produced
+    impossible rows (soc_start 47, soc_end 124).
+    """
+    await storage.async_insert_charge(
+        _charge(soc_start=47.0, soc_end=60.0, kwh=10.0)
+    )
+    later = dt_util.now() + timedelta(hours=2)
+    merged = await storage.async_extend_last_charge(
+        extra_kwh=5.0, ended_at=later, soc_end=66.0
+    )
+    assert merged is not None
+    assert merged.kwh == pytest.approx(15.0)
+    assert merged.soc_end == pytest.approx(66.0)
+    assert merged.total_cost == pytest.approx(15.0 * 0.15)
+    # soc_end=None keeps the existing value.
+    merged2 = await storage.async_extend_last_charge(
+        extra_kwh=1.0, ended_at=later + timedelta(hours=1), soc_end=None
+    )
+    assert merged2 is not None
+    assert merged2.soc_end == pytest.approx(66.0)

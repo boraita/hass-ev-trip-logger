@@ -1969,13 +1969,33 @@ class EvTripLoggerCoordinator:
         # connected. Multiple `charging` on/off pulses (battery balancing,
         # scheduled charging windows, sentry top-ups) inside one plugged
         # interval are the same session — we shouldn't fragment them.
+        #
+        # v0.5.45 — "still connected" must mean CONTINUOUSLY connected.
+        # Checking only the current plug state merged sessions that were
+        # days apart (unplug → drive 70 km → replug overnight) into one
+        # multi-day 60+ kWh row. Two extra gates now:
+        #   1. SoC didn't drop since the previous charge ended (a drop
+        #      means the car was driven — different session).
+        #   2. Recorder history shows no plug 'off' since the previous
+        #      charge. On any doubt we insert a new row: fragmentation
+        #      is recoverable, a corrupted merge is not.
+        soc_dropped_since_last = (
+            self.last_charge is not None
+            and self.last_charge.soc_end is not None
+            and active.soc_start is not None
+            and float(active.soc_start) < float(self.last_charge.soc_end) - 1.0
+        )
         if (
             self._plug_sensor is not None
             and self._read_bool(self._plug_sensor) is True
             and self.last_charge is not None
+            and not soc_dropped_since_last
+            and await self._async_plug_stayed_connected_since(
+                self.last_charge.ended_at
+            )
         ):
             merged = await self.storage.async_extend_last_charge(
-                extra_kwh=kwh, ended_at=now, extra_soc_pct=extra_soc,
+                extra_kwh=kwh, ended_at=now, soc_end=soc_end,
             )
             if merged is not None:
                 self.last_charge = merged
@@ -3447,6 +3467,35 @@ class EvTripLoggerCoordinator:
         if not cleaned or cleaned.casefold() in DRIVER_NONE_STATES:
             return None
         return cleaned
+
+    async def _async_plug_stayed_connected_since(self, since: datetime) -> bool:
+        """True when the plug sensor never reported 'off' since `since`.
+
+        v0.5.45 — proves session continuity for the cable-still-plugged
+        charge merge. Conservative: when the recorder can't answer (not
+        loaded, query error) we return False so the charge is inserted
+        as its own row instead of merged into a potentially unrelated
+        one. Brief unavailable/unknown blips (cloud reloads) don't count
+        as disconnects — only an explicit 'off' does.
+        """
+        if not self._plug_sensor:
+            return False
+        try:
+            from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+            r = await get_instance(self.hass).async_add_executor_job(
+                state_changes_during_period,
+                self.hass,
+                since,
+                dt_util.now(),
+                self._plug_sensor,
+            )
+            sts = r.get(self._plug_sensor, []) if isinstance(r, dict) else []
+        except Exception:  # pragma: no cover — recorder optional/best-effort
+            return False
+        return not any(x.state == STATE_OFF for x in sts)
 
     async def _async_driver_during(
         self, start: datetime, end: datetime

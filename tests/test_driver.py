@@ -244,3 +244,54 @@ def test_is_zoneless() -> None:
     assert _is_zoneless("  ")
     assert not _is_zoneless("home")
     assert not _is_zoneless("Trabajo ele ")
+
+
+async def test_charge_merge_is_conservative_without_plug_continuity(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.45 — without recorder proof that the cable stayed plugged,
+    a new charging session inserts its OWN row instead of merging into
+    (and corrupting) the previous one."""
+    from homeassistant.util import dt as dt_util
+    from custom_components.ev_trip_logger.const import (
+        CONF_CHARGE_SENSOR,
+        CONF_PLUG_SENSOR,
+    )
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    CHG = "binary_sensor.charging"
+    PLUG = "binary_sensor.plug"
+    hass.states.async_set(CHG, STATE_OFF)
+    hass.states.async_set(PLUG, STATE_ON)
+    entry = await _setup(
+        hass, **{CONF_CHARGE_SENSOR: CHG, CONF_PLUG_SENSOR: PLUG}
+    )
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Previous charge ended 3 h ago at 80 %; battery now 60 (car drove).
+    old = ChargeRecord(
+        started_at=dt_util.now() - timedelta(hours=8),
+        ended_at=dt_util.now() - timedelta(hours=3),
+        kwh=20.0, price_per_kwh=0.07, total_cost=1.4,
+        soc_start=50.0, soc_end=80.0,
+    )
+    old.charge_id = await coordinator.storage.async_insert_charge(old)
+    coordinator.last_charge = old
+
+    hass.states.async_set(BAT, "60")
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+    hass.states.async_set(CHG, STATE_OFF)
+    await hass.async_block_till_done()
+
+    charges = await coordinator.storage.async_recent_charges(5)
+    assert len(charges) == 2  # new row, NOT merged
+    newest = charges[0]
+    assert newest.charge_id != old.charge_id
+    assert newest.soc_end == pytest.approx(70.0)
+    # The old row is untouched.
+    untouched = [c for c in charges if c.charge_id == old.charge_id][0]
+    assert untouched.kwh == pytest.approx(20.0)
+    assert untouched.soc_end == pytest.approx(80.0)

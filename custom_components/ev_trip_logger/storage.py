@@ -1416,7 +1416,7 @@ class TripStorage:
             return int(cur.rowcount or 0)
 
     async def async_extend_last_charge(
-        self, extra_kwh: float, ended_at: datetime, extra_soc_pct: float | None = None
+        self, extra_kwh: float, ended_at: datetime, soc_end: float | None = None
     ) -> ChargeRecord | None:
         """Append to the most recent charge instead of inserting a new row.
 
@@ -1424,17 +1424,23 @@ class TripStorage:
         between two charging pulses: we treat the whole plugged interval
         as ONE session. Adds `extra_kwh` to the row's kwh, extends
         ended_at, recomputes total_cost from the existing price_per_kwh,
-        and (if provided) bumps soc_end by `extra_soc_pct`.
+        and (if provided) sets soc_end to the new ABSOLUTE reading.
+
+        v0.5.45 — soc_end used to be a delta ADDED to the previous
+        soc_end; merging several pulses compounded the additions and
+        produced impossible values (47 % start, 124 % end). The session
+        always ends at the battery's current absolute SoC, so that's
+        what we store now.
         """
         return await self._hass.async_add_executor_job(
-            self._extend_last_charge, extra_kwh, ended_at, extra_soc_pct
+            self._extend_last_charge, extra_kwh, ended_at, soc_end
         )
 
     def _extend_last_charge(
         self,
         extra_kwh: float,
         ended_at: datetime,
-        extra_soc_pct: float | None,
+        soc_end: float | None,
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -1445,9 +1451,9 @@ class TripStorage:
                 return None
             new_kwh = float(row["kwh"] or 0) + float(extra_kwh)
             new_total = new_kwh * float(row["price_per_kwh"] or 0)
-            new_soc_end = row["soc_end"]
-            if extra_soc_pct is not None and new_soc_end is not None:
-                new_soc_end = float(new_soc_end) + float(extra_soc_pct)
+            new_soc_end = (
+                float(soc_end) if soc_end is not None else row["soc_end"]
+            )
             conn.execute(
                 "UPDATE charges SET kwh = ?, total_cost = ?, ended_at = ?, "
                 "soc_end = ? WHERE id = ?",
