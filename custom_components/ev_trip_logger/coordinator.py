@@ -82,6 +82,16 @@ from .storage import ChargeRecord, TripRecord, TripStorage
 _LOGGER = logging.getLogger(__name__)
 
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""}
+
+# Tracker states that carry no zone information. When origin/destination
+# resolves to one of these, the GPS-coords zone fallback kicks in
+# (v0.5.44) so journey open/close logic isn't blinded by a stale tracker.
+_NON_ZONE_STATES = frozenset({"not_home", "unknown", "unavailable", "none", ""})
+
+
+def _is_zoneless(location: str | None) -> bool:
+    """True when the tracker state names no zone (not_home/unknown/...)."""
+    return not location or location.strip().casefold() in _NON_ZONE_STATES
 _LIVE_TICK = timedelta(seconds=30)
 # v0.5.41 — force a fresh upstream poll on the location entity every
 # N ticks while a trip is open. Cloud-polled integrations (BYD,
@@ -231,6 +241,43 @@ def _route_distance_km(
         _, lat2, lon2 = samples[i]
         total += _haversine_km(lat1, lon1, lat2, lon2)
     return total
+def _pick_driver_for_window(
+    timeline: Sequence[tuple[datetime, str]],
+    start: datetime,
+    end: datetime,
+) -> str | None:
+    """Pick the driver active during [start, end] from sensor history.
+
+    `timeline` is the driver sensor's (timestamp, state) changes sorted
+    ascending; it may begin before `start` (the state already active at
+    window open). Returns the valid driver name with the longest overlap
+    with the window, or None when nobody valid was connected.
+
+    v0.5.44 — needed because on cloud-polled cars (BYD) vehicle_on
+    rarely flips, so most trips take the synthetic path which never ran
+    the live driver capture.
+    """
+    overlap: dict[str, float] = {}
+    for i, (ts, raw) in enumerate(timeline):
+        seg_start = max(ts, start)
+        seg_end = min(timeline[i + 1][0], end) if i + 1 < len(timeline) else end
+        if seg_end <= seg_start:
+            continue
+        cleaned = (raw or "").strip()
+        if (
+            not cleaned
+            or cleaned in _INVALID_STATES
+            or cleaned.casefold() in DRIVER_NONE_STATES
+        ):
+            continue
+        overlap[cleaned] = (
+            overlap.get(cleaned, 0.0) + (seg_end - seg_start).total_seconds()
+        )
+    if not overlap:
+        return None
+    return max(overlap, key=lambda k: overlap[k])
+
+
 # Minimum time a location zone must persist before we treat it as a real
 # arrival. Cloud-polled device_trackers occasionally bounce (e.g.
 # home→not_home→home in 40 s) when geofence math wobbles near the home
@@ -519,6 +566,39 @@ class EvTripLoggerCoordinator:
         if location is None:
             return False
         return location.strip().casefold() == self.home_zone.strip().casefold()
+
+    def _zone_from_coords(
+        self, lat: float | None, lon: float | None
+    ) -> str | None:
+        """Resolve a HA zone label from GPS coordinates (best-effort).
+
+        v0.5.44 — synthetic trips read the device_tracker STATE for
+        origin/destination, but a cloud-paused tracker can be hours
+        stale: 'not_home' while the car is physically parked at home.
+        That leaves the journey open forever and tomorrow's commute gets
+        absorbed into yesterday's journey. The route's GPS endpoints are
+        fresher than the tracker state, so when the tracker gives us
+        nothing usable we check the coords against HA's zones directly.
+
+        Returns the same label a device_tracker would report (the home
+        slug for the home zone, the friendly name for others), or None
+        when the point is outside every zone.
+        """
+        if lat is None or lon is None:
+            return None
+        try:
+            from homeassistant.components.zone import (  # noqa: PLC0415
+                async_active_zone,
+            )
+            zone_state = async_active_zone(self.hass, lat, lon)
+        except Exception:  # pragma: no cover — defensive
+            return None
+        if zone_state is None:
+            return None
+        slug = zone_state.entity_id.split(".", 1)[1]
+        if self._is_at_home(slug):
+            return slug
+        return zone_state.name or slug
 
     @property
     def home_zone(self) -> str:
@@ -1396,6 +1476,18 @@ class EvTripLoggerCoordinator:
                     end_lon = float(loc_state.attributes.get("longitude"))
                 except (TypeError, ValueError):
                     end_lat = end_lon = None
+        # v0.5.44 — when the tracker state names no zone (stale cloud
+        # poll, paused polling), resolve it from the route's GPS
+        # endpoints so the journey state machine sees the real home
+        # arrival/departure instead of a frozen 'not_home'.
+        if _is_zoneless(location_end):
+            zone_end = self._zone_from_coords(end_lat, end_lon)
+            if zone_end is not None:
+                location_end = zone_end
+        if _is_zoneless(location_start):
+            zone_start = self._zone_from_coords(start_lat, start_lon)
+            if zone_start is not None:
+                location_start = zone_start
         started_from_home = self._is_at_home(location_start)
         is_at_home_end = self._is_at_home(location_end)
         # Same invariant as _async_close_trip — open journeys absorb
@@ -1442,6 +1534,9 @@ class EvTripLoggerCoordinator:
             # manufacturer integration was sleeping → tag for low
             # confidence so the dashboard can warn the user.
             confidence=self._synth_confidence(started_at, ended_at),
+            # v0.5.44 — resolve driver from recorder history: the live
+            # capture never ran for reconstructed trips.
+            driver=await self._async_driver_during(started_at, ended_at),
         )
 
         # v0.5.27 — same charges-window attribution as the live close.
@@ -2158,6 +2253,9 @@ class EvTripLoggerCoordinator:
             origin=last_trip.destination,
             destination=None,
             confidence=confidence,
+            # v0.5.44 — orphan windows are reconstructed too; pull the
+            # driver from recorder history.
+            driver=await self._async_driver_during(last_trip.ended_at, now),
         )
         try:
             trip_id = await self.storage.async_insert(record)
@@ -2400,6 +2498,15 @@ class EvTripLoggerCoordinator:
         soc_read = self._read_float(self._battery)
         soc_end = soc_read if soc_read is not None else active.last_seen_soc
         location_end = self._read_str(self._location) if self._location else None
+        # v0.5.44 — tracker-lag fallback: when the tracker still says
+        # not_home/unknown at close, resolve the zone from the last GPS
+        # sample so the journey closes on a real home arrival.
+        if _is_zoneless(location_end) and active.gps_samples:
+            zone_end = self._zone_from_coords(
+                active.gps_samples[-1][1], active.gps_samples[-1][2]
+            )
+            if zone_end is not None:
+                location_end = zone_end
 
         distance = (
             (odometer_end - active.odometer_start)
@@ -3127,6 +3234,7 @@ class EvTripLoggerCoordinator:
                 cost=cost,
                 currency=self._currency if cost else None,
                 confidence="reconstructed_recovery",
+                driver=await self._async_driver_during(s_ts, e_ts),
             )
             trip_id = await self.storage.async_insert(record)
             inserted += 1
@@ -3339,6 +3447,38 @@ class EvTripLoggerCoordinator:
         if not cleaned or cleaned.casefold() in DRIVER_NONE_STATES:
             return None
         return cleaned
+
+    async def _async_driver_during(
+        self, start: datetime, end: datetime
+    ) -> str | None:
+        """Resolve who drove during [start, end] from recorder history.
+
+        v0.5.44 — used by the synthetic / orphan / recovery paths, which
+        reconstruct trips after the fact: the live capture in _open_trip
+        and the live tick never ran for them. Best-effort: any recorder
+        hiccup returns None (same posture as the other recovery lookups).
+        """
+        if not self._driver_sensor:
+            return None
+        try:
+            from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+            r = await get_instance(self.hass).async_add_executor_job(
+                state_changes_during_period,
+                self.hass,
+                start - timedelta(minutes=10),
+                end,
+                self._driver_sensor,
+            )
+            sts = r.get(self._driver_sensor, []) if isinstance(r, dict) else []
+        except Exception:  # pragma: no cover — recorder optional/best-effort
+            return None
+        timeline = sorted(
+            ((x.last_updated, x.state) for x in sts), key=lambda y: y[0]
+        )
+        return _pick_driver_for_window(timeline, start, end)
 
     def _read_bool(self, entity_id: str | None) -> bool | None:
         raw = self._read_state(entity_id)

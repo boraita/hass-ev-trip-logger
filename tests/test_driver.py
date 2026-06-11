@@ -161,3 +161,86 @@ async def test_zero_soc_at_close_is_not_discarded(hass: HomeAssistant) -> None:
     assert coordinator.last_trip is not None
     assert coordinator.last_trip.soc_end == pytest.approx(0.0)
     assert coordinator.last_trip.soc_used_pct == pytest.approx(10.0)
+
+
+# ---------------------------------------------------------------------------
+# v0.5.44 — driver resolution for reconstructed trips + zone-from-coords
+# ---------------------------------------------------------------------------
+
+def _dt(h: int, m: int = 0):
+    from datetime import datetime, timezone
+    return datetime(2026, 6, 11, h, m, tzinfo=timezone.utc)
+
+
+def test_pick_driver_longest_overlap_wins() -> None:
+    from custom_components.ev_trip_logger.coordinator import _pick_driver_for_window
+    timeline = [
+        (_dt(5, 0), "none"),
+        (_dt(5, 43), "Elena"),
+        (_dt(6, 5), "Rafa"),
+        (_dt(6, 10), "none"),
+    ]
+    # Window 05:52–06:14: Elena 13 min, Rafa 5 min.
+    assert _pick_driver_for_window(timeline, _dt(5, 52), _dt(6, 14)) == "Elena"
+
+
+def test_pick_driver_state_active_at_window_start() -> None:
+    from custom_components.ev_trip_logger.coordinator import _pick_driver_for_window
+    # Single change before the window — still drives the whole window.
+    timeline = [(_dt(5, 0), "Rafa")]
+    assert _pick_driver_for_window(timeline, _dt(6, 0), _dt(6, 30)) == "Rafa"
+
+
+def test_pick_driver_ignores_none_and_invalid_states() -> None:
+    from custom_components.ev_trip_logger.coordinator import _pick_driver_for_window
+    timeline = [
+        (_dt(5, 0), "none"),
+        (_dt(5, 30), "unavailable"),
+        (_dt(5, 45), "not_connected"),
+    ]
+    assert _pick_driver_for_window(timeline, _dt(5, 0), _dt(6, 0)) is None
+    assert _pick_driver_for_window([], _dt(5, 0), _dt(6, 0)) is None
+
+
+async def test_zone_from_coords_resolves_stale_tracker(hass: HomeAssistant) -> None:
+    """GPS endpoint inside zone.home resolves to 'home' even when the
+    tracker state is a stale 'not_home' (paused cloud polling)."""
+    from homeassistant.setup import async_setup_component
+
+    # Real zone component: async_active_zone reads its internal registry,
+    # not manually-injected states. zone.home derives from core config.
+    assert await async_setup_component(
+        hass,
+        "zone",
+        {
+            "zone": [
+                {
+                    "name": "Trabajo ele",
+                    "latitude": 37.20,
+                    "longitude": -3.70,
+                    "radius": 100,
+                }
+            ]
+        },
+    )
+    await hass.async_block_till_done()
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    home_lat = hass.config.latitude
+    home_lon = hass.config.longitude
+    assert coordinator._zone_from_coords(home_lat, home_lon) == "home"
+    assert coordinator._zone_from_coords(37.2000, -3.7000) == "Trabajo ele"
+    assert coordinator._zone_from_coords(36.0, -4.0) is None
+    assert coordinator._zone_from_coords(None, -3.6) is None
+
+
+def test_is_zoneless() -> None:
+    from custom_components.ev_trip_logger.coordinator import _is_zoneless
+    assert _is_zoneless("not_home")
+    assert _is_zoneless("Unknown")
+    assert _is_zoneless(None)
+    assert _is_zoneless("  ")
+    assert not _is_zoneless("home")
+    assert not _is_zoneless("Trabajo ele ")
