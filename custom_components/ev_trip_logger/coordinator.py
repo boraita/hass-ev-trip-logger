@@ -1429,6 +1429,21 @@ class EvTripLoggerCoordinator:
             if soc_used is not None
             else None
         )
+        energy_source: str | None = "soc" if energy is not None else None
+        # v0.5.46 — same heal as the live close (v0.5.15). BYD's
+        # integer-step SoC means a short trip often crosses no 1 %
+        # boundary (soc 55→55) → soc_used None → the row persisted with
+        # NULL energy/consumption/cost. On cloud-polled cars nearly
+        # every trip is synthetic, so the live-path fallback never ran.
+        # Estimate from the user's own distance-weighted average.
+        if energy is None and distance > 0:
+            try:
+                avg_per_100 = await self.storage.async_avg_consumption_kwh_per_100km()
+            except Exception:  # pragma: no cover — defensive
+                avg_per_100 = None
+            if avg_per_100 and avg_per_100 > 0:
+                energy = distance * avg_per_100 / 100.0
+                energy_source = "estimated"
         consumption = (
             (energy / distance * 100.0) if energy and distance > 0 else None
         )
@@ -1534,6 +1549,9 @@ class EvTripLoggerCoordinator:
             # manufacturer integration was sleeping → tag for low
             # confidence so the dashboard can warn the user.
             confidence=self._synth_confidence(started_at, ended_at),
+            # v0.5.46 — provenance: 'soc' when SoC-derived, 'estimated'
+            # when healed from the 30d average (dashboard badge).
+            energy_source=energy_source,
             # v0.5.44 — resolve driver from recorder history: the live
             # capture never ran for reconstructed trips.
             driver=await self._async_driver_during(started_at, ended_at),
