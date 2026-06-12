@@ -92,6 +92,14 @@ _NON_ZONE_STATES = frozenset({"not_home", "unknown", "unavailable", "none", ""})
 def _is_zoneless(location: str | None) -> bool:
     """True when the tracker state names no zone (not_home/unknown/...)."""
     return not location or location.strip().casefold() in _NON_ZONE_STATES
+
+
+# v0.5.47 — max age of a GPS sample for the zone-from-coords fallback.
+# A stale last-route point can be a MID-ROUTE position captured before
+# the car actually arrived; resolving a zone from it could close a
+# journey on a false "home". Older than this → trust nothing (NULL is
+# better than wrong).
+_ZONE_FALLBACK_MAX_AGE = timedelta(minutes=10)
 _LIVE_TICK = timedelta(seconds=30)
 # v0.5.41 — force a fresh upstream poll on the location entity every
 # N ticks while a trip is open. Cloud-polled integrations (BYD,
@@ -538,6 +546,10 @@ class EvTripLoggerCoordinator:
         )
         self._listeners: list[Callable[[], None]] = []
         self._trip_log_listeners: list[Callable[[], None]] = []
+        # v0.5.47 — current_snapshot() memo, valid for one notify cycle.
+        # Sensors only re-render on _notify_listeners (should_poll is
+        # False everywhere), so caching between invalidations is safe.
+        self._snapshot_cache: dict[str, Any] | None = None
 
     @property
     def entry_id(self) -> str:
@@ -865,6 +877,10 @@ class EvTripLoggerCoordinator:
 
     @callback
     def _notify_listeners(self) -> None:
+        # v0.5.47 — invalidate the per-cycle snapshot memo BEFORE the
+        # fan-out: ~13 CurrentTrip* sensors read current_snapshot() per
+        # cycle and recomputed identical values each time.
+        self._snapshot_cache = None
         for listener in list(self._listeners):
             listener()
 
@@ -1495,11 +1511,25 @@ class EvTripLoggerCoordinator:
         # poll, paused polling), resolve it from the route's GPS
         # endpoints so the journey state machine sees the real home
         # arrival/departure instead of a frozen 'not_home'.
-        if _is_zoneless(location_end):
+        # v0.5.47 — freshness guards: the endpoint sample must be close
+        # in time to the trip boundary it represents, otherwise it can
+        # be a mid-route point that resolves to the wrong zone.
+        if (
+            _is_zoneless(location_end)
+            and route
+            and (ended_at - route[-1][0]) <= _ZONE_FALLBACK_MAX_AGE
+        ) or (_is_zoneless(location_end) and not route and end_lat is not None):
+            # No-route case: end coords came from the tracker's CURRENT
+            # position at finalize time, which is fresh by construction.
             zone_end = self._zone_from_coords(end_lat, end_lon)
             if zone_end is not None:
                 location_end = zone_end
-        if _is_zoneless(location_start):
+        if (
+            _is_zoneless(location_start)
+            and route
+            and (route[0][0] - started_at) <= _ZONE_FALLBACK_MAX_AGE
+            and route[0][0] >= started_at - _ZONE_FALLBACK_MAX_AGE
+        ):
             zone_start = self._zone_from_coords(start_lat, start_lon)
             if zone_start is not None:
                 location_start = zone_start
@@ -1959,39 +1989,15 @@ class EvTripLoggerCoordinator:
             self._notify_listeners()
             return
 
-        if self.last_charge is not None:
-            # Compare against `started_at` so a manual correction hours after
-            # the original auto-detect doesn't open the window. Also widen
-            # the dedup horizon to 2 h.
-            ref_ts = self.last_charge.started_at or self.last_charge.ended_at
-            elapsed = (now - ref_ts).total_seconds()
-            # Time-based dedup: a real new charging session shouldn't follow
-            # the previous one within 2 hours. price_locked alone must NOT
-            # block insertion — that flag is for protecting the prior
-            # record's price from auto-update, not for vetoing future
-            # charges (that bug in v0.5.4 swallowed an entire overnight
-            # session because the previous charge had been corrected).
-            if elapsed < 7200:  # 2 h
-                _LOGGER.debug(
-                    "Skipping auto-charge: previous charge %.0fs ago "
-                    "(price_locked=%s)",
-                    elapsed, self.last_charge.price_locked,
-                )
-                self._notify_listeners()
-                return
-
-        kwh = (soc_end - active.soc_start) / 100.0 * self._battery_capacity
-        extra_soc = float(soc_end) - float(active.soc_start)
-
-        # Merge into the previous charge when the cable is STILL physically
-        # connected. Multiple `charging` on/off pulses (battery balancing,
-        # scheduled charging windows, sentry top-ups) inside one plugged
-        # interval are the same session — we shouldn't fragment them.
+        # Merge eligibility — decided BEFORE the time dedup (v0.5.47).
+        # Multiple `charging` on/off pulses (battery balancing, scheduled
+        # charging windows, sentry top-ups) inside one plugged interval
+        # are the same session — we shouldn't fragment OR drop them.
         #
         # v0.5.45 — "still connected" must mean CONTINUOUSLY connected.
         # Checking only the current plug state merged sessions that were
         # days apart (unplug → drive 70 km → replug overnight) into one
-        # multi-day 60+ kWh row. Two extra gates now:
+        # multi-day 60+ kWh row. Two extra gates:
         #   1. SoC didn't drop since the previous charge ended (a drop
         #      means the car was driven — different session).
         #   2. Recorder history shows no plug 'off' since the previous
@@ -2003,7 +2009,7 @@ class EvTripLoggerCoordinator:
             and active.soc_start is not None
             and float(active.soc_start) < float(self.last_charge.soc_end) - 1.0
         )
-        if (
+        can_merge = (
             self._plug_sensor is not None
             and self._read_bool(self._plug_sensor) is True
             and self.last_charge is not None
@@ -2011,7 +2017,37 @@ class EvTripLoggerCoordinator:
             and await self._async_plug_stayed_connected_since(
                 self.last_charge.ended_at
             )
-        ):
+        )
+
+        if self.last_charge is not None and not can_merge:
+            # Compare against `started_at` so a manual correction hours after
+            # the original auto-detect doesn't open the window. Also widen
+            # the dedup horizon to 2 h.
+            ref_ts = self.last_charge.started_at or self.last_charge.ended_at
+            elapsed = (now - ref_ts).total_seconds()
+            # Time-based dedup: a real new charging session shouldn't follow
+            # the previous one within 2 hours. price_locked alone must NOT
+            # block insertion — that flag is for protecting the prior
+            # record's price from auto-update, not for vetoing future
+            # charges (that bug in v0.5.4 swallowed an entire overnight
+            # session because the previous charge had been corrected).
+            #
+            # v0.5.47 — the dedup used to run BEFORE the merge decision,
+            # so a continuity-proven pulse within 2 h of the session
+            # start was silently DROPPED (its kWh lost) instead of
+            # merged. Continuity-proven pulses now bypass this gate.
+            if elapsed < 7200:  # 2 h
+                _LOGGER.debug(
+                    "Skipping auto-charge: previous charge %.0fs ago "
+                    "(price_locked=%s)",
+                    elapsed, self.last_charge.price_locked,
+                )
+                self._notify_listeners()
+                return
+
+        kwh = (soc_end - active.soc_start) / 100.0 * self._battery_capacity
+
+        if can_merge:
             merged = await self.storage.async_extend_last_charge(
                 extra_kwh=kwh, ended_at=now, soc_end=soc_end,
             )
@@ -2539,7 +2575,13 @@ class EvTripLoggerCoordinator:
         # v0.5.44 — tracker-lag fallback: when the tracker still says
         # not_home/unknown at close, resolve the zone from the last GPS
         # sample so the journey closes on a real home arrival.
-        if _is_zoneless(location_end) and active.gps_samples:
+        # v0.5.47 — only when the sample is FRESH: a stale point can be
+        # mid-route and resolve to the wrong zone (worse than NULL).
+        if (
+            _is_zoneless(location_end)
+            and active.gps_samples
+            and (now - active.gps_samples[-1][0]) <= _ZONE_FALLBACK_MAX_AGE
+        ):
             zone_end = self._zone_from_coords(
                 active.gps_samples[-1][1], active.gps_samples[-1][2]
             )
@@ -3558,6 +3600,9 @@ class EvTripLoggerCoordinator:
         active = self.current
         if active is None:
             return None
+        # v0.5.47 — memo per notify cycle (see _notify_listeners).
+        if self._snapshot_cache is not None:
+            return self._snapshot_cache
 
         # None checks, not `or` — 0 is a valid reading for both.
         odo_read = self._read_float(self._odometer)
@@ -3617,7 +3662,7 @@ class EvTripLoggerCoordinator:
         if consumption is not None and consumption > 0:
             score = max(0.0, min(10.0, 10.0 - max(0.0, consumption - 14.5) * 0.6))
 
-        return {
+        self._snapshot_cache = {
             "distance_km": distance,
             "duration_min": duration_min,
             "avg_speed_kmh": avg_speed,
@@ -3632,6 +3677,7 @@ class EvTripLoggerCoordinator:
             "score": score,
             "driver": active.driver,
         }
+        return self._snapshot_cache
 
     def current_charge_snapshot(self) -> dict[str, Any] | None:
         """Live charging metrics — mirror of LastChargeSensor while charging."""

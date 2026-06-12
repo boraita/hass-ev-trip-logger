@@ -44,7 +44,10 @@ DRIVER_NONE_STATES: Final = frozenset(
 # wiring multiple HA `statistics` platform entries by hand.
 CONF_TRACKED_SENSORS: Final = "tracked_sensors"
 # How often each tracked-average sensor re-queries the recorder.
-TRACKED_AVG_REFRESH_S: Final = 300
+# v0.5.47 — 30 min (was 5): a rolling 7/30-day mean doesn't move in
+# five minutes, and each refresh drags thousands of raw recorder rows
+# (22 sensors x 12/h = 264 heavy queries/hour for no visible change).
+TRACKED_AVG_REFRESH_S: Final = 1800
 # v0.5.31 — optional ABRP (A Better Route Planner) telemetry push.
 # Token+api_key required to activate; car_model is the ABRP slug
 # (e.g. "byd:sealion:25:82:rwd"). All three live in the integration's

@@ -295,3 +295,56 @@ async def test_charge_merge_is_conservative_without_plug_continuity(
     untouched = [c for c in charges if c.charge_id == old.charge_id][0]
     assert untouched.kwh == pytest.approx(20.0)
     assert untouched.soc_end == pytest.approx(80.0)
+
+
+async def test_charge_pulse_with_proven_continuity_merges(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.47 — a second pulse within 2 h of the session start used to
+    be DROPPED by the time dedup before the merge could run. With plug
+    continuity proven, it must now merge into the previous row."""
+    from homeassistant.util import dt as dt_util
+    from custom_components.ev_trip_logger.const import (
+        CONF_CHARGE_SENSOR,
+        CONF_PLUG_SENSOR,
+    )
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    CHG = "binary_sensor.charging"
+    PLUG = "binary_sensor.plug"
+    hass.states.async_set(CHG, STATE_OFF)
+    hass.states.async_set(PLUG, STATE_ON)
+    entry = await _setup(
+        hass, bat=70.0, **{CONF_CHARGE_SENSOR: CHG, CONF_PLUG_SENSOR: PLUG}
+    )
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Session started 1 h ago, first pulse closed 30 min ago at 70 %.
+    old = ChargeRecord(
+        started_at=dt_util.now() - timedelta(hours=1),
+        ended_at=dt_util.now() - timedelta(minutes=30),
+        kwh=10.0, price_per_kwh=0.07, total_cost=0.7,
+        soc_start=60.0, soc_end=70.0,
+    )
+    old.charge_id = await coordinator.storage.async_insert_charge(old)
+    coordinator.last_charge = old
+
+    # Recorder isn't available in tests — prove continuity directly.
+    async def _stayed_connected(_since):
+        return True
+    coordinator._async_plug_stayed_connected_since = _stayed_connected
+
+    # Balancing pulse 30 min later: 70 -> 75 %.
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(BAT, "75")
+    await hass.async_block_till_done()
+    hass.states.async_set(CHG, STATE_OFF)
+    await hass.async_block_till_done()
+
+    charges = await coordinator.storage.async_recent_charges(5)
+    assert len(charges) == 1  # merged, not dropped, not a new row
+    merged = charges[0]
+    assert merged.charge_id == old.charge_id
+    assert merged.kwh == pytest.approx(10.0 + 5.0 / 100 * 75.0)  # +3.75
+    assert merged.soc_end == pytest.approx(75.0)  # absolute, not 70+5+...

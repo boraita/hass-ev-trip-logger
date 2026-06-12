@@ -295,6 +295,10 @@ class TripStorage:
         """
         conn = sqlite3.connect(self._path)
         conn.row_factory = sqlite3.Row
+        # v0.5.47 — NORMAL sync is safe under WAL (set persistently at
+        # init) and skips the per-commit fsync that dominated I/O cost
+        # at ~450 connections/hour on flash storage.
+        conn.execute("PRAGMA synchronous=NORMAL")
         try:
             with conn:  # commit on success / rollback on exception
                 yield conn
@@ -308,6 +312,11 @@ class TripStorage:
     def _init_db(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            # v0.5.47 — WAL is persistent in the DB file: readers no
+            # longer block on the writer and commits skip the rollback-
+            # journal fsync dance. The integration opens a connection
+            # per query (~450/h), so this is the single cheapest win.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
             self._migrate(conn)
 
@@ -348,6 +357,15 @@ class TripStorage:
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
+        )
+        # v0.5.47 — match the actual query shapes: _get_last orders by
+        # ended_at on every startup/service call, and the journey
+        # open/absorb logic filters on destination at every trip close.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trips_ended_at ON trips(ended_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trips_destination ON trips(destination)"
         )
         charge_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(charges)").fetchall()
@@ -687,6 +705,10 @@ class TripStorage:
     def _recent_completed_journeys(
         self, current_journey_id: int | None, limit: int
     ) -> list[dict[str, Any]]:
+        # v0.5.47 — single aggregated query. The old shape fetched the
+        # journey-id list and then ran one _journey_summary query PER
+        # journey (N+1): with the default limit that was up to 51
+        # connections per trip-close event.
         excl = ""
         params: tuple = ()
         if current_journey_id is not None:
@@ -695,7 +717,15 @@ class TripStorage:
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT journey_id FROM trips
+                SELECT
+                    journey_id,
+                    MIN(started_at) AS started_at,
+                    MAX(ended_at)   AS ended_at,
+                    COALESCE(SUM(distance_km), 0) AS distance,
+                    COALESCE(SUM(energy_kwh), 0)  AS energy,
+                    COALESCE(SUM(cost), 0)        AS cost,
+                    COUNT(*) AS stages
+                FROM trips
                 WHERE journey_id IS NOT NULL {excl}
                 GROUP BY journey_id
                 ORDER BY MAX(ended_at) DESC
@@ -703,12 +733,18 @@ class TripStorage:
                 """,
                 params + (limit,),
             ).fetchall()
-        out: list[dict[str, Any]] = []
-        for r in rows:
-            s = self._journey_summary(int(r[0]))
-            if s is not None:
-                out.append(s)
-        return out
+        return [
+            {
+                "journey_id": int(r[0]),
+                "started_at": datetime.fromisoformat(r[1]) if r[1] else None,
+                "ended_at": datetime.fromisoformat(r[2]) if r[2] else None,
+                "distance_km": float(r[3]),
+                "energy_kwh": float(r[4]),
+                "cost": float(r[5]),
+                "stages": int(r[6]),
+            }
+            for r in rows
+        ]
 
     async def async_avg_consumption_kwh_per_100km(self) -> float | None:
         """Distance-weighted recent average kWh/100km across all trips.
@@ -726,6 +762,10 @@ class TripStorage:
         )
 
     def _avg_consumption_kwh_per_100km(self) -> float | None:
+        # v0.5.47 — exclude rows whose energy was itself ESTIMATED from
+        # this average: feeding estimates back into the baseline freezes
+        # it (real consumption shifts get diluted by prior estimates).
+        # Measured rows (soc, power_integration, legacy NULL) all count.
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -735,6 +775,7 @@ class TripStorage:
                 FROM trips
                 WHERE energy_kwh IS NOT NULL AND energy_kwh > 0
                   AND distance_km IS NOT NULL AND distance_km > 0
+                  AND (energy_source IS NULL OR energy_source != 'estimated')
                 """
             ).fetchone()
         total_kwh, total_km = row[0], row[1]
