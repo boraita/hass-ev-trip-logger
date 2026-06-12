@@ -26,7 +26,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
@@ -1122,6 +1122,15 @@ class TrackedAvgSensor(_BaseTripSensor):
         self._mean: float | None = None
         self._samples: int = 0
         self._window_start: datetime | None = None
+        # v0.5.48 — last KNOWN unit of the source. Mirroring the source's
+        # live attributes made the unit flip to None while the upstream
+        # integration was reloading, which the recorder registered as a
+        # units-changed statistics issue (one Repair per sensor).
+        self._unit_cache: str | None = None
+        # v0.5.48 — startup retry budget: the first refresh often runs
+        # before the recorder is ready; without a fast retry the sensor
+        # sat 'unknown' until the next slow cadence tick (30 min).
+        self._startup_retries_left: int = 5
 
     async def async_added_to_hass(self) -> None:
         from .const import TRACKED_AVG_REFRESH_S  # noqa: PLC0415
@@ -1131,6 +1140,20 @@ class TrackedAvgSensor(_BaseTripSensor):
                 self.hass, self._async_refresh,
                 timedelta(seconds=TRACKED_AVG_REFRESH_S),
             )
+        )
+
+    @callback
+    def _schedule_startup_retry(self) -> None:
+        """One-shot fast retry while we still have no value (startup)."""
+        if self._mean is not None or self._startup_retries_left <= 0:
+            return
+        self._startup_retries_left -= 1
+
+        async def _retry(_now: Any) -> None:
+            await self._async_refresh()
+
+        self.async_on_remove(
+            async_call_later(self.hass, 60, _retry)
         )
 
     async def _async_refresh(self, *_: Any) -> None:
@@ -1153,6 +1176,7 @@ class TrackedAvgSensor(_BaseTripSensor):
         except Exception as exc:
             _LOGGER.debug("TrackedAvg %s: recorder query failed: %s",
                           self._source, exc)
+            self._schedule_startup_retry()
             return
         states = result.get(self._source, []) if isinstance(result, dict) else []
         values: list[float] = []
@@ -1178,11 +1202,16 @@ class TrackedAvgSensor(_BaseTripSensor):
 
     @property
     def native_unit_of_measurement(self) -> str | None:
-        # Mirror the source sensor's unit when we can read it.
+        # v0.5.48 — sticky unit: adopt the source's unit when readable
+        # and KEEP it across upstream unavailability blips. A unit that
+        # flips to None and back makes the recorder open a units-changed
+        # Repair for the long-term statistics.
         state = self.hass.states.get(self._source)
         if state is not None:
-            return state.attributes.get("unit_of_measurement")
-        return None
+            unit = state.attributes.get("unit_of_measurement")
+            if unit:
+                self._unit_cache = unit
+        return self._unit_cache
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
