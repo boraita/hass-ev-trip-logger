@@ -409,6 +409,13 @@ class LastTripExtraSensor(_BaseTripSensor):
         trip = self._coordinator.last_trip
         if trip is None:
             return None
+        if self._key == "score":
+            # v0.5.50 — anchor to the per-car baseline rather than the
+            # original 14.5 default. `score` on the record is kept for
+            # back-compat and uses 14.5 — we bypass it here.
+            return trip.score_with_baseline(
+                self._coordinator.score_baseline_kwh_100km
+            )
         return getattr(trip, self._key, None)
 
 
@@ -563,13 +570,20 @@ def _humanize_location(
     return "Outside known zones"
 
 
-def _trip_to_attr(trip: Any) -> dict[str, Any]:
+def _trip_to_attr(
+    trip: Any, *, score_baseline: float = 14.5
+) -> dict[str, Any]:
     """Serialise a TripRecord for sensor attributes.
 
     Exposes every field we capture so any Lovelace card / template can use
     them. Keeps both `id` (the new v0.4.3 short alias) and `trip_id`
     (the historical key dashboards have been using since v0.1) for
     backwards compatibility — both point at the same DB primary key.
+
+    v0.5.50 — `score_baseline` is the kWh/100km anchor for 10/10. Pass
+    `coordinator.score_baseline_kwh_100km` for the per-car-calibrated
+    value; falls back to the historical 14.5 default to keep this
+    function callable without a coordinator (e.g. tests).
     """
     start_addr = getattr(trip, "start_address", None)
     end_addr = getattr(trip, "end_address", None)
@@ -595,7 +609,7 @@ def _trip_to_attr(trip: Any) -> dict[str, Any]:
         "avg_temp_c": _r(trip.avg_temp_c, 1),
         "cost": _r(trip.cost, 2),
         "currency": trip.currency,
-        "score": _r(trip.score, 1),
+        "score": _r(trip.score_with_baseline(score_baseline), 1),
         # v0.5.19 — origin/destination now show the geocoded address
         # when the raw device_tracker state was `not_home` (= outside
         # any HA zone). The raw value is preserved as `origin_raw` /
@@ -1022,7 +1036,14 @@ class RecentTripsSensor(_BaseTripSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {"trips": [_trip_to_attr(t) for t in self._trips]}
+        baseline = self._coordinator.score_baseline_kwh_100km
+        return {
+            "trips": [_trip_to_attr(t, score_baseline=baseline) for t in self._trips],
+            # v0.5.50 — expose the active calibration so dashboards can
+            # show a "calibrated for THIS car" caption next to the score.
+            "score_baseline_kwh_100km": round(baseline, 2),
+            "score_baseline_trip_count": self._coordinator.score_baseline_trip_count,
+        }
 
 
 class AbrpNextChargeSocSensor(_BaseTripSensor):
@@ -1400,9 +1421,10 @@ class TripRecordsSensor(_BaseTripSensor):
         eff = rec.get("most_efficient")
         longest = rec.get("longest")
         cheapest = rec.get("cheapest")
-        best_score = self._entry(
-            eff, round(eff.score, 1) if eff and eff.score is not None else None
-        )
+        # v0.5.50 — score against the per-car calibrated baseline.
+        baseline = self._coordinator.score_baseline_kwh_100km
+        best = eff.score_with_baseline(baseline) if eff is not None else None
+        best_score = self._entry(eff, round(best, 1) if best is not None else None)
         most_efficient = self._entry(
             eff,
             round(eff.consumption_kwh_100km, 1)

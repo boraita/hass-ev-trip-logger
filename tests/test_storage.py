@@ -160,6 +160,67 @@ async def test_records_picks_bests_and_totals(storage: TripStorage) -> None:
     assert rec["totals"]["cost"] == pytest.approx(4.6)
 
 
+async def test_score_baseline_p5_below_threshold_returns_none(
+    storage: TripStorage,
+) -> None:
+    """v0.5.50 — under the min-trips floor, coordinator must fall back."""
+    for c in [12.0, 13.0, 14.0]:
+        await storage.async_insert(
+            _trip(distance_km=20.0, energy_kwh=c * 0.2, consumption_kwh_100km=c)
+        )
+    p5, n = await storage.async_score_baseline_p5(min_distance_km=5.0, min_trips=10)
+    assert p5 is None
+    assert n == 3
+
+
+async def test_score_baseline_p5_uses_lowest_quantile_when_enough_trips(
+    storage: TripStorage,
+) -> None:
+    """v0.5.50 — P5 of consumption with enough trips picks the best tail.
+
+    With 20 trips ascending [10..29] kWh/100km, P5 idx = floor(0.05*19) = 0,
+    so it picks the very best — 10.0.
+    """
+    values = list(range(10, 30))  # 20 trips: 10, 11, ..., 29
+    for c in values:
+        await storage.async_insert(
+            _trip(
+                distance_km=20.0,
+                energy_kwh=c * 0.2,
+                consumption_kwh_100km=float(c),
+            )
+        )
+    p5, n = await storage.async_score_baseline_p5(min_distance_km=5.0, min_trips=10)
+    assert n == 20
+    assert p5 == pytest.approx(10.0)
+
+
+async def test_score_baseline_p5_filters_short_trips_and_outliers(
+    storage: TripStorage,
+) -> None:
+    """v0.5.50 — short trips (<5 km) and out-of-band sensor errors must
+    not anchor the baseline. Only trips with 5 km+ AND 5..50 kWh/100km
+    are eligible.
+    """
+    # 12 long & realistic trips: baseline candidates
+    for c in [12.0, 14.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 22.0, 24.0, 27.0]:
+        await storage.async_insert(
+            _trip(distance_km=20.0, energy_kwh=c * 0.2, consumption_kwh_100km=c)
+        )
+    # Two phantom trips that should NOT compete for the baseline:
+    await storage.async_insert(  # < 5 km
+        _trip(distance_km=1.0, energy_kwh=0.05, consumption_kwh_100km=5.0)
+    )
+    await storage.async_insert(  # > 50 kWh/100km (sensor glitch)
+        _trip(distance_km=20.0, energy_kwh=12.0, consumption_kwh_100km=60.0)
+    )
+    p5, n = await storage.async_score_baseline_p5(min_distance_km=5.0, min_trips=10)
+    assert n == 12
+    # P5 with n=12 → idx = floor(0.05*11) = 0 → 12.0 (the actual best
+    # eligible, NOT the 5.0 short-trip outlier).
+    assert p5 == pytest.approx(12.0)
+
+
 async def test_recent_trips_respects_limit(storage: TripStorage) -> None:
     for i in range(6):
         await storage.async_insert(_trip(distance_km=float(i)))
@@ -254,6 +315,36 @@ def test_trip_score_curve_matches_byd_app(consumption, expected) -> None:
         consumption_kwh_100km=consumption,
     )
     assert trip.score == expected
+
+
+@pytest.mark.parametrize(
+    "consumption, baseline, expected",
+    [
+        # On the baseline → 10/10
+        (12.0, 12.0, pytest.approx(10.0)),
+        # 5 kWh/100km above baseline of 12 → 10 - 3 = 7
+        (17.0, 12.0, pytest.approx(7.0)),
+        # 29.5 vs the old 14.5 default → 1.0 (the Tesla-in-Alps case)
+        (29.5, 14.5, pytest.approx(1.0)),
+        # Same 29.5 against a Tesla-calibrated 19.5 baseline → 4.0
+        (29.5, 19.5, pytest.approx(4.0)),
+        # Below baseline never goes above 10
+        (8.0, 14.5, 10.0),
+        # No consumption → None
+        (None, 14.5, None),
+        (0.0, 14.5, None),
+    ],
+)
+def test_score_with_baseline_shifts_anchor(consumption, baseline, expected) -> None:
+    """v0.5.50 — score curve re-anchors to the per-car baseline."""
+    trip = TripRecord(
+        started_at=dt_util.now(),
+        ended_at=dt_util.now(),
+        duration_min=10.0,
+        distance_km=1.0,
+        consumption_kwh_100km=consumption,
+    )
+    assert trip.score_with_baseline(baseline) == expected
 
 
 def test_period_start_today() -> None:

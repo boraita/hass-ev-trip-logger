@@ -216,6 +216,17 @@ _VEHICLE_ON_OFF_DEBOUNCE_S = 3.0
 # offsets while vehicle_on stays ON. The chain is cancelled on any
 # off-edge or once another path opens the trip first.
 _LIVE_OPEN_RETRY_DELAYS_S: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0)
+# v0.5.50 — score baseline calibration.
+# Default 14.5 kWh/100km (matches BYD app's 10/10 anchor) is used until
+# the car has driven enough to derive its own best efficiency. P5 of
+# consumption_kwh_100km over trips with distance>=5 km maps to 10/10.
+# Min 10 such trips before adopting; bounded so a single freak trip down
+# a mountain (5 kWh/100km) or a faulty sensor (50 kWh/100km) can't
+# anchor the rating.
+_SCORE_BASELINE_DEFAULT = 14.5
+_SCORE_BASELINE_MIN_TRIPS = 10
+_SCORE_BASELINE_MIN_DISTANCE_KM = 5.0
+_SCORE_BASELINE_BOUNDS: tuple[float, float] = (8.0, 20.0)
 # v0.5.25 — bounded GPS ring buffer fed by EVERY poll event (any
 # metric or location state change). At BYD-typical cadence (8-10 min)
 # 256 samples cover ~40 h. Live trips also append per-tick samples,
@@ -536,6 +547,14 @@ class EvTripLoggerCoordinator:
         # vehicle_on flips off. See _LIVE_OPEN_RETRY_DELAYS_S.
         self._pending_open_unsub: CALLBACK_TYPE | None = None
         self._pending_open_attempt: int = 0
+        # v0.5.50 — score baseline calibration. Updated from history at
+        # setup and after each new trip closes; the score column on every
+        # exposed trip is recomputed against this anchor so changing cars
+        # / driving styles doesn't permanently anchor the rating to one
+        # vehicle's curve. Stays at the default until enough history
+        # exists (see _async_refresh_score_baseline).
+        self.score_baseline_kwh_100km: float = _SCORE_BASELINE_DEFAULT
+        self.score_baseline_trip_count: int = 0
 
         # Reverse-geocode cache keyed on rounded (lat, lon) → friendly label.
         # Rounded to 4 decimal places (~10 m), which dedupes hits in the same
@@ -913,6 +932,45 @@ class EvTripLoggerCoordinator:
     def _notify_trip_log_listeners(self) -> None:
         for listener in list(self._trip_log_listeners):
             listener()
+        # v0.5.50 — any change in the persisted trip log (insert / delete
+        # / amend) may shift the P5 of consumption that anchors the
+        # score curve. Refresh asynchronously so a hot insert path
+        # doesn't pay for the query.
+        self.hass.async_create_task(self._async_refresh_score_baseline())
+
+    async def _async_refresh_score_baseline(self) -> None:
+        """v0.5.50 — recompute `score_baseline_kwh_100km` from history.
+
+        P5 of consumption_kwh_100km over trips with distance>=5 km maps
+        to 10/10. Falls back to 14.5 until there are at least
+        `_SCORE_BASELINE_MIN_TRIPS` such trips; clamps the result to
+        `_SCORE_BASELINE_BOUNDS` so a single fluke trip (or a sensor
+        glitch) can't pin the curve.
+        """
+        try:
+            p5, n = await self.storage.async_score_baseline_p5(
+                min_distance_km=_SCORE_BASELINE_MIN_DISTANCE_KM,
+                min_trips=_SCORE_BASELINE_MIN_TRIPS,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug("score baseline query failed: %s", exc)
+            return
+        self.score_baseline_trip_count = n
+        if p5 is None:
+            new_baseline = _SCORE_BASELINE_DEFAULT
+        else:
+            lo, hi = _SCORE_BASELINE_BOUNDS
+            new_baseline = max(lo, min(hi, p5))
+        if abs(new_baseline - self.score_baseline_kwh_100km) > 0.05:
+            _LOGGER.info(
+                "Score baseline shift: %.2f → %.2f kWh/100km (n=%d eligible trips)",
+                self.score_baseline_kwh_100km, new_baseline, n,
+            )
+            self.score_baseline_kwh_100km = new_baseline
+            # Re-render dependent sensors so the rating curves update.
+            self._notify_listeners()
+        else:
+            self.score_baseline_kwh_100km = new_baseline
 
     async def async_start(self) -> None:
         """Wire up state listeners and seed from existing storage."""
@@ -938,6 +996,11 @@ class EvTripLoggerCoordinator:
         self.last_completed_journey_id = (
             await self.storage.async_last_completed_journey_id(self.current_journey_id)
         )
+
+        # v0.5.50 — seed the per-car score baseline from history at boot
+        # so the very first sensor render uses the calibrated anchor
+        # instead of the 14.5 default flicker.
+        await self._async_refresh_score_baseline()
 
         # One-shot heal: re-cost every trip from its preceding charge's
         # price. Catches users whose CONF_ENERGY_PRICE was 0 at trip-close
@@ -3778,10 +3841,15 @@ class EvTripLoggerCoordinator:
         # Live cost: use the most recent charge price if any, else the home default.
         price_per_kwh = self._trip_cost_price_per_kwh()
         cost = (energy * price_per_kwh) if energy and energy > 0 else None
-        # Live score: same curve as TripRecord.score.
+        # Live score: same curve as TripRecord.score_with_baseline,
+        # anchored to the per-car baseline (v0.5.50). Inline rather
+        # than instantiating a TripRecord to avoid the round-trip.
         score = None
         if consumption is not None and consumption > 0:
-            score = max(0.0, min(10.0, 10.0 - max(0.0, consumption - 14.5) * 0.6))
+            baseline = self.score_baseline_kwh_100km
+            score = max(
+                0.0, min(10.0, 10.0 - max(0.0, consumption - baseline) * 0.6)
+            )
 
         self._snapshot_cache = {
             "distance_km": distance,

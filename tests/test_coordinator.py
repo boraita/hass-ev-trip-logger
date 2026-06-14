@@ -1528,3 +1528,70 @@ async def test_live_open_retry_cancelled_on_off_edge(hass: HomeAssistant) -> Non
     hass.states.async_set(ODO, "1000")
     await _advance(hass, 5)
     assert coordinator.current is None
+
+
+async def test_score_baseline_defaults_then_calibrates(hass: HomeAssistant) -> None:
+    """v0.5.50 — score baseline stays at 14.5 until 10 eligible trips
+    exist, then snaps to the P5 (clamped) and reshapes the score curve.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # No trips → default baseline.
+    assert coordinator.score_baseline_kwh_100km == 14.5
+    assert coordinator.score_baseline_trip_count == 0
+
+    # Insert 9 eligible trips → still under the 10-trip threshold, fallback.
+    base = dt_util.now()
+    for i in range(9):
+        await coordinator.storage.async_insert(TripRecord(
+            started_at=base - timedelta(days=i + 1, hours=1),
+            ended_at=base - timedelta(days=i + 1),
+            duration_min=60.0,
+            distance_km=20.0,
+            energy_kwh=4.0,
+            consumption_kwh_100km=10.0 + i,
+        ))
+    await coordinator._async_refresh_score_baseline()
+    assert coordinator.score_baseline_kwh_100km == 14.5
+    assert coordinator.score_baseline_trip_count == 9
+
+    # One more → 10 eligible trips, baseline = P5 = best (10.0). Clamped to
+    # the floor of 8.0 — 10.0 already lies above the floor, so we expect 10.0.
+    await coordinator.storage.async_insert(TripRecord(
+        started_at=base - timedelta(days=20, hours=1),
+        ended_at=base - timedelta(days=20),
+        duration_min=60.0,
+        distance_km=20.0,
+        energy_kwh=4.0,
+        consumption_kwh_100km=19.0,
+    ))
+    await coordinator._async_refresh_score_baseline()
+    assert coordinator.score_baseline_kwh_100km == pytest.approx(10.0)
+    assert coordinator.score_baseline_trip_count == 10
+
+
+async def test_score_baseline_clamped_to_bounds(hass: HomeAssistant) -> None:
+    """v0.5.50 — a fleet of weirdly-efficient trips (e.g. lots of downhill
+    or sensor errors) should NOT pin the baseline below the 8.0 floor.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    base = dt_util.now()
+    for i in range(15):
+        await coordinator.storage.async_insert(TripRecord(
+            started_at=base - timedelta(days=i + 1, hours=1),
+            ended_at=base - timedelta(days=i + 1),
+            duration_min=60.0,
+            distance_km=20.0,
+            energy_kwh=1.0,
+            consumption_kwh_100km=5.5,  # impossibly efficient
+        ))
+    await coordinator._async_refresh_score_baseline()
+    # All trips at 5.5 kWh/100km but the floor protects us.
+    assert coordinator.score_baseline_kwh_100km == 8.0

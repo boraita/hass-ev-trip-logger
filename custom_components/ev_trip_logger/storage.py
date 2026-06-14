@@ -194,15 +194,29 @@ class TripRecord:
 
     @property
     def score(self) -> float | None:
+        """Default score using the historical 14.5 kWh/100km anchor.
+
+        Kept for backwards compatibility. Production callers should prefer
+        `score_with_baseline(coordinator.score_baseline_kwh_100km)` which
+        adapts the 10/10 anchor to THIS car's own best-observed efficiency.
+        """
+        return self.score_with_baseline(14.5)
+
+    def score_with_baseline(self, baseline: float) -> float | None:
         """Efficiency rating 0–10 derived from kWh/100km.
 
-        Matches the BYD app curve: 14.5 kWh/100km ≈ 10, slope 0.6 per excess kWh.
-        Returns None when we don't have a consumption figure.
+        v0.5.50 — `baseline` is the kWh/100km value that maps to 10/10.
+        Slope is 0.6 points per excess kWh/100km. Originally the baseline
+        was hard-coded at 14.5 (matching the BYD app's curve), but it's
+        unfair on Teslas in the Alps. The coordinator now derives the
+        baseline from the car's own historical best (P5 of distance>=5km
+        trips, clamped to [8, 20]); the default of 14.5 is the fallback
+        when there's not enough history yet.
         """
         e = self.consumption_kwh_100km
         if e is None or e <= 0:
             return None
-        return max(0.0, min(10.0, 10.0 - max(0.0, e - 14.5) * 0.6))
+        return max(0.0, min(10.0, 10.0 - max(0.0, e - baseline) * 0.6))
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise for events / export."""
@@ -985,6 +999,45 @@ class TripStorage:
             "longest": _row_to_record(longest) if longest else None,
             "cheapest": _row_to_record(cheapest) if cheapest else None,
         }
+
+    async def async_score_baseline_p5(
+        self, *, min_distance_km: float = 5.0, min_trips: int = 10
+    ) -> tuple[float | None, int]:
+        """v0.5.50 — return (p5_consumption_kwh_100km, eligible_trip_count).
+
+        Used by the coordinator to derive a per-car score baseline. Returns
+        `(None, n)` when fewer than `min_trips` eligible trips exist (the
+        caller falls back to the 14.5 default). Eligibility filters out
+        sub-`min_distance_km` jaunts whose consumption is dominated by warm-
+        up and standby drain, and clamps to a sane physical band 5–50 to
+        suppress sensor errors.
+        """
+        return await self._hass.async_add_executor_job(
+            self._score_baseline_p5, min_distance_km, min_trips
+        )
+
+    def _score_baseline_p5(
+        self, min_distance_km: float, min_trips: int
+    ) -> tuple[float | None, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT consumption_kwh_100km FROM trips "
+                "WHERE consumption_kwh_100km IS NOT NULL "
+                "  AND consumption_kwh_100km BETWEEN 5 AND 50 "
+                "  AND distance_km IS NOT NULL "
+                "  AND distance_km >= ? "
+                "ORDER BY consumption_kwh_100km ASC",
+                (min_distance_km,),
+            ).fetchall()
+        values = [float(r[0]) for r in rows]
+        n = len(values)
+        if n < min_trips:
+            return (None, n)
+        # P5: pick the value at index floor(0.05 * (n - 1)) of the sorted
+        # ascending list. For n=10 → idx=0 (best ever); for n=20 → idx=0;
+        # n=40 → idx=1. The "best-but-not-fluke" tail.
+        idx = int(0.05 * (n - 1))
+        return (values[idx], n)
 
     async def async_recent_charges(self, limit: int = 10) -> list[ChargeRecord]:
         return await self._hass.async_add_executor_job(self._recent_charges, limit)
