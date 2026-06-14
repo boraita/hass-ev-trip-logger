@@ -1558,8 +1558,9 @@ async def test_score_baseline_defaults_then_calibrates(hass: HomeAssistant) -> N
     assert coordinator.score_baseline_kwh_100km == 14.5
     assert coordinator.score_baseline_trip_count == 9
 
-    # One more → 10 eligible trips, baseline = P5 = best (10.0). Clamped to
-    # the floor of 8.0 — 10.0 already lies above the floor, so we expect 10.0.
+    # One more → 10 eligible trips, P5 = best = 10.0. With the new
+    # floor pinned at the 14.5 default, the calibration can only RAISE
+    # the bar; a P5 of 10.0 below 14.5 keeps the anchor at 14.5.
     await coordinator.storage.async_insert(TripRecord(
         started_at=base - timedelta(days=20, hours=1),
         ended_at=base - timedelta(days=20),
@@ -1569,13 +1570,19 @@ async def test_score_baseline_defaults_then_calibrates(hass: HomeAssistant) -> N
         consumption_kwh_100km=19.0,
     ))
     await coordinator._async_refresh_score_baseline()
-    assert coordinator.score_baseline_kwh_100km == pytest.approx(10.0)
+    assert coordinator.score_baseline_kwh_100km == 14.5
     assert coordinator.score_baseline_trip_count == 10
 
 
-async def test_score_baseline_clamped_to_bounds(hass: HomeAssistant) -> None:
-    """v0.5.50 — a fleet of weirdly-efficient trips (e.g. lots of downhill
-    or sensor errors) should NOT pin the baseline below the 8.0 floor.
+async def test_score_baseline_never_drops_below_default(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.50 — calibration may raise the bar but never lower it.
+
+    User directive: 14.5 is the reference default. A fleet of
+    weirdly-efficient trips (downhill / sensor errors / regen-heavy
+    short trips) must NOT lower the anchor — otherwise every later
+    normal trip would score worse than it deserves.
     """
     from custom_components.ev_trip_logger.storage import TripRecord
 
@@ -1593,8 +1600,38 @@ async def test_score_baseline_clamped_to_bounds(hass: HomeAssistant) -> None:
             consumption_kwh_100km=5.5,  # impossibly efficient
         ))
     await coordinator._async_refresh_score_baseline()
-    # All trips at 5.5 kWh/100km but the floor protects us.
-    assert coordinator.score_baseline_kwh_100km == 8.0
+    # P5 = 5.5 → clamped UP to the 14.5 default (never lower).
+    assert coordinator.score_baseline_kwh_100km == 14.5
+
+
+async def test_score_baseline_raises_anchor_for_thirsty_cars(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.50 — for a car whose realistic best is worse than 14.5
+    (Tesla in mountain terrain, large SUVs), the calibration MUST
+    raise the 10/10 anchor to that car's actual best, otherwise the
+    score stays unfairly low.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    base = dt_util.now()
+    # 12 trips clustered around 17–22 kWh/100km — best = 17.0
+    for i, cons in enumerate([17.0, 17.5, 17.5, 18.0, 18.5, 19.0, 19.5,
+                              20.0, 20.5, 21.0, 21.5, 22.0]):
+        await coordinator.storage.async_insert(TripRecord(
+            started_at=base - timedelta(days=i + 1, hours=1),
+            ended_at=base - timedelta(days=i + 1),
+            duration_min=60.0,
+            distance_km=20.0,
+            energy_kwh=cons * 0.2,
+            consumption_kwh_100km=cons,
+        ))
+    await coordinator._async_refresh_score_baseline()
+    # P5 with n=12 → idx 0 → 17.0; above the 14.5 floor → adopted.
+    assert coordinator.score_baseline_kwh_100km == pytest.approx(17.0)
 
 
 async def test_battery_capacity_falls_back_to_declared_until_enough_charges(

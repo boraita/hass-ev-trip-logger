@@ -217,16 +217,21 @@ _VEHICLE_ON_OFF_DEBOUNCE_S = 3.0
 # off-edge or once another path opens the trip first.
 _LIVE_OPEN_RETRY_DELAYS_S: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0)
 # v0.5.50 — score baseline calibration.
-# Default 14.5 kWh/100km (matches BYD app's 10/10 anchor) is used until
-# the car has driven enough to derive its own best efficiency. P5 of
-# consumption_kwh_100km over trips with distance>=5 km maps to 10/10.
-# Min 10 such trips before adopting; bounded so a single freak trip down
-# a mountain (5 kWh/100km) or a faulty sensor (50 kWh/100km) can't
-# anchor the rating.
+# Default 14.5 kWh/100km is the reference anchor — the kWh/100km that
+# maps to 10/10 before any calibration kicks in. Once 10+ eligible trips
+# exist, the P5 of `consumption_kwh_100km` (distance ≥ 5 km) replaces
+# 14.5 — BUT the result is clamped to [14.5, 20.0]. The 14.5 floor is
+# deliberate: per the user's spec, the calibration may RAISE the bar
+# (Tesla needing 18 kWh/100km for 10/10 is realistic) but never LOWER
+# it (a freak downhill trip at 5 kWh/100km can't make every later trip
+# look terrible by anchoring at 5).
 _SCORE_BASELINE_DEFAULT = 14.5
 _SCORE_BASELINE_MIN_TRIPS = 10
 _SCORE_BASELINE_MIN_DISTANCE_KM = 5.0
-_SCORE_BASELINE_BOUNDS: tuple[float, float] = (8.0, 20.0)
+_SCORE_BASELINE_BOUNDS: tuple[float, float] = (
+    _SCORE_BASELINE_DEFAULT,  # 14.5 — calibration can only RAISE the bar
+    20.0,
+)
 # v0.5.51 — auto-calibration of effective battery capacity from real
 # charges (kwh / ΔSoC × 100). 30 % ΔSoC threshold filters top-ups
 # whose SoC quantization noise (±1 %) dwarfs the signal; 5-charge floor
