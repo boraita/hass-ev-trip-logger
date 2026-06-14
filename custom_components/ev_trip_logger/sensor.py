@@ -1043,6 +1043,16 @@ class RecentTripsSensor(_BaseTripSensor):
             # show a "calibrated for THIS car" caption next to the score.
             "score_baseline_kwh_100km": round(baseline, 2),
             "score_baseline_trip_count": self._coordinator.score_baseline_trip_count,
+            # v0.5.51 — visibility into the capacity calibration. The
+            # `effective_battery_capacity_kwh` is what every SoC→kWh
+            # conversion now uses; `n` lets the dashboard caption
+            # "calibrated from N real charges" vs the declared spec.
+            "effective_battery_capacity_kwh": round(
+                self._coordinator.battery_capacity, 2
+            ),
+            "battery_capacity_calibration_charges": (
+                self._coordinator._battery_capacity_calibration_n
+            ),
         }
 
 

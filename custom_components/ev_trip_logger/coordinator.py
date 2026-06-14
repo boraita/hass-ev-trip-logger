@@ -227,6 +227,15 @@ _SCORE_BASELINE_DEFAULT = 14.5
 _SCORE_BASELINE_MIN_TRIPS = 10
 _SCORE_BASELINE_MIN_DISTANCE_KM = 5.0
 _SCORE_BASELINE_BOUNDS: tuple[float, float] = (8.0, 20.0)
+# v0.5.51 — auto-calibration of effective battery capacity from real
+# charges (kwh / ΔSoC × 100). 30 % ΔSoC threshold filters top-ups
+# whose SoC quantization noise (±1 %) dwarfs the signal; 5-charge floor
+# avoids a single freak charge anchoring the value; bounds keep a
+# corrupted charge from suggesting an impossible 200 kWh pack.
+_CAPACITY_MIN_DELTA_PCT = 30.0
+_CAPACITY_MIN_CHARGES = 5
+_CAPACITY_BOUNDS_RATIO: tuple[float, float] = (0.5, 1.5)
+_CAPACITY_CHARGE_WINDOW = 30  # last N eligible charges
 # v0.5.25 — bounded GPS ring buffer fed by EVERY poll event (any
 # metric or location state change). At BYD-typical cadence (8-10 min)
 # 256 samples cover ~40 h. Live trips also append per-tick samples,
@@ -488,9 +497,19 @@ class EvTripLoggerCoordinator:
         # input_select, template sensor...). State == driver name.
         self._driver_sensor = merged.get(CONF_DRIVER_SENSOR)
 
-        self._battery_capacity = float(
+        self._battery_capacity_declared = float(
             merged.get(CONF_BATTERY_CAPACITY, DEFAULT_BATTERY_CAPACITY)
         )
+        # v0.5.51 — capacity DERIVED from real charges (kwh / ΔSoC × 100).
+        # The declared capacity in config can be optimistic for several
+        # reasons: manufacturer-spec "useable kWh" lies on the high side
+        # for some platforms, the pack degrades over time, and our
+        # SoC→kWh conversion ends up overstating `energy_kwh` by 30–40%
+        # on a Tesla until we calibrate. Stays None until enough
+        # charges with ΔSoC ≥ _CAPACITY_MIN_DELTA_PCT exist; then the
+        # property below prefers it.
+        self._battery_capacity_calibrated: float | None = None
+        self._battery_capacity_calibration_n: int = 0
         self._dcfc_threshold_kw = float(
             merged.get(CONF_DCFC_THRESHOLD_KW, DEFAULT_DCFC_THRESHOLD_KW)
         )
@@ -590,7 +609,19 @@ class EvTripLoggerCoordinator:
 
     @property
     def battery_capacity(self) -> float:
-        return self._battery_capacity
+        """Effective battery capacity in kWh.
+
+        v0.5.51 — prefers the value calibrated from real charges
+        (`_battery_capacity_calibrated`) when enough data exists; falls
+        back to the declared CONF_BATTERY_CAPACITY otherwise. Every
+        SoC→kWh conversion routes through this property, so a single
+        fix here propagates to energy_kwh, consumption, cost and score.
+        """
+        return (
+            self._battery_capacity_calibrated
+            if self._battery_capacity_calibrated is not None
+            else self._battery_capacity_declared
+        )
 
     @property
     def recent_limit(self) -> int:
@@ -932,11 +963,95 @@ class EvTripLoggerCoordinator:
     def _notify_trip_log_listeners(self) -> None:
         for listener in list(self._trip_log_listeners):
             listener()
-        # v0.5.50 — any change in the persisted trip log (insert / delete
-        # / amend) may shift the P5 of consumption that anchors the
-        # score curve. Refresh asynchronously so a hot insert path
-        # doesn't pay for the query.
+        # v0.5.50/51 — any change in the persisted log (trip or charge)
+        # may shift the calibration we use for SoC→kWh conversion (via
+        # `battery_capacity`) and/or the score curve baseline. Refresh
+        # both asynchronously; both queries are cheap and idempotent.
+        self.hass.async_create_task(self._async_refresh_battery_capacity())
         self.hass.async_create_task(self._async_refresh_score_baseline())
+
+    async def _async_refresh_battery_capacity(self) -> None:
+        """v0.5.51 — derive effective pack capacity from real charges.
+
+        Adopts the median of `kwh / ΔSoC × 100` over the last
+        `_CAPACITY_CHARGE_WINDOW` charges with ΔSoC ≥
+        `_CAPACITY_MIN_DELTA_PCT`. Requires `_CAPACITY_MIN_CHARGES` to
+        avoid anchoring on a single freak charge; clamps the result to
+        50–150 % of the declared capacity so a corrupted charge can't
+        suggest an impossibly small or large pack.
+        """
+        try:
+            median, n = await self.storage.async_effective_capacity_kwh(
+                min_delta_pct=_CAPACITY_MIN_DELTA_PCT,
+                min_charges=_CAPACITY_MIN_CHARGES,
+                window=_CAPACITY_CHARGE_WINDOW,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug("effective capacity query failed: %s", exc)
+            return
+        self._battery_capacity_calibration_n = n
+        if median is None:
+            new_value: float | None = None
+        else:
+            lo = self._battery_capacity_declared * _CAPACITY_BOUNDS_RATIO[0]
+            hi = self._battery_capacity_declared * _CAPACITY_BOUNDS_RATIO[1]
+            new_value = max(lo, min(hi, median))
+        prev = self._battery_capacity_calibrated
+        changed = (
+            (prev is None) != (new_value is None)
+            or (prev is not None and new_value is not None
+                and abs(new_value - prev) > 0.2)
+        )
+        self._battery_capacity_calibrated = new_value
+        if changed:
+            shown = new_value if new_value is not None else self._battery_capacity_declared
+            _LOGGER.info(
+                "Effective battery capacity: %.2f kWh "
+                "(n=%d charges, declared=%.2f)",
+                shown, n, self._battery_capacity_declared,
+            )
+            # v0.5.51 — backfill historical trips so the new capacity
+            # applies to old rows too, otherwise the dashboard would
+            # show a discontinuity between trips logged before/after the
+            # calibration kicked in. We only rewrite trips whose
+            # energy_kwh was SoC-derived (energy_source NULL / 'soc' /
+            # 'estimated'); power-integration-measured rows are left
+            # untouched. Cost gets a separate heal pass.
+            self.hass.async_create_task(self._async_heal_energy_after_calibration())
+            # SoC→kWh conversion drives almost everything visible —
+            # poke sensors so they re-render against the new value.
+            self._notify_listeners()
+
+    async def _async_heal_energy_after_calibration(self) -> None:
+        """v0.5.51 — backfill `energy_kwh` and `consumption_kwh_100km`
+        for SoC-derived trips against the freshly-calibrated capacity.
+        Re-costs the affected trips at the configured home tariff so the
+        dashboard's € column stays consistent. No-op on the
+        power-integration trips (those used direct measurement).
+        """
+        new_capacity = self.battery_capacity
+        try:
+            n = await self.storage.async_recompute_energy_from_capacity(new_capacity)
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.warning("Energy heal failed: %s", exc)
+            return
+        if n == 0:
+            return
+        _LOGGER.info(
+            "Energy heal: rewrote %d trip(s) against %.2f kWh capacity", n, new_capacity,
+        )
+        # Re-cost the just-rewritten trips at the home tariff.
+        try:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                default_price=self._energy_price
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug("Cost re-heal post-energy-heal failed: %s", exc)
+        # Refresh in-memory last_trip + listeners so the dashboard
+        # picks the rewritten values up immediately.
+        self.last_trip = await self.storage.async_get_last()
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
 
     async def _async_refresh_score_baseline(self) -> None:
         """v0.5.50 — recompute `score_baseline_kwh_100km` from history.
@@ -997,6 +1112,12 @@ class EvTripLoggerCoordinator:
             await self.storage.async_last_completed_journey_id(self.current_journey_id)
         )
 
+        # v0.5.51 — derive effective pack capacity from real charges
+        # BEFORE the score baseline runs (the baseline relies on
+        # consumption_kwh_100km, which derives from energy_kwh, which
+        # derives from this capacity — so refreshing in the wrong
+        # order leaves the first score render anchored to a stale curve).
+        await self._async_refresh_battery_capacity()
         # v0.5.50 — seed the per-car score baseline from history at boot
         # so the very first sensor render uses the calibrated anchor
         # instead of the 14.5 default flicker.
@@ -1621,7 +1742,7 @@ class EvTripLoggerCoordinator:
             else None
         )
         energy = (
-            (soc_used / 100.0) * self._battery_capacity
+            (soc_used / 100.0) * self.battery_capacity
             if soc_used is not None
             else None
         )
@@ -2225,7 +2346,7 @@ class EvTripLoggerCoordinator:
                 self._notify_listeners()
                 return
 
-        kwh = (soc_end - active.soc_start) / 100.0 * self._battery_capacity
+        kwh = (soc_end - active.soc_start) / 100.0 * self.battery_capacity
 
         if can_merge:
             merged = await self.storage.async_extend_last_charge(
@@ -2461,14 +2582,14 @@ class EvTripLoggerCoordinator:
             energy_kwh = None
             consumption = None
         else:
-            expected_soc = km_gap * _ORPHAN_DEFAULT_KWH_100KM / self._battery_capacity
+            expected_soc = km_gap * _ORPHAN_DEFAULT_KWH_100KM / self.battery_capacity
             ratio = (
                 soc_gap / expected_soc if expected_soc > 0 else float("inf")
             )
             if _ORPHAN_RATIO_MIN <= ratio <= _ORPHAN_RATIO_MAX:
                 confidence = "orphan"
                 soc_used_pct = soc_gap
-                energy_kwh = (soc_gap / 100.0) * self._battery_capacity
+                energy_kwh = (soc_gap / 100.0) * self.battery_capacity
                 consumption = (
                     (energy_kwh / km_gap * 100.0) if km_gap > 0 else None
                 )
@@ -2803,7 +2924,7 @@ class EvTripLoggerCoordinator:
             else None
         )
         energy_soc = (
-            (soc_used / 100.0) * self._battery_capacity
+            (soc_used / 100.0) * self.battery_capacity
             if soc_used is not None and soc_used > 0
             else None
         )
@@ -3475,7 +3596,7 @@ class EvTripLoggerCoordinator:
                 and soc_start > soc_end else None
             )
             energy = (
-                round((soc_used / 100.0) * self._battery_capacity, 2)
+                round((soc_used / 100.0) * self.battery_capacity, 2)
                 if soc_used is not None else None
             )
             cost = (
@@ -3552,7 +3673,7 @@ class EvTripLoggerCoordinator:
             else None
         )
         energy = (
-            (soc_used / 100.0) * self._battery_capacity
+            (soc_used / 100.0) * self.battery_capacity
             if soc_used is not None and soc_used > 0
             else None
         )
@@ -3812,7 +3933,7 @@ class EvTripLoggerCoordinator:
             else None
         )
         energy = (
-            (soc_used / 100.0) * self._battery_capacity
+            (soc_used / 100.0) * self.battery_capacity
             if soc_used is not None
             else None
         )
@@ -3877,7 +3998,7 @@ class EvTripLoggerCoordinator:
         if soc_now is None or active.soc_start is None or soc_now <= active.soc_start:
             kwh_so_far: float | None = 0.0
         else:
-            kwh_so_far = (soc_now - active.soc_start) / 100.0 * self._battery_capacity
+            kwh_so_far = (soc_now - active.soc_start) / 100.0 * self.battery_capacity
         # Live price: the user can correct it post-hoc on the last completed
         # charge; while in progress we project the configured home tariff.
         price_per_kwh = self._energy_price

@@ -1000,6 +1000,62 @@ class TripStorage:
             "cheapest": _row_to_record(cheapest) if cheapest else None,
         }
 
+    async def async_effective_capacity_kwh(
+        self,
+        *,
+        min_delta_pct: float = 30.0,
+        min_charges: int = 5,
+        window: int = 30,
+    ) -> tuple[float | None, int]:
+        """v0.5.51 — derive effective pack capacity from real charges.
+
+        Returns `(median_kwh, n)`. Each eligible charge yields a sample
+        `kwh / (soc_end - soc_start) × 100`. Eligibility:
+          * `soc_start`, `soc_end`, `kwh` all populated
+          * `(soc_end - soc_start) >= min_delta_pct` — keeps SoC
+            quantization noise (±1 %) from dominating
+          * `kwh > 0`
+        Aggregates the median of the last `window` eligible charges
+        (median is more robust than mean when one charge had a partially
+        depleted state-of-charge reading). Returns `(None, n)` when n <
+        min_charges and the caller should keep the declared capacity.
+        """
+        return await self._hass.async_add_executor_job(
+            self._effective_capacity_kwh, min_delta_pct, min_charges, window
+        )
+
+    def _effective_capacity_kwh(
+        self, min_delta_pct: float, min_charges: int, window: int
+    ) -> tuple[float | None, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT kwh, soc_start, soc_end FROM charges "
+                "WHERE kwh IS NOT NULL AND kwh > 0 "
+                "  AND soc_start IS NOT NULL AND soc_end IS NOT NULL "
+                "  AND (soc_end - soc_start) >= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (min_delta_pct, window),
+            ).fetchall()
+        samples: list[float] = []
+        for kwh, s0, s1 in rows:
+            try:
+                delta = float(s1) - float(s0)
+                if delta <= 0:
+                    continue
+                samples.append(float(kwh) / delta * 100.0)
+            except (TypeError, ValueError):
+                continue
+        n = len(samples)
+        if n < min_charges:
+            return (None, n)
+        samples.sort()
+        mid = n // 2
+        median = (
+            samples[mid] if n % 2 == 1
+            else (samples[mid - 1] + samples[mid]) / 2.0
+        )
+        return (median, n)
+
     async def async_score_baseline_p5(
         self, *, min_distance_km: float = 5.0, min_trips: int = 10
     ) -> tuple[float | None, int]:
@@ -1419,6 +1475,46 @@ class TripStorage:
                 "WHERE id = ?",
                 (start_address, end_address, trip_id),
             )
+
+    async def async_recompute_energy_from_capacity(
+        self, new_capacity_kwh: float
+    ) -> int:
+        """v0.5.51 — rewrite `energy_kwh` and `consumption_kwh_100km` for
+        every trip that was originally SoC-derived, against the new
+        battery capacity.
+
+        Trips with `energy_source = 'power_integration'` are left alone:
+        those were measured directly, not estimated from SoC drop.
+        Trips with energy_source NULL or 'soc' or 'estimated' are
+        rewritten as `soc_used_pct × new_capacity / 100`. The cost is
+        re-derived from the same `energy_kwh × price_per_kwh` formula
+        we use everywhere else (call
+        `async_recompute_trip_costs_from_charges` afterwards to apply
+        the user's home tariff).
+
+        Returns the number of rows updated.
+        """
+        return await self._hass.async_add_executor_job(
+            self._recompute_energy_from_capacity, float(new_capacity_kwh)
+        )
+
+    def _recompute_energy_from_capacity(self, new_capacity_kwh: float) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE trips SET
+                    energy_kwh = ROUND(soc_used_pct * ? / 100.0, 4),
+                    consumption_kwh_100km = ROUND(
+                        soc_used_pct * ? / 100.0 / distance_km * 100.0, 4
+                    )
+                WHERE soc_used_pct IS NOT NULL AND soc_used_pct > 0
+                  AND distance_km IS NOT NULL AND distance_km > 0
+                  AND (energy_source IS NULL
+                       OR energy_source IN ('soc', 'estimated'))
+                """,
+                (new_capacity_kwh, new_capacity_kwh),
+            )
+            return int(cur.rowcount or 0)
 
     async def async_recompute_trip_costs_from_charges(
         self, default_price: float = 0.0

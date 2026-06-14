@@ -395,3 +395,135 @@ async def test_extend_last_charge_uses_absolute_soc_end(
     )
     assert merged2 is not None
     assert merged2.soc_end == pytest.approx(66.0)
+
+
+async def test_effective_capacity_below_threshold(storage: TripStorage) -> None:
+    """v0.5.51 — under min_charges → None (coordinator falls back to spec)."""
+    # 4 eligible charges with ΔSoC ≥ 30, but threshold needs 5.
+    for soc_s, soc_e, kwh in [
+        (20.0, 80.0, 50.0),
+        (15.0, 75.0, 51.0),
+        (10.0, 70.0, 49.0),
+        (5.0, 65.0, 50.5),
+    ]:
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=1),
+            ended_at=dt_util.now(),
+            kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
+            soc_start=soc_s, soc_end=soc_e,
+        ))
+    cap, n = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5
+    )
+    assert cap is None
+    assert n == 4
+
+
+async def test_effective_capacity_median_of_eligible_charges(
+    storage: TripStorage,
+) -> None:
+    """v0.5.51 — capacity is the median of kwh/ΔSoC over eligible charges.
+
+    With samples [80, 82, 83, 85, 90] kWh implied, median = 83.
+    """
+    samples = [
+        (20.0, 70.0, 40.0),   # 50% Δ, 40 kWh → 80
+        (10.0, 60.0, 41.0),   # 50% Δ, 41 kWh → 82
+        (15.0, 65.0, 41.5),   # 50% Δ, 41.5 kWh → 83
+        (20.0, 60.0, 34.0),   # 40% Δ, 34 kWh → 85
+        (25.0, 75.0, 45.0),   # 50% Δ, 45 kWh → 90
+    ]
+    for s0, s1, kwh in samples:
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=1),
+            ended_at=dt_util.now(),
+            kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
+            soc_start=s0, soc_end=s1,
+        ))
+    cap, n = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5
+    )
+    assert n == 5
+    assert cap == pytest.approx(83.0)
+
+
+async def test_effective_capacity_filters_small_top_ups(
+    storage: TripStorage,
+) -> None:
+    """v0.5.51 — charges with ΔSoC < 30 % are ignored (SoC quantization noise)."""
+    # 5 big charges (eligible) + 10 small top-ups (excluded).
+    for _ in range(10):
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=1),
+            ended_at=dt_util.now(),
+            kwh=2.0, price_per_kwh=0.2, total_cost=0.4,
+            soc_start=78.0, soc_end=80.0,  # 2 % → would imply 100 kWh, ignored
+        ))
+    for _ in range(5):
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=1),
+            ended_at=dt_util.now(),
+            kwh=40.0, price_per_kwh=0.2, total_cost=8.0,
+            soc_start=20.0, soc_end=80.0,  # 60 % Δ → 66.67 kWh
+        ))
+    cap, n = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5
+    )
+    assert n == 5
+    assert cap == pytest.approx(66.67, abs=0.05)
+
+
+async def test_recompute_energy_from_capacity_rewrites_soc_trips(
+    storage: TripStorage,
+) -> None:
+    """v0.5.51 — heal updates SoC-derived trips against a new capacity."""
+    # Insert: 1 trip from SoC at the OLD 80-kWh capacity, 1 from power.
+    soc_trip = _trip(
+        distance_km=50.0, soc_used_pct=10.0,
+        energy_kwh=8.0,  # was: 10% * 80 / 100
+        consumption_kwh_100km=16.0,
+        energy_source="soc",
+    )
+    power_trip = _trip(
+        distance_km=50.0, soc_used_pct=10.0,
+        energy_kwh=7.5,  # measured directly; smaller than SoC-derived
+        consumption_kwh_100km=15.0,
+        energy_source="power_integration",
+    )
+    soc_id = await storage.async_insert(soc_trip)
+    power_id = await storage.async_insert(power_trip)
+
+    # New calibrated capacity: 70 kWh (degraded pack).
+    n = await storage.async_recompute_energy_from_capacity(70.0)
+    assert n == 1  # only the SoC-derived row
+
+    # SoC trip rewritten to 10% * 70 / 100 = 7.0 kWh, 14 kWh/100km.
+    rewritten = await storage.async_get_last()
+    # Most recent is power_trip — unchanged.
+    assert rewritten.trip_id == power_id
+    assert rewritten.energy_kwh == pytest.approx(7.5)
+
+    # Pull the SoC row directly to verify the rewrite.
+    recent = await storage.async_recent_trips(limit=10)
+    by_id = {t.trip_id: t for t in recent}
+    healed = by_id[soc_id]
+    assert healed.energy_kwh == pytest.approx(7.0)
+    assert healed.consumption_kwh_100km == pytest.approx(14.0)
+
+
+async def test_recompute_energy_skips_rows_without_soc_used(
+    storage: TripStorage,
+) -> None:
+    """v0.5.51 — rows without soc_used_pct can't be rescaled. The heal
+    must skip them rather than producing NaN/None corruption.
+    """
+    await storage.async_insert(_trip(
+        distance_km=50.0, soc_used_pct=None, energy_kwh=8.0,
+        energy_source="soc",
+    ))
+    await storage.async_insert(_trip(
+        distance_km=50.0, soc_used_pct=10.0, energy_kwh=8.0,
+        energy_source="soc",
+    ))
+    n = await storage.async_recompute_energy_from_capacity(70.0)
+    assert n == 1  # only the row with soc_used_pct survives the guard

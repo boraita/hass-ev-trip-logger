@@ -1595,3 +1595,75 @@ async def test_score_baseline_clamped_to_bounds(hass: HomeAssistant) -> None:
     await coordinator._async_refresh_score_baseline()
     # All trips at 5.5 kWh/100km but the floor protects us.
     assert coordinator.score_baseline_kwh_100km == 8.0
+
+
+async def test_battery_capacity_falls_back_to_declared_until_enough_charges(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.51 — until 5 eligible charges exist, capacity = declared spec."""
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 80.0})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator.battery_capacity == 80.0
+
+    # Insert 4 eligible charges → still under the floor.
+    for _ in range(4):
+        await coordinator.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=2),
+            ended_at=dt_util.now() - timedelta(hours=1),
+            kwh=42.0, price_per_kwh=0.2, total_cost=8.4,
+            soc_start=10.0, soc_end=70.0,  # 60 % Δ → 70 kWh implied
+        ))
+    await coordinator._async_refresh_battery_capacity()
+    assert coordinator.battery_capacity == 80.0  # still declared
+
+
+async def test_battery_capacity_calibrates_from_real_charges(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.51 — with ≥5 eligible charges, capacity = median(kwh/ΔSoC).
+
+    Declared 100 kWh but real charges imply ~70 kWh → property returns 70.
+    Score / energy / consumption all recompute against the calibrated
+    value the next time they're read.
+    """
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 100.0})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    for _ in range(6):
+        await coordinator.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=2),
+            ended_at=dt_util.now() - timedelta(hours=1),
+            kwh=42.0, price_per_kwh=0.2, total_cost=8.4,
+            soc_start=10.0, soc_end=70.0,  # 60 % Δ → 70 kWh implied
+        ))
+    await coordinator._async_refresh_battery_capacity()
+    assert coordinator.battery_capacity == pytest.approx(70.0)
+
+
+async def test_battery_capacity_clamped_to_declared_bounds(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.51 — a string of corrupted charges suggesting absurd capacity
+    must not overwrite the declared value beyond ±50 %.
+    """
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 80.0})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # 5 charges that imply 30 kWh — below the floor (40 = 80 * 0.5).
+    for _ in range(5):
+        await coordinator.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=2),
+            ended_at=dt_util.now() - timedelta(hours=1),
+            kwh=18.0, price_per_kwh=0.2, total_cost=3.6,
+            soc_start=10.0, soc_end=70.0,  # 60 % Δ → 30 kWh implied
+        ))
+    await coordinator._async_refresh_battery_capacity()
+    # Clamped at the floor (50 % of declared 80 = 40 kWh), not the
+    # raw 30 kWh that the corrupted charges would have implied.
+    assert coordinator.battery_capacity == pytest.approx(40.0)
