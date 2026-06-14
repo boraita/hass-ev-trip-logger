@@ -1447,3 +1447,84 @@ async def test_v050_calendar_entity_emits_daily_events(hass: HomeAssistant) -> N
     today_evt = [e for e in events if e.start == today.date()][0]
     assert "2 trips" in today_evt.summary
     assert "23" in today_evt.summary  # 12 + 11 km
+
+
+async def test_live_open_retries_when_odometer_stale(hass: HomeAssistant) -> None:
+    """v0.5.49 — vehicle_on=on arrives before odometer settles (BYD cloud
+    poll lag). The opener must defer instead of bailing, and open the trip
+    on the first retry once the odometer becomes readable.
+    """
+    # Battery is fresh, odometer is unknown — common pattern on BYD when
+    # ignition fires between cloud-poll cycles.
+    hass.states.async_set(ODO, STATE_UNKNOWN)
+    hass.states.async_set(BAT, "80")
+    hass.states.async_set(VOK, STATE_OFF)
+    data = {
+        CONF_NAME: "Test EV",
+        CONF_ODOMETER: ODO,
+        CONF_BATTERY: BAT,
+        CONF_VEHICLE_ON: VOK,
+        CONF_BATTERY_CAPACITY: 75.0,
+        CONF_MIN_TRIP_DISTANCE: 0.5,
+        CONF_IDLE_TIMEOUT: 1,
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=data, title="Test EV")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator.current is None
+
+    # Ignition fires. Odometer still stale → no trip yet, but a retry
+    # is scheduled.
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current is None
+    assert coordinator._pending_open_unsub is not None
+
+    # Odometer settles after a few seconds (cloud poll lands).
+    hass.states.async_set(ODO, "1000")
+    await hass.async_block_till_done()
+    # The metric-changed handler opens the trip immediately and cancels
+    # the deferred retry.
+    assert coordinator.current is not None
+    assert coordinator.current.odometer_start == 1000.0
+    assert coordinator._pending_open_unsub is None
+
+
+async def test_live_open_retry_cancelled_on_off_edge(hass: HomeAssistant) -> None:
+    """v0.5.49 — a brief on→off flap with odometer stale must NOT spawn a
+    delayed trip. Without the off-edge cancel, the retry chain would fire
+    minutes later and open a phantom trip while the car is parked.
+    """
+    hass.states.async_set(ODO, STATE_UNKNOWN)
+    hass.states.async_set(BAT, "80")
+    hass.states.async_set(VOK, STATE_OFF)
+    data = {
+        CONF_NAME: "Test EV",
+        CONF_ODOMETER: ODO,
+        CONF_BATTERY: BAT,
+        CONF_VEHICLE_ON: VOK,
+        CONF_BATTERY_CAPACITY: 75.0,
+        CONF_MIN_TRIP_DISTANCE: 0.5,
+        CONF_IDLE_TIMEOUT: 1,
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=data, title="Test EV")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator._pending_open_unsub is not None
+
+    # User unlocked the car but didn't drive — vehicle_on flips back off.
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    assert coordinator._pending_open_unsub is None
+
+    # Even if odometer settles later, no trip should open (no on-edge).
+    hass.states.async_set(ODO, "1000")
+    await _advance(hass, 5)
+    assert coordinator.current is None

@@ -207,6 +207,15 @@ _MAX_SYNTH_BASELINE_AGE = timedelta(hours=2)
 # into two short trips with a near-zero gap. The debounce coalesces
 # off-edges in this window into one close.
 _VEHICLE_ON_OFF_DEBOUNCE_S = 3.0
+# v0.5.49 — live-path retry on the vehicle_on=on edge. Cloud-polled
+# integrations (BYD, Tesla Fleet) often raise vehicle_on a poll-cycle
+# before the odometer entity catches up to the fresh value. Previously
+# the live opener bailed silently and every trip fell to the synthetic
+# path — which loses regen, max_power, max_speed and temperature samples.
+# Now we kick `homeassistant.update_entity` and re-check at these
+# offsets while vehicle_on stays ON. The chain is cancelled on any
+# off-edge or once another path opens the trip first.
+_LIVE_OPEN_RETRY_DELAYS_S: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0)
 # v0.5.25 — bounded GPS ring buffer fed by EVERY poll event (any
 # metric or location state change). At BYD-typical cadence (8-10 min)
 # 256 samples cover ~40 h. Live trips also append per-tick samples,
@@ -522,6 +531,11 @@ class EvTripLoggerCoordinator:
         # off-edge timestamp so a follow-up on→off within
         # _VEHICLE_ON_OFF_DEBOUNCE_S can be detected and re-coalesced.
         self._pending_close_unsub: CALLBACK_TYPE | None = None
+        # v0.5.49 — live-open retry chain. Set when vehicle_on=on arrives
+        # but odometer is still stale; cleared as soon as a trip opens or
+        # vehicle_on flips off. See _LIVE_OPEN_RETRY_DELAYS_S.
+        self._pending_open_unsub: CALLBACK_TYPE | None = None
+        self._pending_open_attempt: int = 0
 
         # Reverse-geocode cache keyed on rounded (lat, lon) → friendly label.
         # Rounded to 4 decimal places (~10 m), which dedupes hits in the same
@@ -1087,6 +1101,9 @@ class EvTripLoggerCoordinator:
         self._unsub_synth_finalize = None
         self._unsub_location = None
         self._synth_baseline = None
+        # v0.5.49 — make sure a deferred live-open retry doesn't fire
+        # after async_stop (would touch a stopped coordinator).
+        self._cancel_pending_open()
 
     @callback
     def _async_vehicle_on_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -1109,35 +1126,19 @@ class EvTripLoggerCoordinator:
                 )
                 return
             if self.current is None:
-                # Defer opening if metrics aren't ready yet — avoids recording
-                # a bogus odometer_start. The next metric tick will not re-open
-                # automatically, so the user only loses a trip if the BYD
-                # entity reports on before its odometer/battery do, which is
-                # very brief in practice.
-                if (
-                    self._read_float(self._odometer) is None
-                    or self._read_float(self._battery) is None
-                ):
-                    _LOGGER.warning(
-                        "vehicle_on=on but odometer/battery not ready; not opening trip"
-                    )
-                    return
-                # v0.5.16 — mutual exclusion: a charge session must end
-                # before a trip opens. Chain via an async helper so the
-                # close completes BEFORE _open_trip, letting
-                # _resolve_soc_start consume the freshly-closed
-                # last_charge.soc_end as the new trip's anchor.
-                if self.current_charge is not None:
-                    _LOGGER.info(
-                        "vehicle_on=on with charge in progress — "
-                        "closing charge before opening trip"
-                    )
-                    self.hass.async_create_task(
-                        self._async_close_charge_then_open_trip(now)
-                    )
-                else:
-                    self._open_trip(now)
-        elif self.current is not None:
+                # v0.5.49 — try to open immediately. If odometer isn't
+                # ready yet (BYD cloud-poll lag), the helper schedules
+                # retries instead of bailing silently. battery=None is
+                # tolerated: _resolve_soc_start already handles it via
+                # the SoC ring buffer / last_charge anchor.
+                self._async_try_live_open(now, attempt=0)
+            return
+        # v0.5.49 — any off-edge cancels a pending live-open retry chain.
+        # Without this, a brief on→off flap (BYD sometimes emits one as
+        # the user merely unlocks the car) would still try to open a
+        # trip 30-60 s later, after the car is already settled.
+        self._cancel_pending_open()
+        if self.current is not None:
             # v0.5.16 — debounced close. Captures the off timestamp so
             # the trip's ended_at reflects the actual off-edge, not the
             # debounce expiry. If a fresh on arrives before the timer
@@ -1156,6 +1157,117 @@ class EvTripLoggerCoordinator:
             self._pending_close_unsub = async_call_later(
                 self.hass, _VEHICLE_ON_OFF_DEBOUNCE_S, _debounced_close
             )
+
+    @callback
+    def _cancel_pending_open(self) -> None:
+        if self._pending_open_unsub is not None:
+            self._pending_open_unsub()
+            self._pending_open_unsub = None
+        self._pending_open_attempt = 0
+
+    @callback
+    def _async_try_live_open(self, now: datetime, *, attempt: int) -> None:
+        """Open a live trip when odometer is fresh, else schedule a retry.
+
+        v0.5.49 — cloud-polled integrations (BYD, Tesla Fleet) often raise
+        `vehicle_on=on` a poll-cycle before the odometer entity catches
+        up. Before this, the live opener bailed and every trip fell to
+        the synthetic path — which loses regen / max_power / max_speed /
+        avg_temp.
+
+        Strategy:
+          * If odometer is already readable → open immediately. battery
+            being None is fine (`_resolve_soc_start` handles it).
+          * Else: kick `homeassistant.update_entity` to nudge the cloud
+            poll and re-check at the next entry in _LIVE_OPEN_RETRY_DELAYS_S.
+          * Any off-edge cancels the chain (`_cancel_pending_open`).
+          * If another path opens the trip first (metric arrival,
+            charge-close chain), the next retry sees `self.current is
+            not None` and exits silently.
+        """
+        # A previous attempt's timer may still be queued — replace it.
+        self._cancel_pending_open()
+
+        if self.current is not None:
+            return
+        # Re-check vehicle_on at every retry; the user may have turned
+        # the car off mid-chain (handled by the off-edge cancel, but a
+        # state read is a cheap second line of defence).
+        if self._read_bool(self._vehicle_on) is not True:
+            return
+
+        if self.current_charge is not None:
+            # v0.5.16 — mutual exclusion: close the charge first so its
+            # final SoC anchors the new trip. Charge close races the
+            # retry chain; cancel the chain because the chained helper
+            # already opens the trip on its own once close persists.
+            _LOGGER.info(
+                "vehicle_on=on with charge in progress — "
+                "closing charge before opening trip"
+            )
+            self.hass.async_create_task(
+                self._async_close_charge_then_open_trip(now)
+            )
+            return
+
+        if self._read_float(self._odometer) is not None:
+            self._open_trip(now)
+            return
+
+        # Odometer still stale. Nudge the upstream poll, then queue the
+        # next retry. If we've exhausted the chain, log once and let the
+        # synthetic path own this trip.
+        if self._odometer or self._battery:
+            self.hass.async_create_task(self._async_force_refresh_metrics())
+
+        if attempt >= len(_LIVE_OPEN_RETRY_DELAYS_S):
+            _LOGGER.info(
+                "vehicle_on=on but odometer never settled after %d retries"
+                " (%.0f s total); leaving trip to the synthetic path",
+                attempt, sum(_LIVE_OPEN_RETRY_DELAYS_S),
+            )
+            self._pending_open_attempt = 0
+            return
+
+        delay = _LIVE_OPEN_RETRY_DELAYS_S[attempt]
+        next_attempt = attempt + 1
+        _LOGGER.debug(
+            "Deferring live-open: odometer not ready"
+            " (attempt %d/%d, retry in %.0fs)",
+            next_attempt, len(_LIVE_OPEN_RETRY_DELAYS_S), delay,
+        )
+
+        @callback
+        def _retry(_at: datetime) -> None:
+            self._pending_open_unsub = None
+            self._async_try_live_open(dt_util.now(), attempt=next_attempt)
+
+        self._pending_open_unsub = async_call_later(self.hass, delay, _retry)
+        self._pending_open_attempt = next_attempt
+
+    async def _async_force_refresh_metrics(self) -> None:
+        """v0.5.49 — kick `homeassistant.update_entity` on battery+odometer
+        to shorten the BYD cloud-poll gap at vehicle_on=on. Best-effort;
+        any failure is swallowed (logged at debug). Distinct from
+        `_async_force_refresh_location` because that one targets the
+        device_tracker; here we only care about the float metrics.
+        """
+        targets: list[str] = []
+        if self._odometer:
+            targets.append(self._odometer)
+        if self._battery:
+            targets.append(self._battery)
+        if not targets:
+            return
+        try:
+            await self.hass.services.async_call(
+                "homeassistant",
+                "update_entity",
+                {"entity_id": targets},
+                blocking=False,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug("update_entity refresh (metrics) failed: %s", exc)
 
     @callback
     def _async_metric_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -1205,6 +1317,11 @@ class EvTripLoggerCoordinator:
             and self._read_bool(self._vehicle_on) is True
             and self._read_float(self._odometer) is not None
         ):
+            # v0.5.49 — odometer just landed; the deferred retry chain
+            # would still re-check soon, but opening here makes the
+            # response immediate and avoids a stale `_pending_open_unsub`
+            # firing a no-op a few seconds later.
+            self._cancel_pending_open()
             self._open_trip(dt_util.now())
             return
 
@@ -2350,6 +2467,10 @@ class EvTripLoggerCoordinator:
             self._unsub_synth_finalize()
             self._unsub_synth_finalize = None
         self._synth_baseline = None
+        # v0.5.49 — any path that reaches _open_trip means a trip is
+        # being opened NOW; drop any deferred retry so it can't fire
+        # later and try to open a second one.
+        self._cancel_pending_open()
         odometer = self._read_float(self._odometer)
         # v0.5.41 — detect a km gap with the previous trip BEFORE
         # resolving SoC. If a gap is found, suppress the snap-on-
