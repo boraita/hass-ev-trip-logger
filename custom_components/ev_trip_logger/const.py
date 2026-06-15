@@ -15,6 +15,12 @@ CONF_POWER: Final = "power_sensor"
 CONF_CHARGE_SENSOR: Final = "charge_sensor"
 CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
+# v0.5.54 — optional weather.* entity (any HA weather integration:
+# AEMET, Met.no, OpenWeatherMap, ...). When set, we snapshot temperature
+# / condition / humidity / wind / precipitation at trip open and close
+# and store the averages on the trip row, enabling season/temp/time
+# breakdowns of consumption.
+CONF_WEATHER_ENTITY: Final = "weather_entity"
 CONF_SPEED: Final = "speed_sensor"
 CONF_PLUG_SENSOR: Final = "plug_sensor"
 # v0.5.35 — optional polling-pause sensor (e.g. BYD's

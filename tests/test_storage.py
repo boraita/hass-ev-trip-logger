@@ -527,3 +527,62 @@ async def test_recompute_energy_skips_rows_without_soc_used(
     ))
     n = await storage.async_recompute_energy_from_capacity(70.0)
     assert n == 1  # only the row with soc_used_pct survives the guard
+
+
+async def test_aggregates_by_season_groups_trips(storage: TripStorage) -> None:
+    """v0.5.54 — trips bucketed by Northern-hemisphere meteorological season."""
+    base = datetime(2026, 1, 15, 9, 0)  # January = winter
+    await storage.async_insert(_trip(
+        started_at=base, ended_at=base + timedelta(hours=1),
+        distance_km=20.0, energy_kwh=4.0, consumption_kwh_100km=20.0,
+        ambient_temp_c=3.0,
+    ))
+    summer = datetime(2026, 7, 15, 9, 0)
+    await storage.async_insert(_trip(
+        started_at=summer, ended_at=summer + timedelta(hours=1),
+        distance_km=20.0, energy_kwh=3.0, consumption_kwh_100km=15.0,
+        ambient_temp_c=28.0,
+    ))
+    out = await storage.async_aggregates_by_season()
+    assert out["winter"]["trips"] == 1
+    assert out["winter"]["avg_consumption_kwh_100km"] == pytest.approx(20.0)
+    assert out["winter"]["avg_ambient_temp_c"] == pytest.approx(3.0)
+    assert out["summer"]["trips"] == 1
+    assert out["summer"]["avg_consumption_kwh_100km"] == pytest.approx(15.0)
+    assert out["spring"]["trips"] == 0
+    assert out["autumn"]["trips"] == 0
+
+
+async def test_aggregates_by_temp_bucket_filters_unknown(
+    storage: TripStorage,
+) -> None:
+    """v0.5.54 — ambient_temp_c=None goes to `unknown` bucket."""
+    await storage.async_insert(_trip(distance_km=20.0, ambient_temp_c=2.0))
+    await storage.async_insert(_trip(distance_km=20.0, ambient_temp_c=18.0))
+    await storage.async_insert(_trip(distance_km=20.0, ambient_temp_c=None))
+    out = await storage.async_aggregates_by_temp_bucket()
+    assert out["cold"]["trips"] == 1     # 2 < 5
+    assert out["mild"]["trips"] == 1     # 15 ≤ 18 < 25
+    assert out["unknown"]["trips"] == 1
+    assert out["cool"]["trips"] == 0
+
+
+async def test_capacity_history_round_trip(storage: TripStorage) -> None:
+    """v0.5.54 — snapshots are returned oldest → newest."""
+    t0 = datetime(2026, 1, 1, 12, 0)
+    await storage.async_insert_capacity_snapshot(82.5, 82.5, 10, t0)
+    await storage.async_insert_capacity_snapshot(
+        81.8, 82.5, 14, t0 + timedelta(days=90)
+    )
+    await storage.async_insert_capacity_snapshot(
+        81.2, 82.5, 18, t0 + timedelta(days=180)
+    )
+    history = await storage.async_capacity_history(limit=10)
+    assert len(history) == 3
+    assert history[0]["calibrated_kwh"] == pytest.approx(82.5)
+    assert history[-1]["calibrated_kwh"] == pytest.approx(81.2)
+
+    latest = await storage.async_latest_capacity_snapshot()
+    assert latest is not None
+    assert latest[1] == pytest.approx(81.2)
+    assert latest[3] == 18

@@ -190,6 +190,12 @@ class TripRecord:
     confidence: str | None = None
     # v0.5.43: driver identity captured from the configured driver sensor.
     driver: str | None = None
+    # v0.5.54: weather snapshot averages from the configured weather entity.
+    ambient_temp_c: float | None = None
+    weather_condition: str | None = None
+    humidity_pct: float | None = None
+    wind_kmh: float | None = None
+    precipitation_mm: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -368,6 +374,35 @@ class TripStorage:
         # v0.5.43: per-trip driver identity.
         if "driver" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN driver TEXT")
+        # v0.5.54: weather snapshot — averages of start/close readings
+        # from the configured weather.* entity. All optional (NULL when
+        # CONF_WEATHER_ENTITY isn't set).
+        for col in (
+            "ambient_temp_c", "humidity_pct", "wind_kmh", "precipitation_mm",
+        ):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
+        if "weather_condition" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN weather_condition TEXT")
+        # v0.5.54: longitudinal battery capacity tracking. Each row
+        # is a snapshot of the calibration result (the median of
+        # `kwh/ΔSoC × 100` over recent charges). Comparing earliest
+        # vs most recent reveals SoH degradation over time.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS capacity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_at TEXT NOT NULL,
+                calibrated_kwh REAL NOT NULL,
+                declared_kwh REAL NOT NULL,
+                n_charges INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capacity_history_observed_at "
+            "ON capacity_history(observed_at)"
+        )
         # Safe to call on fresh or migrated DBs.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trips_journey_id ON trips(journey_id)"
@@ -423,8 +458,10 @@ class TripStorage:
                     start_address, end_address,
                     soc_start_source, energy_source, energy_from_power,
                     gps_distance_km, kwh_charged_before, kwh_charged_during,
-                    confidence, driver
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    confidence, driver,
+                    ambient_temp_c, weather_condition, humidity_pct,
+                    wind_kmh, precipitation_mm
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -462,6 +499,11 @@ class TripStorage:
                     record.kwh_charged_during,
                     record.confidence,
                     record.driver,
+                    record.ambient_temp_c,
+                    record.weather_condition,
+                    record.humidity_pct,
+                    record.wind_kmh,
+                    record.precipitation_mm,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -2105,6 +2147,272 @@ class TripStorage:
             "avg_soc_added": float(sd) if sd is not None else None,
         }
 
+    # ------------------------------------------------------------------
+    # v0.5.54 — degradation tracking + season/weather aggregates
+    # ------------------------------------------------------------------
+
+    async def async_insert_capacity_snapshot(
+        self, calibrated_kwh: float, declared_kwh: float, n_charges: int,
+        when: datetime,
+    ) -> int:
+        """v0.5.54 — persist a capacity-calibration snapshot.
+
+        The coordinator calls this when `_async_refresh_battery_capacity`
+        produces a value that differs from the latest stored row by more
+        than `_CAPACITY_HISTORY_MIN_DELTA_KWH` (0.5 kWh). Repeated calls
+        with the same value just update the latest row's `n_charges`
+        (more data, same conclusion).
+        """
+        return await self._hass.async_add_executor_job(
+            self._insert_capacity_snapshot,
+            calibrated_kwh, declared_kwh, n_charges, when,
+        )
+
+    def _insert_capacity_snapshot(
+        self, calibrated_kwh: float, declared_kwh: float,
+        n_charges: int, when: datetime,
+    ) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO capacity_history "
+                "(observed_at, calibrated_kwh, declared_kwh, n_charges) "
+                "VALUES (?, ?, ?, ?)",
+                (when.isoformat(), calibrated_kwh, declared_kwh, n_charges),
+            )
+            return int(cur.lastrowid or 0)
+
+    async def async_latest_capacity_snapshot(
+        self,
+    ) -> tuple[datetime, float, float, int] | None:
+        """v0.5.54 — return the most recent capacity snapshot or None."""
+        return await self._hass.async_add_executor_job(
+            self._latest_capacity_snapshot
+        )
+
+    def _latest_capacity_snapshot(
+        self,
+    ) -> tuple[datetime, float, float, int] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT observed_at, calibrated_kwh, declared_kwh, n_charges "
+                "FROM capacity_history ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            datetime.fromisoformat(row[0]),
+            float(row[1]),
+            float(row[2]),
+            int(row[3]),
+        )
+
+    async def async_capacity_history(
+        self, limit: int = 24,
+    ) -> list[dict[str, Any]]:
+        """v0.5.54 — return the last `limit` capacity snapshots, oldest first.
+
+        Powers the `battery_capacity_trend` sensor: comparing the first
+        snapshot (oldest) with the latest yields the degradation slope.
+        """
+        return await self._hass.async_add_executor_job(
+            self._capacity_history, limit
+        )
+
+    def _capacity_history(self, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT observed_at, calibrated_kwh, declared_kwh, n_charges "
+                "FROM capacity_history ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        # reverse so caller gets oldest → newest for easy diffing
+        return [
+            {
+                "observed_at": r[0],
+                "calibrated_kwh": float(r[1]),
+                "declared_kwh": float(r[2]),
+                "n_charges": int(r[3]),
+            }
+            for r in reversed(rows)
+        ]
+
+    async def async_aggregates_by_season(
+        self, *, hemisphere: str = "N",
+    ) -> dict[str, dict[str, float | int]]:
+        """v0.5.54 — lifetime aggregates grouped by meteorological season.
+
+        Northern-hemisphere mapping (matches HA's default): spring=Mar–May,
+        summer=Jun–Aug, autumn=Sep–Nov, winter=Dec–Feb. Set
+        `hemisphere='S'` to swap. Per bucket returns
+        {trips, distance_km, energy_kwh, avg_consumption_kwh_100km,
+         avg_ambient_temp_c}.
+        """
+        return await self._hass.async_add_executor_job(
+            self._aggregates_by_season, hemisphere,
+        )
+
+    def _aggregates_by_season(
+        self, hemisphere: str,
+    ) -> dict[str, dict[str, float | int]]:
+        # SQLite's strftime('%m', ts) returns the month with leading zero.
+        # Bucket via CASE so it's a single scan, no per-bucket query.
+        n_to_s = {
+            "winter": ("12", "01", "02"),
+            "spring": ("03", "04", "05"),
+            "summer": ("06", "07", "08"),
+            "autumn": ("09", "10", "11"),
+        }
+        if hemisphere.upper() == "S":
+            n_to_s = {
+                "summer": ("12", "01", "02"),
+                "autumn": ("03", "04", "05"),
+                "winter": ("06", "07", "08"),
+                "spring": ("09", "10", "11"),
+            }
+        out: dict[str, dict[str, float | int]] = {}
+        with self._connect() as conn:
+            for season, months in n_to_s.items():
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS n,
+                        COALESCE(SUM(distance_km), 0) AS d,
+                        COALESCE(SUM(energy_kwh), 0) AS e,
+                        AVG(consumption_kwh_100km) AS c,
+                        AVG(ambient_temp_c) AS t
+                    FROM trips
+                    WHERE strftime('%m', started_at) IN (?, ?, ?)
+                      AND distance_km IS NOT NULL AND distance_km > 0
+                    """,
+                    months,
+                ).fetchone()
+                n, d, e, c, t = row
+                out[season] = {
+                    "trips": int(n or 0),
+                    "distance_km": round(float(d or 0), 1),
+                    "energy_kwh": round(float(e or 0), 2),
+                    "avg_consumption_kwh_100km": (
+                        round(float(c), 1) if c is not None else None
+                    ),
+                    "avg_ambient_temp_c": (
+                        round(float(t), 1) if t is not None else None
+                    ),
+                }
+        return out
+
+    async def async_aggregates_by_temp_bucket(
+        self,
+    ) -> dict[str, dict[str, float | int]]:
+        """v0.5.54 — lifetime aggregates bucketed by ambient temperature.
+
+        Buckets: cold (<5°C), cool (5–15), mild (15–25), warm (25–35),
+        hot (≥35). Trips without `ambient_temp_c` are excluded; they
+        accumulate under `unknown` for visibility.
+        """
+        return await self._hass.async_add_executor_job(
+            self._aggregates_by_temp_bucket
+        )
+
+    def _aggregates_by_temp_bucket(
+        self,
+    ) -> dict[str, dict[str, float | int]]:
+        out: dict[str, dict[str, float | int]] = {}
+        buckets = {
+            "cold": "ambient_temp_c < 5",
+            "cool": "ambient_temp_c >= 5 AND ambient_temp_c < 15",
+            "mild": "ambient_temp_c >= 15 AND ambient_temp_c < 25",
+            "warm": "ambient_temp_c >= 25 AND ambient_temp_c < 35",
+            "hot":  "ambient_temp_c >= 35",
+            "unknown": "ambient_temp_c IS NULL",
+        }
+        with self._connect() as conn:
+            for name, predicate in buckets.items():
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS n,
+                        COALESCE(SUM(distance_km), 0) AS d,
+                        COALESCE(SUM(energy_kwh), 0) AS e,
+                        AVG(consumption_kwh_100km) AS c
+                    FROM trips
+                    WHERE {predicate}
+                      AND distance_km IS NOT NULL AND distance_km > 0
+                    """,
+                ).fetchone()
+                n, d, e, c = row
+                out[name] = {
+                    "trips": int(n or 0),
+                    "distance_km": round(float(d or 0), 1),
+                    "energy_kwh": round(float(e or 0), 2),
+                    "avg_consumption_kwh_100km": (
+                        round(float(c), 1) if c is not None else None
+                    ),
+                }
+        return out
+
+    async def async_aggregates_by_time_of_day(
+        self,
+    ) -> dict[str, dict[str, float | int]]:
+        """v0.5.54 — lifetime aggregates bucketed by local start hour.
+
+        night 22–06, morning 06–12, midday 12–15, afternoon 15–19,
+        evening 19–22. Uses `strftime('%H', started_at)` — works
+        because we store ISO strings with timezone offsets.
+        """
+        return await self._hass.async_add_executor_job(
+            self._aggregates_by_time_of_day
+        )
+
+    def _aggregates_by_time_of_day(
+        self,
+    ) -> dict[str, dict[str, float | int]]:
+        # Map hour ranges to bucket name. SQLite hour is "00".."23".
+        buckets: dict[str, tuple[int, int]] = {
+            "night": (22, 30),     # 22..23, 00..05 (handled via OR below)
+            "morning": (6, 12),
+            "midday": (12, 15),
+            "afternoon": (15, 19),
+            "evening": (19, 22),
+        }
+        out: dict[str, dict[str, float | int]] = {}
+        with self._connect() as conn:
+            for name, (lo, hi) in buckets.items():
+                if name == "night":
+                    where = (
+                        "CAST(strftime('%H', started_at) AS INTEGER) >= 22 "
+                        "OR CAST(strftime('%H', started_at) AS INTEGER) < 6"
+                    )
+                    params: tuple[Any, ...] = ()
+                else:
+                    where = (
+                        "CAST(strftime('%H', started_at) AS INTEGER) >= ? "
+                        "AND CAST(strftime('%H', started_at) AS INTEGER) < ?"
+                    )
+                    params = (lo, hi)
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS n,
+                        COALESCE(SUM(distance_km), 0) AS d,
+                        COALESCE(SUM(energy_kwh), 0) AS e,
+                        AVG(consumption_kwh_100km) AS c
+                    FROM trips
+                    WHERE ({where})
+                      AND distance_km IS NOT NULL AND distance_km > 0
+                    """,
+                    params,
+                ).fetchone()
+                n, d, e, c = row
+                out[name] = {
+                    "trips": int(n or 0),
+                    "distance_km": round(float(d or 0), 1),
+                    "energy_kwh": round(float(e or 0), 2),
+                    "avg_consumption_kwh_100km": (
+                        round(float(c), 1) if c is not None else None
+                    ),
+                }
+        return out
+
 
 def _row_to_record(row: sqlite3.Row) -> TripRecord:
     return TripRecord(
@@ -2144,6 +2452,11 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         kwh_charged_during=row["kwh_charged_during"] if "kwh_charged_during" in row.keys() else None,
         confidence=row["confidence"] if "confidence" in row.keys() else None,
         driver=row["driver"] if "driver" in row.keys() else None,
+        ambient_temp_c=row["ambient_temp_c"] if "ambient_temp_c" in row.keys() else None,
+        weather_condition=row["weather_condition"] if "weather_condition" in row.keys() else None,
+        humidity_pct=row["humidity_pct"] if "humidity_pct" in row.keys() else None,
+        wind_kmh=row["wind_kmh"] if "wind_kmh" in row.keys() else None,
+        precipitation_mm=row["precipitation_mm"] if "precipitation_mm" in row.keys() else None,
     )
 
 

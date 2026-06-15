@@ -61,6 +61,7 @@ from .const import (
     CONF_POWER,
     CONF_SPEED,
     CONF_TEMP,
+    CONF_WEATHER_ENTITY,
     CONF_RECENT_LIMIT,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
@@ -256,6 +257,12 @@ _CAPACITY_MIN_DELTA_PCT = 30.0
 _CAPACITY_MIN_CHARGES = 5
 _CAPACITY_BOUNDS_RATIO: tuple[float, float] = (0.5, 1.5)
 _CAPACITY_CHARGE_WINDOW = 30  # last N eligible charges
+# v0.5.54 — degradation tracking. Persist a new row in `capacity_history`
+# whenever the calibrated value moves by more than this threshold. Smaller
+# drifts just update n_charges on the latest row (more samples, same
+# conclusion). Keeps the history table from churning on every charge while
+# still capturing real degradation steps.
+_CAPACITY_HISTORY_MIN_DELTA_KWH = 0.5
 # v0.5.25 — bounded GPS ring buffer fed by EVERY poll event (any
 # metric or location state change). At BYD-typical cadence (8-10 min)
 # 256 samples cover ~40 h. Live trips also append per-tick samples,
@@ -266,6 +273,39 @@ _GPS_BUFFER_MAX = 256
 # sample within the last N minutes is recent enough to qualify as
 # "the car's position at trip start" — anything older is stale.
 _PRE_TRIP_GPS_LOOKBACK_S = 600  # 10 min
+
+
+def _avg_weather(
+    start: dict[str, Any] | None, end: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """v0.5.54 — average two weather snapshots into the trip-row fields.
+
+    Numeric fields are mean(start, end) when both exist, else whichever
+    half is non-None. `weather_condition` takes the END snapshot when
+    available (matches what the user actually saw on arrival).
+    """
+    def _avg(key: str) -> float | None:
+        a = (start or {}).get(key)
+        b = (end or {}).get(key)
+        if a is not None and b is not None:
+            return (float(a) + float(b)) / 2.0
+        if a is not None:
+            return float(a)
+        if b is not None:
+            return float(b)
+        return None
+    condition = None
+    if end and end.get("condition"):
+        condition = end["condition"]
+    elif start and start.get("condition"):
+        condition = start["condition"]
+    return {
+        "ambient_temp_c": _avg("temperature_c"),
+        "weather_condition": condition,
+        "humidity_pct": _avg("humidity_pct"),
+        "wind_kmh": _avg("wind_kmh"),
+        "precipitation_mm": _avg("precipitation_mm"),
+    }
 
 
 def _haversine_km(
@@ -426,6 +466,13 @@ class TripInProgress:
     # open; re-checked on every live tick until it resolves, since BT
     # pairing often completes a few seconds after ignition.
     driver: str | None = None
+    # v0.5.54 — snapshot of the configured weather.* entity at trip
+    # open (start_*) and close (end_*). The end_* fields are filled
+    # by `_async_close_trip` just before persistence; the trip row
+    # then stores the START–END average (when both exist) or whichever
+    # half is non-null. None when CONF_WEATHER_ENTITY is unset.
+    weather_start: dict[str, Any] | None = None
+    weather_end: dict[str, Any] | None = None
 
 
 @dataclass
@@ -512,6 +559,11 @@ class EvTripLoggerCoordinator:
         self.abrp_push_enabled: bool = True
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
+        # v0.5.54 — optional weather.* entity. Snapshot at trip open/close,
+        # average the two and persist on the trip row so the
+        # consumption_by_season / by_temp / by_time_of_day sensors can
+        # bucket trips post-hoc. None means "feature disabled".
+        self._weather_entity = merged.get(CONF_WEATHER_ENTITY)
         self._speed = merged.get(CONF_SPEED)
         # v0.5.43 — optional driver-identity sensor (BT connected device,
         # input_select, template sensor...). State == driver name.
@@ -1041,6 +1093,41 @@ class EvTripLoggerCoordinator:
             # SoC→kWh conversion drives almost everything visible —
             # poke sensors so they re-render against the new value.
             self._notify_listeners()
+        # v0.5.54 — capacity_history persistence runs even when `changed`
+        # is False, because we still want to refresh the latest snapshot's
+        # n_charges to reflect that more data agrees with the value.
+        if new_value is not None:
+            self.hass.async_create_task(
+                self._async_snapshot_capacity_history(new_value, n)
+            )
+
+    async def _async_snapshot_capacity_history(
+        self, calibrated_kwh: float, n_charges: int,
+    ) -> None:
+        """v0.5.54 — append a row to `capacity_history` when the calibrated
+        value drifts ≥`_CAPACITY_HISTORY_MIN_DELTA_KWH` from the latest
+        snapshot. For smaller drifts, the SoH is effectively the same so
+        we don't bloat the table; the next bigger move will capture both.
+        """
+        try:
+            latest = await self.storage.async_latest_capacity_snapshot()
+            if latest is not None:
+                _, last_kwh, _, _ = latest
+                if abs(calibrated_kwh - last_kwh) < _CAPACITY_HISTORY_MIN_DELTA_KWH:
+                    return
+            await self.storage.async_insert_capacity_snapshot(
+                calibrated_kwh=calibrated_kwh,
+                declared_kwh=self._battery_capacity_declared,
+                n_charges=n_charges,
+                when=dt_util.now(),
+            )
+            _LOGGER.info(
+                "Capacity snapshot: %.2f kWh (n=%d charges, declared=%.2f) "
+                "appended to history",
+                calibrated_kwh, n_charges, self._battery_capacity_declared,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug("capacity_history snapshot failed: %s", exc)
 
     async def _async_heal_energy_after_calibration(self) -> None:
         """v0.5.51 — backfill `energy_kwh` and `consumption_kwh_100km`
@@ -2736,6 +2823,8 @@ class EvTripLoggerCoordinator:
             # v0.5.43 — may still be None here (BT pairs a few seconds
             # after ignition); the live tick keeps retrying.
             driver=self._read_driver(),
+            # v0.5.54 — first weather snapshot of the trip.
+            weather_start=self._read_weather_snapshot(),
         )
         # v0.5.25 — seed gps_samples with the most-recent buffered
         # sample (if any within the lookback window) so even very short
@@ -3139,6 +3228,10 @@ class EvTripLoggerCoordinator:
             # v0.5.43 — last-chance read in case the live tick never
             # caught the BT connection (very short trips).
             driver=active.driver if active.driver is not None else self._read_driver(),
+            # v0.5.54 — weather averages from start+end snapshots. We
+            # average the two so a trip that started cold and ended
+            # warm bucketsfairly. If only one half exists we use that.
+            **_avg_weather(active.weather_start, self._read_weather_snapshot()),
         )
 
         # v0.5.27 — attribute pre/intra-trip charging energy. Lets the
@@ -3875,6 +3968,35 @@ class EvTripLoggerCoordinator:
 
     def _read_str(self, entity_id: str | None) -> str | None:
         return self._read_state(entity_id)
+
+    def _read_weather_snapshot(self) -> dict[str, Any] | None:
+        """v0.5.54 — read the configured `weather.*` entity right now.
+
+        Returns a dict with the temperature/condition/humidity/wind/
+        precipitation attributes when the entity is configured and
+        readable, or None otherwise. The trip code averages start &
+        end snapshots; callers should be prepared for either side to
+        be None.
+        """
+        if not self._weather_entity:
+            return None
+        st = self.hass.states.get(self._weather_entity)
+        if st is None or st.state in _INVALID_STATES:
+            return None
+        a = st.attributes or {}
+        def _f(key: str) -> float | None:
+            try:
+                v = a.get(key)
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        return {
+            "condition": st.state,
+            "temperature_c": _f("temperature"),
+            "humidity_pct": _f("humidity"),
+            "wind_kmh": _f("wind_speed"),
+            "precipitation_mm": _f("precipitation"),
+        }
 
     def _read_driver(self) -> str | None:
         """Current driver name from the configured driver sensor.

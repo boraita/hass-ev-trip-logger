@@ -242,6 +242,10 @@ async def async_setup_entry(
     entities.append(BatteryPercentSensor(coordinator))
     entities.append(RangeAtRecentEfficiencySensor(coordinator))
     entities.append(ConsumptionByTempBucketSensor(coordinator))
+    # v0.5.54 — additional bucket dimensions + SoH.
+    entities.append(ConsumptionBySeasonSensor(coordinator))
+    entities.append(ConsumptionByTimeOfDaySensor(coordinator))
+    entities.append(BatterySohSensor(coordinator))
     # v0.5.43 — driver identity. Stats work off the DB column (fillable
     # via set_trip even without a live sensor); the live sensor only
     # makes sense when a driver sensor is wired.
@@ -2401,3 +2405,223 @@ class DriverStatsSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"drivers": self._rows, "window_days": self._WINDOW_DAYS}
+
+
+# ---------------------------------------------------------------------------
+# v0.5.54 — season / time-of-day / battery-soh sensors.
+# ---------------------------------------------------------------------------
+
+
+class ConsumptionBySeasonSensor(_BaseTripSensor):
+    """v0.5.54 — lifetime consumption bucketed by season.
+
+    State = the season we're CURRENTLY in (so the displayed value
+    shifts naturally month-to-month). Attributes carry every season's
+    aggregate.
+    """
+
+    _unrecorded_attributes = frozenset({"by_season"})
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="consumption_by_season",
+            translation_key="consumption_by_season",
+            native_unit_of_measurement="kWh/100km",
+            icon="mdi:weather-partly-snowy-rainy",
+            suggested_display_precision=1,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_consumption_by_season"
+        self._by_season: dict[str, dict[str, Any]] = {}
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._by_season = await self._coordinator.storage.async_aggregates_by_season()
+        self.async_write_ha_state()
+
+    @staticmethod
+    def _current_season(now: datetime) -> str:
+        m = now.month
+        if m in (12, 1, 2):
+            return "winter"
+        if m in (3, 4, 5):
+            return "spring"
+        if m in (6, 7, 8):
+            return "summer"
+        return "autumn"
+
+    @property
+    def native_value(self) -> float | None:
+        season = self._current_season(dt_util.now())
+        return (self._by_season.get(season) or {}).get(
+            "avg_consumption_kwh_100km"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "current_season": self._current_season(dt_util.now()),
+            "by_season": self._by_season,
+        }
+
+
+class ConsumptionByTimeOfDaySensor(_BaseTripSensor):
+    """v0.5.54 — lifetime consumption bucketed by start-hour of the trip."""
+
+    _unrecorded_attributes = frozenset({"by_time"})
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="consumption_by_time_of_day",
+            translation_key="consumption_by_time_of_day",
+            native_unit_of_measurement="kWh/100km",
+            icon="mdi:clock-time-eight-outline",
+            suggested_display_precision=1,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_consumption_by_time_of_day"
+        self._by_time: dict[str, dict[str, Any]] = {}
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._by_time = await self._coordinator.storage.async_aggregates_by_time_of_day()
+        self.async_write_ha_state()
+
+    @staticmethod
+    def _current_bucket(now: datetime) -> str:
+        h = now.hour
+        if h >= 22 or h < 6:
+            return "night"
+        if h < 12:
+            return "morning"
+        if h < 15:
+            return "midday"
+        if h < 19:
+            return "afternoon"
+        return "evening"
+
+    @property
+    def native_value(self) -> float | None:
+        bucket = self._current_bucket(dt_util.now())
+        return (self._by_time.get(bucket) or {}).get(
+            "avg_consumption_kwh_100km"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "current_bucket": self._current_bucket(dt_util.now()),
+            "by_time": self._by_time,
+        }
+
+
+class BatterySohSensor(_BaseTripSensor):
+    """v0.5.54 — State of Health = calibrated / declared × 100.
+
+    State stays at 100 until enough charges accumulate to calibrate
+    (then the SoH naturally drops with degradation). The capacity
+    history is exposed as attributes for dashboard line charts.
+    """
+
+    _unrecorded_attributes = frozenset({"history"})
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="battery_soh",
+            translation_key="battery_soh",
+            native_unit_of_measurement="%",
+            icon="mdi:battery-heart-variant",
+            suggested_display_precision=1,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_battery_soh"
+        self._history: list[dict[str, Any]] = []
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._history = await self._coordinator.storage.async_capacity_history(
+            limit=24
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        declared = self._coordinator._battery_capacity_declared
+        calibrated = self._coordinator._battery_capacity_calibrated
+        if calibrated is None or declared <= 0:
+            return 100.0  # no data yet → assume healthy
+        return round(calibrated / declared * 100.0, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        coord = self._coordinator
+        declared = coord._battery_capacity_declared
+        calibrated = coord._battery_capacity_calibrated
+        # Degradation rate: slope between oldest and newest snapshot.
+        rate_kwh_per_year: float | None = None
+        if len(self._history) >= 2:
+            oldest = self._history[0]
+            newest = self._history[-1]
+            try:
+                t0 = datetime.fromisoformat(oldest["observed_at"])
+                t1 = datetime.fromisoformat(newest["observed_at"])
+                years = (t1 - t0).total_seconds() / (365.25 * 86400)
+                if years > 0:
+                    delta = newest["calibrated_kwh"] - oldest["calibrated_kwh"]
+                    rate_kwh_per_year = round(delta / years, 3)
+            except Exception:  # pragma: no cover — defensive
+                rate_kwh_per_year = None
+        return {
+            "declared_capacity_kwh": declared,
+            "calibrated_capacity_kwh": (
+                round(calibrated, 2) if calibrated is not None else None
+            ),
+            "calibration_charges": coord._battery_capacity_calibration_n,
+            "degradation_kwh_per_year": rate_kwh_per_year,
+            "history": self._history,
+        }

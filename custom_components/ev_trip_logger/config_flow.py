@@ -47,6 +47,7 @@ from .const import (
     CONF_SPEED,
     CONF_TEMP,
     CONF_VEHICLE_ON,
+    CONF_WEATHER_ENTITY,
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
@@ -141,6 +142,18 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="temperature")
+            ),
+            # v0.5.54 — optional weather entity. AEMET / Met.no /
+            # OpenWeatherMap / etc. When set, every trip stores temp
+            # condition / humidity / wind / precipitation; powers the
+            # consumption-by-season / by-temp / by-time sensors.
+            _optional(
+                CONF_WEATHER_ENTITY,
+                EntitySelector(
+                    EntitySelectorConfig(domain="weather")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="weather")
             ),
             # v0.5.43 — driver identity. Any entity whose state names the
             # person using the car: the manufacturer's "connected
