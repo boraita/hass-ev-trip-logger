@@ -2278,6 +2278,14 @@ class AvgChargeMetricsSensor(_BaseTripSensor):
         cfg = self._CONFIG[key]
         self._key = key
         slug = cfg["slug"]
+        # v0.5.55 — `energy` / `monetary` device classes reject
+        # `measurement` (HA expects `total`/`total_increasing`). These are
+        # averages, not instantaneous readings, so the right answer here
+        # is no state_class at all (= None). Avoids the warning spam
+        # `'measurement' is impossible considering device class 'energy'`.
+        is_energy_or_money = cfg.get("device_class") in (
+            SensorDeviceClass.ENERGY, SensorDeviceClass.MONETARY,
+        )
         self.entity_description = SensorEntityDescription(
             key=slug,
             translation_key=slug,
@@ -2285,7 +2293,9 @@ class AvgChargeMetricsSensor(_BaseTripSensor):
                 coordinator.currency if cfg.get("use_currency") else cfg.get("unit")
             ),
             device_class=cfg.get("device_class"),
-            state_class=SensorStateClass.MEASUREMENT,
+            state_class=(
+                None if is_energy_or_money else SensorStateClass.MEASUREMENT
+            ),
             icon=cfg.get("icon"),
             suggested_display_precision=cfg.get("precision"),
             entity_category=EntityCategory.DIAGNOSTIC,
