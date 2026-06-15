@@ -207,6 +207,21 @@ _MAX_SYNTH_BASELINE_AGE = timedelta(hours=2)
 # into two short trips with a near-zero gap. The debounce coalesces
 # off-edges in this window into one close.
 _VEHICLE_ON_OFF_DEBOUNCE_S = 3.0
+# v0.5.53 — grace window where vehicle_on=off does NOT close the trip.
+# Covers brief stops mid-trip (red lights, parking-lot wait, pickup):
+# byd-trip-stats and BYDMate both treat the off-edge as a timer, not an
+# event, so a quick off→on sequence within the grace just keeps the
+# trip open. When the timer expires, the close happens with
+# `ended_at = car_off_since` (NOT `now`), so the grace doesn't inflate
+# duration. Live snapshot updates pause as soon as the off arrives —
+# the sensors don't keep ticking during the grace window.
+_VEHICLE_OFF_GRACE_S = 180.0
+# v0.5.53 — telemetry silence watchdog. If no odometer/battery sample
+# arrives for this long while a trip is "open", we assume the upstream
+# polling has died and the car was actually parked. Close retroactively
+# at `last_telemetry_ts`, not `now`, to avoid pinning a 2-hour
+# duration to a 20-minute drive whose polling silently stalled.
+_TELEMETRY_SILENCE_TIMEOUT_S = 480.0  # 8 min
 # v0.5.49 — live-path retry on the vehicle_on=on edge. Cloud-polled
 # integrations (BYD, Tesla Fleet) often raise vehicle_on a poll-cycle
 # before the odometer entity catches up to the fresh value. Previously
@@ -1303,17 +1318,32 @@ class EvTripLoggerCoordinator:
         now = dt_util.now()
         if is_on:
             self._cancel_idle()
-            # v0.5.16 — if a debounced close is pending from a recent
-            # off-edge, this on event means it was a flicker (BYD cloud-
-            # poll sometimes sends on→off→on within 1-2 s). Cancel the
-            # pending close, leave the trip open, return.
+            # v0.5.16/53 — if a deferred close is pending from a recent
+            # off-edge, this on event means the off was just a pause
+            # (red light, brief parking) within the grace window. Cancel
+            # the pending close, leave the trip open, return.
             if self._pending_close_unsub is not None:
                 self._pending_close_unsub()
                 self._pending_close_unsub = None
                 _LOGGER.info(
-                    "vehicle_on=on cancelled a pending close — flicker absorbed"
+                    "vehicle_on=on cancelled a pending close — pause absorbed"
                 )
                 return
+            # v0.5.53 — also cancel a pending SYNTHETIC finalize. The
+            # finalize timer fires _SYNTH_COALESCE_WINDOW_S after the
+            # last odometer growth; if vehicle_on goes off→on inside
+            # that window, the live path should reclaim the trip, NOT
+            # let the synthetic path commit a half-finished record.
+            # This was the root cause of trip 162 closing prematurely:
+            # vehicle_on flapped, synth_finalize was scheduled, on came
+            # back but no one cancelled the finalize.
+            if self._unsub_synth_finalize is not None:
+                self._unsub_synth_finalize()
+                self._unsub_synth_finalize = None
+                self._synth_baseline = None
+                _LOGGER.info(
+                    "vehicle_on=on cancelled a pending synth finalize"
+                )
             if self.current is None:
                 # v0.5.49 — try to open immediately. If odometer isn't
                 # ready yet (BYD cloud-poll lag), the helper schedules
@@ -1344,7 +1374,7 @@ class EvTripLoggerCoordinator:
                 self.hass.async_create_task(self._async_close_trip(off_ts))
 
             self._pending_close_unsub = async_call_later(
-                self.hass, _VEHICLE_ON_OFF_DEBOUNCE_S, _debounced_close
+                self.hass, _VEHICLE_OFF_GRACE_S, _debounced_close
             )
 
     @callback
@@ -1712,6 +1742,19 @@ class EvTripLoggerCoordinator:
         # cover this distance and we'd double-count.
         if self.current is not None:
             self._synth_baseline = None
+            return
+        # v0.5.53 — abort if vehicle_on is currently on. The synthetic
+        # path is for "we missed the live trip entirely"; firing while
+        # the ignition is on commits a half-trip before the real one
+        # ends. This was the trip-162 bug: synth_finalize fired while
+        # the car was still moving, closed at the last odo we'd seen
+        # and lost the remaining 3 km / 1 % SoC.
+        if self._read_bool(self._vehicle_on) is True:
+            self._synth_baseline = None
+            _LOGGER.debug(
+                "synth finalize skipped — vehicle_on=on, live path "
+                "owns this trip"
+            )
             return
         odo_now = self._read_float(self._odometer)
         if odo_now is None:
@@ -2769,6 +2812,15 @@ class EvTripLoggerCoordinator:
         ):
             vehicle_on = self._read_bool(self._vehicle_on)
             if vehicle_on is False:
+                # v0.5.53 — if a vehicle_on=off grace close is already
+                # scheduled (_pending_close_unsub), defer to it. The
+                # grace's backdated `ended_at = car_off_since` is more
+                # precise than `last_movement_ts` here (the off-edge
+                # itself is captured exactly at off_ts, while
+                # last_movement_ts is the last odo growth which may
+                # have been minutes earlier in heavy traffic).
+                if self._pending_close_unsub is not None:
+                    return
                 _LOGGER.info(
                     "Idle watchdog: no movement for %.0fs AND vehicle_on=off — "
                     "force-closing (missed off-edge)",

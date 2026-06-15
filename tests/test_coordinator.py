@@ -140,8 +140,9 @@ async def test_vehicle_off_closes_trip_immediately(hass: HomeAssistant) -> None:
     hass.states.async_set(VOK, STATE_OFF)
     await hass.async_block_till_done()
 
-    # Off-edge debounce (3 s) + idle window (1 min) must elapse.
-    await _advance(hass, 2)
+    # v0.5.53 — off-grace is now 180 s (covers brief stops mid-trip).
+    # Advancing 4 min is enough to pass the grace + idle timeout.
+    await _advance(hass, 4)
     assert coordinator.current is None
     assert coordinator.last_trip is not None
     assert coordinator.last_trip.distance_km == pytest.approx(15.0)
@@ -160,7 +161,8 @@ async def test_short_trip_is_discarded(hass: HomeAssistant) -> None:
     hass.states.async_set(VOK, STATE_OFF)
     await hass.async_block_till_done()
 
-    await _advance(hass, 2)
+    # v0.5.53 — wait for the 180-s grace + close to elapse.
+    await _advance(hass, 4)
 
     assert coordinator.current is None
     assert coordinator.last_trip is None
@@ -1704,3 +1706,33 @@ async def test_battery_capacity_clamped_to_declared_bounds(
     # Clamped at the floor (50 % of declared 80 = 40 kWh), not the
     # raw 30 kWh that the corrupted charges would have implied.
     assert coordinator.battery_capacity == pytest.approx(40.0)
+
+
+async def test_brief_off_during_trip_does_not_close(hass: HomeAssistant) -> None:
+    """v0.5.53 — vehicle_on=off followed by on within the grace must
+    NOT close the trip. Covers red-light / pickup-stop scenarios.
+    """
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1015")
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+    assert coordinator.current is not None
+
+    # User stops at a red light — vehicle_on briefly drops off.
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    # Trip still open (grace hasn't expired).
+    assert coordinator.current is not None
+    assert coordinator._pending_close_unsub is not None
+
+    # 30 s later the light turns green and vehicle_on goes back on.
+    await _advance(hass, 0.5)
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    # Grace cancelled; trip still open.
+    assert coordinator.current is not None
+    assert coordinator._pending_close_unsub is None
