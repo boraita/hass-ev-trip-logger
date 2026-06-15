@@ -13,5 +13,5 @@
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/boraita/hass-ev-trip-logger/issues",
   "requirements": [],
-  "version": "0.5.54"
+  "version": "0.5.55"
 }
