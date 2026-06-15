@@ -2236,6 +2236,100 @@ class TripStorage:
             for r in reversed(rows)
         ]
 
+    async def async_first_odometer_seen(self) -> float | None:
+        """v0.5.57 — earliest non-NULL `odometer_start` ever recorded.
+
+        Used to derive "km this car has been used UNDER our logging"
+        (current_odometer − first_seen). If the car was bought used,
+        this still gives the user a meaningful number (km since they
+        started logging), not the lifetime mileage of the pack.
+        """
+        return await self._hass.async_add_executor_job(
+            self._first_odometer_seen
+        )
+
+    def _first_odometer_seen(self) -> float | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MIN(odometer_start) FROM trips "
+                "WHERE odometer_start IS NOT NULL"
+            ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+    async def async_lifetime_dcfc_ratio(
+        self,
+    ) -> tuple[float | None, float, float]:
+        """v0.5.57 — return (dcfc_kwh / total_kwh, dcfc_kwh, total_kwh).
+
+        Drives the DCFC factor of the expected-SoH model. Returns
+        (None, 0, 0) when no charges exist. Only charges with
+        `kwh > 0` count; `is_dcfc` NULL is treated as AC (the safer
+        assumption — DCFC is the surface we have to flag).
+        """
+        return await self._hass.async_add_executor_job(
+            self._lifetime_dcfc_ratio
+        )
+
+    def _lifetime_dcfc_ratio(
+        self,
+    ) -> tuple[float | None, float, float]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN is_dcfc=1 THEN kwh ELSE 0 END), 0)
+                        AS dcfc_kwh,
+                    COALESCE(SUM(kwh), 0) AS total_kwh
+                FROM charges
+                WHERE kwh IS NOT NULL AND kwh > 0
+                """
+            ).fetchone()
+        dcfc, total = float(row[0]), float(row[1])
+        ratio = (dcfc / total) if total > 0 else None
+        return (ratio, dcfc, total)
+
+    async def async_avg_soc_end_recent(
+        self, *, days: int = 30,
+    ) -> float | None:
+        """v0.5.57 — average `soc_end` over recent charges. Used to
+        derive the "100% SoC daily" penalty in the expected-SoH model.
+        Returns None when not enough data.
+        """
+        return await self._hass.async_add_executor_job(
+            self._avg_soc_end_recent, days,
+        )
+
+    def _avg_soc_end_recent(self, days: int) -> float | None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT AVG(soc_end) FROM charges "
+                "WHERE soc_end IS NOT NULL AND ended_at >= ?",
+                (cutoff,),
+            ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+    async def async_avg_ambient_temp_recent(
+        self, *, days: int = 90,
+    ) -> float | None:
+        """v0.5.57 — average ambient_temp_c over recent trips. Used to
+        classify the climate (cold/temperate/hot) for the SoH model.
+        Returns None until enough trips with weather snapshots exist.
+        """
+        return await self._hass.async_add_executor_job(
+            self._avg_ambient_temp_recent, days,
+        )
+
+    def _avg_ambient_temp_recent(self, days: int) -> float | None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT AVG(ambient_temp_c) FROM trips "
+                "WHERE ambient_temp_c IS NOT NULL AND started_at >= ?",
+                (cutoff,),
+            ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     async def async_aggregates_by_season(
         self, *, hemisphere: str = "N",
     ) -> dict[str, dict[str, float | int]]:

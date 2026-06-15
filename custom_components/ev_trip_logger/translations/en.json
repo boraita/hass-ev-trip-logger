@@ -188,6 +188,16 @@
       "consumption_by_season": { "name": "Consumption by season" },
       "consumption_by_time_of_day": { "name": "Consumption by time of day" },
       "battery_soh": { "name": "Battery state of health" },
+      "expected_battery_soh": { "name": "Expected battery SoH" },
+      "battery_health_vs_expected": {
+        "name": "Battery health vs expected",
+        "state": {
+          "calibrating": "Calibrating",
+          "ahead": "Ahead of curve",
+          "on_track": "On track",
+          "behind": "Behind curve"
+        }
+      },
       "monthly_history": { "name": "Monthly history" },
       "daily_km_60d": { "name": "Daily km 60d" },
       "trip_patterns": { "name": "Trip patterns" },

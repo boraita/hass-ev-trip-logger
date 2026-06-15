@@ -188,6 +188,16 @@
       "consumption_by_season": { "name": "Consumo por estación" },
       "consumption_by_time_of_day": { "name": "Consumo por franja horaria" },
       "battery_soh": { "name": "Salud de la batería" },
+      "expected_battery_soh": { "name": "SoH esperado de la batería" },
+      "battery_health_vs_expected": {
+        "name": "Salud vs esperado",
+        "state": {
+          "calibrating": "Calibrando",
+          "ahead": "Por encima de la curva",
+          "on_track": "En la curva",
+          "behind": "Por debajo de la curva"
+        }
+      },
       "monthly_history": { "name": "Histórico mensual" },
       "daily_km_60d": { "name": "Km diarios 60d" },
       "trip_patterns": { "name": "Patrones de viaje" },

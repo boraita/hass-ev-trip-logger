@@ -12,11 +12,15 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers.selector import (
+    DateSelector,
     EntitySelector,
     EntitySelectorConfig,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
     TextSelector,
 )
 
@@ -45,9 +49,12 @@ from .const import (
     CONF_POWER,
     CONF_RECENT_LIMIT,
     CONF_SPEED,
+    CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
+    CONF_VEHICLE_FIRST_REGISTERED,
     CONF_VEHICLE_ON,
     CONF_WEATHER_ENTITY,
+    DEFAULT_BATTERY_CHEMISTRY,
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
@@ -187,6 +194,26 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                     min=1, max=300, step=0.1, mode=NumberSelectorMode.BOX, unit_of_measurement="kWh"
                 )
             ),
+            # v0.5.57 — battery chemistry drives the expected-SoH model.
+            # Optional; default 'lfp' covers BYD Blade and most large-pack
+            # 2022+ EVs.
+            vol.Optional(
+                CONF_BATTERY_CHEMISTRY,
+                default=defaults.get(CONF_BATTERY_CHEMISTRY, DEFAULT_BATTERY_CHEMISTRY),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=["lfp", "nmc", "nca"],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key="battery_chemistry",
+                )
+            ),
+            # v0.5.57 — first-registered date. Feeds calendar-aging
+            # component of the expected SoH. Optional — we proxy from
+            # km/15 000 when missing.
+            _optional(
+                CONF_VEHICLE_FIRST_REGISTERED,
+                DateSelector(),
+            ): DateSelector(),
             vol.Required(
                 CONF_MIN_TRIP_DISTANCE,
                 default=defaults.get(CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE),

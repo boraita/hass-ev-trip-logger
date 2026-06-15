@@ -60,8 +60,11 @@ from .const import (
     CONF_IDLE_TRIP_TIMEOUT_MIN,
     CONF_POWER,
     CONF_SPEED,
+    CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
+    CONF_VEHICLE_FIRST_REGISTERED,
     CONF_WEATHER_ENTITY,
+    DEFAULT_BATTERY_CHEMISTRY,
     CONF_RECENT_LIMIT,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
@@ -263,6 +266,53 @@ _CAPACITY_CHARGE_WINDOW = 30  # last N eligible charges
 # conclusion). Keeps the history table from churning on every charge while
 # still capturing real degradation steps.
 _CAPACITY_HISTORY_MIN_DELTA_KWH = 0.5
+# v0.5.57 — expected SoH model. Constants derived from research:
+# Geotab 22,700 EV study 2025, Tesla 2023 Impact Report, ADAC VW ID.3
+# Dauertest, Recurrent climate study, BYD warranty extension Jan 2026,
+# MDPI Batteries 2024 LFP/NMC review, NREL Smith 2021/2022.
+# Each row: (year-1 knee, calendar/yr after knee, cycle pp/1000 km,
+# extra hot-climate pp/yr, cold multiplier, DCFC threshold %, DCFC
+# pp/yr per % above threshold, 100%-SoC daily pp/yr).
+_DEGRADATION_PROFILES: dict[str, dict[str, float]] = {
+    "lfp": {
+        "knee_year1_pct": 3.5,
+        "calendar_pct_per_year": 1.0,
+        "cycle_pct_per_1000km": 0.040,
+        "climate_hot_extra_per_year": 0.10,
+        "climate_cold_mult": 0.7,
+        "dcfc_threshold_pct": 12.0,
+        "dcfc_penalty_per_pct_above": 0.04,
+        "soc_100_extra_per_year": 0.05,
+    },
+    "nmc": {
+        "knee_year1_pct": 4.0,
+        "calendar_pct_per_year": 1.8,
+        "cycle_pct_per_1000km": 0.100,
+        "climate_hot_extra_per_year": 0.70,
+        "climate_cold_mult": 0.5,
+        "dcfc_threshold_pct": 12.0,
+        "dcfc_penalty_per_pct_above": 0.12,
+        "soc_100_extra_per_year": 0.55,
+    },
+    "nca": {
+        "knee_year1_pct": 5.0,
+        "calendar_pct_per_year": 2.2,
+        "cycle_pct_per_1000km": 0.110,
+        "climate_hot_extra_per_year": 0.85,
+        "climate_cold_mult": 0.5,
+        "dcfc_threshold_pct": 12.0,
+        "dcfc_penalty_per_pct_above": 0.15,
+        "soc_100_extra_per_year": 0.65,
+    },
+}
+# SoH never drops below this floor in the model — BYD's 70% warranty
+# is the industry floor anyway. Real packs do degrade past 70% but
+# the model is no longer reliable, and reporting 50% would alarm
+# without insight.
+_EXPECTED_SOH_FLOOR_PCT = 70.0
+# Buckets for the health-vs-expected sensor.
+_HEALTH_AHEAD_THRESHOLD_PP = 2.0   # observed ≥ expected + 2pp → ahead
+_HEALTH_BEHIND_THRESHOLD_PP = 2.0  # observed ≤ expected − 2pp → behind
 # v0.5.25 — bounded GPS ring buffer fed by EVERY poll event (any
 # metric or location state change). At BYD-typical cadence (8-10 min)
 # 256 samples cover ~40 h. Live trips also append per-tick samples,
@@ -564,6 +614,29 @@ class EvTripLoggerCoordinator:
         # consumption_by_season / by_temp / by_time_of_day sensors can
         # bucket trips post-hoc. None means "feature disabled".
         self._weather_entity = merged.get(CONF_WEATHER_ENTITY)
+        # v0.5.57 — battery chemistry + first-registered date drive the
+        # expected SoH model (see _DEGRADATION_PROFILES). Chemistry
+        # defaults to LFP when the user doesn't specify, since most
+        # >75 kWh packs sold from 2022+ are LFP-based.
+        self._battery_chemistry = str(
+            merged.get(CONF_BATTERY_CHEMISTRY, DEFAULT_BATTERY_CHEMISTRY)
+        ).lower()
+        if self._battery_chemistry not in _DEGRADATION_PROFILES:
+            self._battery_chemistry = DEFAULT_BATTERY_CHEMISTRY
+        first_reg = merged.get(CONF_VEHICLE_FIRST_REGISTERED)
+        self._vehicle_first_registered: datetime | None = None
+        if first_reg:
+            try:
+                # Accept either ISO 8601 datetime or YYYY-MM-DD date.
+                self._vehicle_first_registered = (
+                    datetime.fromisoformat(str(first_reg))
+                    if "T" in str(first_reg)
+                    else datetime.fromisoformat(str(first_reg) + "T00:00:00")
+                )
+            except ValueError:
+                _LOGGER.warning(
+                    "Invalid vehicle_first_registered=%r — ignoring", first_reg,
+                )
         self._speed = merged.get(CONF_SPEED)
         # v0.5.43 — optional driver-identity sensor (BT connected device,
         # input_select, template sensor...). State == driver name.
@@ -1041,6 +1114,114 @@ class EvTripLoggerCoordinator:
         # both asynchronously; both queries are cheap and idempotent.
         self.hass.async_create_task(self._async_refresh_battery_capacity())
         self.hass.async_create_task(self._async_refresh_score_baseline())
+
+    async def async_compute_expected_soh(self) -> dict[str, Any]:
+        """v0.5.57 — predict the SoH this car should have based on age,
+        km, chemistry, climate and habits.
+
+        Pure forward model — does NOT touch storage. The Sensor classes
+        call this and surface the result. Returns:
+            {
+                "expected_soh_pct": 95.3,
+                "factors": {                 # signed loss contributions
+                    "year1_knee": 3.5,
+                    "calendar": 0.0,
+                    "cycle": 1.06,
+                    "climate_hot": 0.1,
+                    "dcfc": 0.0,
+                    "soc_habit": 0.0,
+                },
+                "inputs": {                  # for transparency
+                    "km": 26471,
+                    "age_years": 1.0,
+                    "chemistry": "lfp",
+                    "avg_ambient_temp_c": 22.5,
+                    "dcfc_ratio": 0.0,
+                    "avg_soc_end_recent": 80.0,
+                },
+                "confidence": "low|medium|high",
+            }
+        """
+        profile = _DEGRADATION_PROFILES[self._battery_chemistry]
+        # 1. Inputs
+        km_now = self._read_float(self._odometer) or 0.0
+        # km used = current odo − first observed odo in storage (or 0).
+        first_odo = await self.storage.async_first_odometer_seen()
+        km = max(0.0, km_now - first_odo) if first_odo is not None else km_now
+        if self._vehicle_first_registered is not None:
+            age_years = (
+                dt_util.now() - self._vehicle_first_registered
+            ).total_seconds() / (365.25 * 86400)
+            age_years = max(0.0, age_years)
+        else:
+            # Proxy: assume 15 000 km/yr (EU/US median). Lower-confidence.
+            age_years = km / 15000.0
+        dcfc_ratio, _, total_kwh = await self.storage.async_lifetime_dcfc_ratio()
+        if dcfc_ratio is None:
+            dcfc_ratio = 0.0
+        avg_soc_end = await self.storage.async_avg_soc_end_recent(days=30)
+        avg_ambient_temp = await self.storage.async_avg_ambient_temp_recent(days=90)
+
+        # 2. Factors (each is a POSITIVE loss in pp, added to total)
+        factors: dict[str, float] = {}
+        factors["year1_knee"] = profile["knee_year1_pct"] * min(1.0, age_years)
+        post_year1 = max(0.0, age_years - 1.0)
+        factors["calendar"] = profile["calendar_pct_per_year"] * post_year1
+        factors["cycle"] = profile["cycle_pct_per_1000km"] * (km / 1000.0)
+        factors["climate_hot"] = 0.0
+        if avg_ambient_temp is not None:
+            if avg_ambient_temp > 25:
+                factors["climate_hot"] = (
+                    profile["climate_hot_extra_per_year"] * age_years
+                )
+            elif avg_ambient_temp < 10:
+                # Cold: slow the calendar+cycle aging.
+                mult = profile["climate_cold_mult"]
+                factors["calendar"] *= mult
+                factors["cycle"] *= mult
+        factors["dcfc"] = 0.0
+        dcfc_pct = dcfc_ratio * 100.0
+        if dcfc_pct > profile["dcfc_threshold_pct"]:
+            factors["dcfc"] = (
+                profile["dcfc_penalty_per_pct_above"]
+                * (dcfc_pct - profile["dcfc_threshold_pct"])
+                * age_years
+            )
+        factors["soc_habit"] = 0.0
+        if avg_soc_end is not None and avg_soc_end > 95:
+            factors["soc_habit"] = profile["soc_100_extra_per_year"] * age_years
+
+        total_loss = sum(factors.values())
+        expected = max(_EXPECTED_SOH_FLOOR_PCT, 100.0 - total_loss)
+
+        # 3. Confidence — high when first_registered is set AND we have
+        # weather data; medium when only one is missing; low otherwise.
+        confidence = "low"
+        has_age = self._vehicle_first_registered is not None
+        has_climate = avg_ambient_temp is not None
+        if has_age and has_climate:
+            confidence = "high"
+        elif has_age or has_climate:
+            confidence = "medium"
+
+        return {
+            "expected_soh_pct": round(expected, 2),
+            "factors": {k: round(v, 3) for k, v in factors.items()},
+            "inputs": {
+                "km": round(km, 1),
+                "age_years": round(age_years, 2),
+                "chemistry": self._battery_chemistry,
+                "avg_ambient_temp_c": (
+                    round(avg_ambient_temp, 1) if avg_ambient_temp else None
+                ),
+                "dcfc_ratio": round(dcfc_ratio, 3),
+                "avg_soc_end_recent": (
+                    round(avg_soc_end, 1) if avg_soc_end else None
+                ),
+                "total_kwh_charged": round(total_kwh, 1),
+            },
+            "confidence": confidence,
+        }
 
     async def _async_refresh_battery_capacity(self) -> None:
         """v0.5.51 — derive effective pack capacity from real charges.

@@ -246,6 +246,9 @@ async def async_setup_entry(
     entities.append(ConsumptionBySeasonSensor(coordinator))
     entities.append(ConsumptionByTimeOfDaySensor(coordinator))
     entities.append(BatterySohSensor(coordinator))
+    # v0.5.57 — expected SoH model based on age/km/chemistry/climate.
+    entities.append(ExpectedBatterySohSensor(coordinator))
+    entities.append(BatteryHealthVsExpectedSensor(coordinator))
     # v0.5.43 — driver identity. Stats work off the DB column (fillable
     # via set_trip even without a live sensor); the live sensor only
     # makes sense when a driver sensor is wired.
@@ -2634,4 +2637,153 @@ class BatterySohSensor(_BaseTripSensor):
             "calibration_charges": coord._battery_capacity_calibration_n,
             "degradation_kwh_per_year": rate_kwh_per_year,
             "history": self._history,
+        }
+
+
+class ExpectedBatterySohSensor(_BaseTripSensor):
+    """v0.5.57 — predicted SoH given km, chemistry, climate, habits.
+
+    Curve constants live in `coordinator._DEGRADATION_PROFILES` and
+    are documented in the coordinator module header. The sensor is
+    pure read-side: every refresh re-runs `async_compute_expected_soh`.
+    """
+
+    _unrecorded_attributes = frozenset({"factors", "inputs"})
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="expected_battery_soh",
+            translation_key="expected_battery_soh",
+            native_unit_of_measurement="%",
+            icon="mdi:heart-pulse",
+            suggested_display_precision=1,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_expected_battery_soh"
+        self._cache: dict[str, Any] = {}
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        try:
+            self._cache = await self._coordinator.async_compute_expected_soh()
+        except Exception as exc:  # pragma: no cover — defensive
+            logging.getLogger(__name__).debug(
+                "expected_soh compute failed: %s", exc
+            )
+            self._cache = {}
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._cache.get("expected_soh_pct")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "factors": self._cache.get("factors", {}),
+            "inputs": self._cache.get("inputs", {}),
+            "confidence": self._cache.get("confidence", "low"),
+        }
+
+
+class BatteryHealthVsExpectedSensor(_BaseTripSensor):
+    """v0.5.57 — compares observed SoH (calibrated / declared × 100)
+    against the predicted SoH for this car's age/km/habits.
+
+    State enum:
+      * `calibrating`  — no calibrated capacity yet (n_charges < 5)
+      * `ahead`        — observed ≥ expected + 2 pp
+      * `on_track`     — within ± 2 pp of the expected curve
+      * `behind`       — observed ≤ expected − 2 pp
+    """
+
+    _attr_options = ["calibrating", "ahead", "on_track", "behind"]
+    _attr_device_class = SensorDeviceClass.ENUM
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="battery_health_vs_expected",
+            translation_key="battery_health_vs_expected",
+            icon="mdi:scale-balance",
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = (
+            f"{coordinator.entry_id}_battery_health_vs_expected"
+        )
+        self._observed: float | None = None
+        self._expected: float | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        coord = self._coordinator
+        # Observed SoH — needs calibrated capacity. Without it we stay
+        # in `calibrating` state and the verdict is unreliable.
+        if coord._battery_capacity_calibrated is None:
+            self._observed = None
+        else:
+            decl = coord._battery_capacity_declared
+            cal = coord._battery_capacity_calibrated
+            self._observed = (cal / decl * 100.0) if decl > 0 else None
+        try:
+            result = await coord.async_compute_expected_soh()
+            self._expected = result.get("expected_soh_pct")
+        except Exception:  # pragma: no cover — defensive
+            self._expected = None
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> str:
+        if self._observed is None or self._expected is None:
+            return "calibrating"
+        delta = self._observed - self._expected
+        if delta >= 2.0:
+            return "ahead"
+        if delta <= -2.0:
+            return "behind"
+        return "on_track"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "observed_soh_pct": (
+                round(self._observed, 2) if self._observed is not None else None
+            ),
+            "expected_soh_pct": (
+                round(self._expected, 2) if self._expected is not None else None
+            ),
+            "delta_pp": (
+                round(self._observed - self._expected, 2)
+                if (self._observed is not None and self._expected is not None)
+                else None
+            ),
         }

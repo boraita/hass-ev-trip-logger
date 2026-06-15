@@ -21,6 +21,16 @@ CONF_TEMP: Final = "exterior_temp_sensor"
 # and store the averages on the trip row, enabling season/temp/time
 # breakdowns of consumption.
 CONF_WEATHER_ENTITY: Final = "weather_entity"
+# v0.5.57 — battery chemistry + age for SoH-vs-expected modelling.
+# `battery_chemistry`: 'lfp' (BYD Blade, Tesla SR, MG, Atto3, Sealion 7)
+# / 'nmc' (Tesla LR, BMW iX, VW ID, most 2018+) / 'nca' (older Tesla).
+# Default 'lfp' when capacity ≥ 75 kWh (heuristic — easy to override).
+# `vehicle_first_registered`: ISO date (YYYY-MM-DD). Used to compute
+# calendar age for the SoH model. Optional; when missing, we estimate
+# age from `km / 15000` as a proxy.
+CONF_BATTERY_CHEMISTRY: Final = "battery_chemistry"
+CONF_VEHICLE_FIRST_REGISTERED: Final = "vehicle_first_registered"
+DEFAULT_BATTERY_CHEMISTRY: Final = "lfp"
 CONF_SPEED: Final = "speed_sensor"
 CONF_PLUG_SENSOR: Final = "plug_sensor"
 # v0.5.35 — optional polling-pause sensor (e.g. BYD's

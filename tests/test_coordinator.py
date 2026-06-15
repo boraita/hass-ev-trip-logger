@@ -1736,3 +1736,83 @@ async def test_brief_off_during_trip_does_not_close(hass: HomeAssistant) -> None
     # Grace cancelled; trip still open.
     assert coordinator.current is not None
     assert coordinator._pending_close_unsub is None
+
+
+async def test_expected_soh_lfp_low_km_high_soh(hass: HomeAssistant) -> None:
+    """v0.5.57 — fresh LFP car (low km, mid-warm climate) → SoH 95+%."""
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
+    coord = hass.data[DOMAIN][entry.entry_id]
+    # Seed 1 trip so first_odometer_seen has a value.
+    await coord.storage.async_insert(TripRecord(
+        started_at=dt_util.now() - timedelta(days=10),
+        ended_at=dt_util.now() - timedelta(days=10) + timedelta(minutes=30),
+        duration_min=30.0, distance_km=20.0,
+        odometer_start=20000.0, odometer_end=20020.0,
+        soc_used_pct=4.0, energy_kwh=3.3, consumption_kwh_100km=16.5,
+    ))
+    hass.states.async_set("sensor.odometer", "26500")
+    await hass.async_block_till_done()
+    result = await coord.async_compute_expected_soh()
+    assert result["inputs"]["chemistry"] == "lfp"
+    assert result["inputs"]["km"] == pytest.approx(6500.0)  # 26500 − 20000
+    assert 95.0 <= result["expected_soh_pct"] <= 100.0
+
+
+async def test_expected_soh_nmc_aged_with_dcfc(hass: HomeAssistant) -> None:
+    """v0.5.57 — older NMC car with DCFC habit loses more than LFP."""
+    from custom_components.ev_trip_logger.const import CONF_BATTERY_CHEMISTRY
+    from custom_components.ev_trip_logger.storage import ChargeRecord, TripRecord
+
+    entry = await _setup(hass, **{
+        CONF_BATTERY_CAPACITY: 75.0, CONF_BATTERY_CHEMISTRY: "nmc",
+    })
+    coord = hass.data[DOMAIN][entry.entry_id]
+    # First trip = baseline odo at 0.
+    await coord.storage.async_insert(TripRecord(
+        started_at=dt_util.now() - timedelta(days=1000),
+        ended_at=dt_util.now() - timedelta(days=1000) + timedelta(minutes=30),
+        duration_min=30.0, distance_km=20.0,
+        odometer_start=0.0, odometer_end=20.0,
+        soc_used_pct=4.0, energy_kwh=3.3,
+    ))
+    hass.states.async_set("sensor.odometer", "100000")
+    # 20% DCFC ratio
+    for is_dcfc, kwh in [(False, 100.0), (False, 100.0), (False, 100.0), (True, 75.0)]:
+        await coord.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(days=10),
+            ended_at=dt_util.now() - timedelta(days=10) + timedelta(minutes=30),
+            kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
+            is_dcfc=is_dcfc,
+        ))
+    await hass.async_block_till_done()
+    result = await coord.async_compute_expected_soh()
+    assert result["inputs"]["chemistry"] == "nmc"
+    assert result["inputs"]["km"] == pytest.approx(100000.0)
+    # Expect substantial loss: ~4 (knee) + ~9 (calendar) + 10 (cycle) +
+    # small DCFC penalty → < 80
+    assert result["expected_soh_pct"] < 85.0
+    assert result["factors"]["cycle"] == pytest.approx(10.0, abs=0.1)
+
+
+async def test_expected_soh_floor_caps_at_70(hass: HomeAssistant) -> None:
+    """v0.5.57 — model never reports below 70% (warranty floor)."""
+    from custom_components.ev_trip_logger.const import CONF_BATTERY_CHEMISTRY
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass, **{
+        CONF_BATTERY_CAPACITY: 75.0, CONF_BATTERY_CHEMISTRY: "nca",
+    })
+    coord = hass.data[DOMAIN][entry.entry_id]
+    await coord.storage.async_insert(TripRecord(
+        started_at=dt_util.now() - timedelta(days=4000),
+        ended_at=dt_util.now() - timedelta(days=4000) + timedelta(minutes=30),
+        duration_min=30.0, distance_km=20.0,
+        odometer_start=0.0, odometer_end=20.0,
+        soc_used_pct=4.0, energy_kwh=3.3,
+    ))
+    hass.states.async_set("sensor.odometer", "500000")
+    await hass.async_block_till_done()
+    result = await coord.async_compute_expected_soh()
+    assert result["expected_soh_pct"] == 70.0  # clamped to floor
