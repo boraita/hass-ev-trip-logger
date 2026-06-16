@@ -323,13 +323,14 @@ class CurrentTripSensor(_BaseTripSensor):
     avg temperature) stay None because they're undefined without data.
     """
 
-    # v0.5.62 — only the avg-of-samples ratio (`avg_temp_c`) stays None
-    # in idle. Speed and consumption returning 0 when no trip is in
-    # progress reads cleanly on dashboards ("not driving → no consumption"),
-    # avoids the `unknown` warning, and is mathematically defensible
-    # (zero distance over zero time has no division-by-zero pitfall here:
-    # the snapshot is None, we return a constant).
-    _RATIO_KEYS = {"avg_temp_c"}
+    # v0.5.62/74 — only the avg-of-samples ratio (`avg_temp_c`) stays
+    # None in idle... almost. v0.5.74 returns the live exterior-temp
+    # reading instead (see `native_value`), so even with no trip in
+    # progress the user sees the current temperature, not `unknown`.
+    # Speed and consumption returning 0 when no trip is in progress
+    # reads cleanly on dashboards ("not driving → no consumption"),
+    # avoids the `unknown` warning, and is mathematically defensible.
+    _RATIO_KEYS: set[str] = set()
 
     def __init__(
         self, coordinator: EvTripLoggerCoordinator, meta: TripSensorMeta
@@ -347,6 +348,14 @@ class CurrentTripSensor(_BaseTripSensor):
     def native_value(self) -> float | None:
         snapshot = self._coordinator.current_snapshot()
         if snapshot is None:
+            # v0.5.74 — `current_trip_avg_temperature` in idle: instead
+            # of `unknown`, show the live exterior-temp reading. The
+            # tile then doubles as "outside temperature now" when the
+            # car is parked, which is what the dashboard wants anyway.
+            if self._meta.key == "avg_temp_c":
+                return self._coordinator._read_float(
+                    self._coordinator._temp
+                ) if self._coordinator._temp else None
             return None if self._meta.key in self._RATIO_KEYS else 0.0
         return snapshot.get(self._meta.key)
 

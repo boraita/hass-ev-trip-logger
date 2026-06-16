@@ -350,12 +350,20 @@ async def test_current_trip_sensors_idle_show_zero_not_unavailable(
         )
         assert float(state.state) == 0.0
 
-    ratio_keys = ["avg_temp_c"]
-    for key in ratio_keys:
-        eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_current_{key}")
-        state = hass.states.get(eid)
-        # Available but value is None → HA renders as "unknown"
-        assert state.state == "unknown", f"{eid} expected unknown, got {state.state}"
+    # v0.5.74 — `current_trip_avg_temperature` in idle returns the
+    # live exterior-temp reading from CONF_TEMP (or `unknown` if no
+    # temp sensor is configured AND auto-detect found nothing).
+    # _setup wires no temp sensor by default, so we still see
+    # `unknown` here — the live-reading path only triggers when
+    # CONF_TEMP / auto-detect resolves to a real entity.
+    eid = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_current_avg_temp_c",
+    )
+    state = hass.states.get(eid)
+    assert state.state == "unknown", (
+        f"{eid} expected unknown (no temp sensor configured), "
+        f"got {state.state}"
+    )
 
 
 async def test_current_trip_distance_updates_live(hass: HomeAssistant) -> None:
