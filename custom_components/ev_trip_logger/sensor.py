@@ -2681,9 +2681,12 @@ class ExpectedBatterySohSensor(_BaseTripSensor):
     async def _async_refresh(self, *_: Any) -> None:
         try:
             self._cache = await self._coordinator.async_compute_expected_soh()
-        except Exception as exc:  # pragma: no cover — defensive
-            logging.getLogger(__name__).debug(
-                "expected_soh compute failed: %s", exc
+        except Exception:  # pragma: no cover — defensive
+            # v0.5.58 — was silent debug, but the sensor was stuck in
+            # `unknown` for hours and we had no traceback. Log the full
+            # exception so the next failure surfaces in system_log.
+            logging.getLogger(__name__).exception(
+                "expected_soh compute failed"
             )
             self._cache = {}
         self.async_write_ha_state()
