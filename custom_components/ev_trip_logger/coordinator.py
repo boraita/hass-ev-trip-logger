@@ -628,11 +628,17 @@ class EvTripLoggerCoordinator:
         if first_reg:
             try:
                 # Accept either ISO 8601 datetime or YYYY-MM-DD date.
-                self._vehicle_first_registered = (
+                parsed = (
                     datetime.fromisoformat(str(first_reg))
                     if "T" in str(first_reg)
                     else datetime.fromisoformat(str(first_reg) + "T00:00:00")
                 )
+                # v0.5.59 — dt_util.now() is tz-aware; subtracting a
+                # naive datetime raises TypeError. Promote to UTC when
+                # we got a bare date from the DateSelector.
+                if parsed.tzinfo is None:
+                    parsed = dt_util.as_local(parsed).astimezone(dt_util.UTC)
+                self._vehicle_first_registered = parsed
             except ValueError:
                 _LOGGER.warning(
                     "Invalid vehicle_first_registered=%r — ignoring", first_reg,

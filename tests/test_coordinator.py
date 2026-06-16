@@ -1816,3 +1816,31 @@ async def test_expected_soh_floor_caps_at_70(hass: HomeAssistant) -> None:
     await hass.async_block_till_done()
     result = await coord.async_compute_expected_soh()
     assert result["expected_soh_pct"] == 70.0  # clamped to floor
+
+
+async def test_expected_soh_handles_date_only_first_registered(hass: HomeAssistant) -> None:
+    """v0.5.59 — DateSelector returns 'YYYY-MM-DD' which we parse to
+    a naive datetime. Subtracting against dt_util.now() (tz-aware) used
+    to crash with TypeError. Test the fix is in place.
+    """
+    from custom_components.ev_trip_logger.const import (
+        CONF_VEHICLE_FIRST_REGISTERED,
+    )
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass, **{CONF_VEHICLE_FIRST_REGISTERED: "2024-12-15"})
+    coord = hass.data[DOMAIN][entry.entry_id]
+    await coord.storage.async_insert(TripRecord(
+        started_at=dt_util.now() - timedelta(days=10),
+        ended_at=dt_util.now() - timedelta(days=10) + timedelta(minutes=30),
+        duration_min=30.0, distance_km=20.0,
+        odometer_start=20000.0, odometer_end=20020.0,
+        soc_used_pct=4.0, energy_kwh=3.3,
+    ))
+    hass.states.async_set("sensor.odometer", "26500")
+    await hass.async_block_till_done()
+    # Should not raise.
+    result = await coord.async_compute_expected_soh()
+    assert result["expected_soh_pct"] is not None
+    assert result["inputs"]["age_years"] > 0  # parsed correctly
+    assert result["confidence"] == "medium"  # has age, no climate
