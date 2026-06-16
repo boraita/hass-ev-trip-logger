@@ -4194,7 +4194,11 @@ class EvTripLoggerCoordinator:
         ):
             candidate = f"sensor.{prefix}{suffix}"
             if self.hass.states.get(candidate) is not None:
-                _LOGGER.info(
+                # WARNING level so it surfaces in `system_log/list` and
+                # the HA UI's Logs panel without needing custom logger
+                # config. Cosmetic but the user wants to KNOW we wired
+                # this for them.
+                _LOGGER.warning(
                     "Auto-detected exterior temp sensor: %s. "
                     "(CONF_TEMP was empty — set it in Configure to override.)",
                     candidate,
