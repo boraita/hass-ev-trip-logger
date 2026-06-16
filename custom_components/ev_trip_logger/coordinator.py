@@ -1150,10 +1150,13 @@ class EvTripLoggerCoordinator:
         """
         profile = _DEGRADATION_PROFILES[self._battery_chemistry]
         # 1. Inputs
-        km_now = self._read_float(self._odometer) or 0.0
-        # km used = current odo − first observed odo in storage (or 0).
-        first_odo = await self.storage.async_first_odometer_seen()
-        km = max(0.0, km_now - first_odo) if first_odo is not None else km_now
+        # v0.5.60 — use the odometer reading DIRECTLY. The pack has
+        # accumulated every km on the odometer, regardless of when we
+        # started logging. Previously we subtracted "first odo seen in
+        # DB", which gave km-since-install (always 0 for users who
+        # configured the integration after driving the car), making the
+        # cycle component of the SoH model report 0 forever.
+        km = self._read_float(self._odometer) or 0.0
         if self._vehicle_first_registered is not None:
             age_years = (
                 dt_util.now() - self._vehicle_first_registered

@@ -1756,8 +1756,11 @@ async def test_expected_soh_lfp_low_km_high_soh(hass: HomeAssistant) -> None:
     await hass.async_block_till_done()
     result = await coord.async_compute_expected_soh()
     assert result["inputs"]["chemistry"] == "lfp"
-    assert result["inputs"]["km"] == pytest.approx(6500.0)  # 26500 − 20000
-    assert 95.0 <= result["expected_soh_pct"] <= 100.0
+    # v0.5.60 — km comes from the odometer reading directly (pack
+    # lifetime), not "since install".
+    assert result["inputs"]["km"] == pytest.approx(26500.0)
+    # LFP year-1 knee (3.5) + cycle loss 26.5 × 0.04 ≈ 1.06 → ~95.4 %
+    assert 93.0 <= result["expected_soh_pct"] <= 97.0
 
 
 async def test_expected_soh_nmc_aged_with_dcfc(hass: HomeAssistant) -> None:
@@ -1843,4 +1846,6 @@ async def test_expected_soh_handles_date_only_first_registered(hass: HomeAssista
     result = await coord.async_compute_expected_soh()
     assert result["expected_soh_pct"] is not None
     assert result["inputs"]["age_years"] > 0  # parsed correctly
+    # v0.5.60 — km is the odometer directly, not km-since-install.
+    assert result["inputs"]["km"] == pytest.approx(26500.0)
     assert result["confidence"] == "medium"  # has age, no climate
