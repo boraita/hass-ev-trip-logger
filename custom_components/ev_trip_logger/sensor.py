@@ -366,6 +366,15 @@ class LastTripSensor(_BaseTripSensor):
         )
         self._attr_unique_id = f"{coordinator.entry_id}_last_{meta.key}"
 
+    # v0.5.63 — fields that ONLY get populated on `live` trips
+    # (BYD's cloud-poll lag means most trips end up `reconstructed`).
+    # When the most recent trip is reconstructed, these are None →
+    # show 0.0 so the dashboard reads "0 kW" / "0 kWh" / "0 km/h"
+    # instead of `unknown`.
+    _ZERO_WHEN_MISSING_KEYS = frozenset({
+        "max_power_kw", "max_speed_kmh", "regen_kwh",
+    })
+
     @property
     def native_value(self) -> float | None:
         trip = self._coordinator.last_trip
@@ -379,6 +388,10 @@ class LastTripSensor(_BaseTripSensor):
         # instead of `unknown`.
         if value is None and self._meta.key == "avg_temp_c":
             return getattr(trip, "ambient_temp_c", None)
+        # v0.5.63 — reconstructed-trip fallback (max_power / max_speed /
+        # regen all live-path-only).
+        if value is None and self._meta.key in self._ZERO_WHEN_MISSING_KEYS:
+            return 0.0
         return value
 
     @property
@@ -1680,8 +1693,9 @@ class CurrentChargeSensor(_BaseTripSensor):
 
     # v0.5.62 — numeric idle defaults. kWh / cost / power / duration all
     # start at 0 in an idle state so the dashboard tile reads "0 kWh"
-    # instead of "unknown". price_per_kwh keeps None (no value to show
-    # until a session starts), is_dcfc maps via _is_dcfc_label.
+    # instead of "unknown". price_per_kwh keeps the home tariff (so
+    # "if I charged now, this is what it would cost"), is_dcfc maps
+    # via _is_dcfc_label.
     _IDLE_NUMERIC_KEYS = frozenset({
         "kwh", "total_cost", "power_kw", "duration_min",
     })
@@ -1694,7 +1708,11 @@ class CurrentChargeSensor(_BaseTripSensor):
                 return _is_dcfc_label(None)
             if self._key in self._IDLE_NUMERIC_KEYS:
                 return 0.0
-            # price_per_kwh and any other → None
+            # v0.5.63 — `price_per_kwh` in idle = the home tariff. Lets
+            # the dashboard show "current tariff: 0.07 €/kWh" instead
+            # of `unknown` when no session is active.
+            if self._key == "price_per_kwh":
+                return self._coordinator._energy_price
             return None
         value = snap.get(self._key)
         if self._key == "is_dcfc":
