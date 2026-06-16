@@ -2198,7 +2198,13 @@ class EvTripLoggerCoordinator:
             energy_kwh=energy,
             consumption_kwh_100km=consumption,
             avg_speed_kmh=avg_speed,
-            avg_temp_c=None,
+            # v0.5.73 — for synthetic trips we can't get per-tick temp
+            # samples (no live tick), so we settle for the END
+            # reading. Better than NULL — at least the trip is bucketed
+            # into the right season / temperature range and feeds
+            # consumption_by_temp_bucket. The user can override
+            # post-hoc with set_trip if needed.
+            avg_temp_c=self._read_float(self._temp) if self._temp else None,
             origin=location_start,
             destination=location_end,
             cost=cost,
