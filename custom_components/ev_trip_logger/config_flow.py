@@ -351,14 +351,14 @@ class EvTripLoggerConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class EvTripLoggerOptionsFlow(OptionsFlow):
-    """Options flow — edit any optional sensor or parameter without losing history.
+    """Options flow — edit any sensor or parameter without losing history.
 
-    Includes the same fields as the initial config-flow's `optional` step so
-    users who skipped a sensor at first install can wire it up later (e.g.
-    add a power sensor to start capturing regen / max_power, add a speed
-    sensor for max_speed). Required entities (odometer, battery,
-    vehicle_on) stay in entry.data and can only be changed via a full
-    reconfigure.
+    v0.5.67 — the required entities (odometer, battery, vehicle_on) are
+    also editable from here: a user who swaps the manufacturer
+    integration (e.g. moves from `byd_vehicle` to a forked variant
+    with different entity names) shouldn't have to reinstall and lose
+    history. The coordinator reads via `{**entry.data, **entry.options}`,
+    so overriding from options Just Works.
     """
 
     async def async_step_init(
@@ -368,7 +368,16 @@ class EvTripLoggerOptionsFlow(OptionsFlow):
             return self.async_create_entry(title="", data=user_input)
 
         defaults = {**self.config_entry.data, **self.config_entry.options}
+        # v0.5.67 — combine required + optional schemas so odometer /
+        # battery / vehicle_on appear at the top of the dialog
+        # (matching the order of the first-install wizard).
+        combined = vol.Schema(
+            {
+                **_required_schema(defaults).schema,
+                **_optional_schema(defaults).schema,
+            }
+        )
         return self.async_show_form(
             step_id="init",
-            data_schema=_optional_schema(defaults),
+            data_schema=combined,
         )
