@@ -323,7 +323,13 @@ class CurrentTripSensor(_BaseTripSensor):
     avg temperature) stay None because they're undefined without data.
     """
 
-    _RATIO_KEYS = {"avg_speed_kmh", "consumption_kwh_100km", "avg_temp_c"}
+    # v0.5.62 — only the avg-of-samples ratio (`avg_temp_c`) stays None
+    # in idle. Speed and consumption returning 0 when no trip is in
+    # progress reads cleanly on dashboards ("not driving → no consumption"),
+    # avoids the `unknown` warning, and is mathematically defensible
+    # (zero distance over zero time has no division-by-zero pitfall here:
+    # the snapshot is None, we return a constant).
+    _RATIO_KEYS = {"avg_temp_c"}
 
     def __init__(
         self, coordinator: EvTripLoggerCoordinator, meta: TripSensorMeta
@@ -365,7 +371,15 @@ class LastTripSensor(_BaseTripSensor):
         trip = self._coordinator.last_trip
         if trip is None:
             return None
-        return getattr(trip, self._meta.key, None)
+        value = getattr(trip, self._meta.key, None)
+        # v0.5.62 — when the car's exterior_temp_sensor is not wired
+        # but a weather entity IS, fall back from the trip's
+        # `avg_temp_c` (always null in that config) to the weather
+        # snapshot's `ambient_temp_c`. The user sees a useful number
+        # instead of `unknown`.
+        if value is None and self._meta.key == "avg_temp_c":
+            return getattr(trip, "ambient_temp_c", None)
+        return value
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
@@ -1664,13 +1678,24 @@ class CurrentChargeSensor(_BaseTripSensor):
         )
         self._attr_unique_id = f"{coordinator.entry_id}_{slug}"
 
+    # v0.5.62 — numeric idle defaults. kWh / cost / power / duration all
+    # start at 0 in an idle state so the dashboard tile reads "0 kWh"
+    # instead of "unknown". price_per_kwh keeps None (no value to show
+    # until a session starts), is_dcfc maps via _is_dcfc_label.
+    _IDLE_NUMERIC_KEYS = frozenset({
+        "kwh", "total_cost", "power_kw", "duration_min",
+    })
+
     @property
     def native_value(self) -> float | str | None:
         snap = self._coordinator.current_charge_snapshot()
         if snap is None:
-            # No active charge → show "unknown" for the enum, None for numerics
-            # so HA renders "unknown" instead of stale data.
-            return _is_dcfc_label(None) if self._key == "is_dcfc" else None
+            if self._key == "is_dcfc":
+                return _is_dcfc_label(None)
+            if self._key in self._IDLE_NUMERIC_KEYS:
+                return 0.0
+            # price_per_kwh and any other → None
+            return None
         value = snap.get(self._key)
         if self._key == "is_dcfc":
             return _is_dcfc_label(value)

@@ -334,8 +334,14 @@ async def test_current_trip_sensors_idle_show_zero_not_unavailable(
     entry = await _setup(hass)
     registry = er.async_get(hass)
 
-    additive_keys = ["distance_km", "duration_min", "soc_used_pct", "energy_kwh", "max_power_kw"]
-    for key in additive_keys:
+    # v0.5.62 — speed and consumption also show 0 in idle (cleaner UX:
+    # "not driving → no consumption"). Only avg_temp_c stays None because
+    # there's no physically defensible default for "no measurement".
+    zero_keys = [
+        "distance_km", "duration_min", "soc_used_pct", "energy_kwh",
+        "max_power_kw", "avg_speed_kmh", "consumption_kwh_100km",
+    ]
+    for key in zero_keys:
         eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_current_{key}")
         assert eid is not None, f"missing {key}"
         state = hass.states.get(eid)
@@ -344,7 +350,7 @@ async def test_current_trip_sensors_idle_show_zero_not_unavailable(
         )
         assert float(state.state) == 0.0
 
-    ratio_keys = ["avg_speed_kmh", "consumption_kwh_100km", "avg_temp_c"]
+    ratio_keys = ["avg_temp_c"]
     for key in ratio_keys:
         eid = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_current_{key}")
         state = hass.states.get(eid)

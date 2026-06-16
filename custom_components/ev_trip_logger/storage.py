@@ -1763,12 +1763,18 @@ class TripStorage:
         self, since: datetime, bucket_size_c: float
     ) -> dict[str, Any]:
         with self._connect() as conn:
+            # v0.5.62 — COALESCE(avg_temp_c, ambient_temp_c). When the
+            # user only has a weather entity but no exterior-temp sensor
+            # on the car, the trip's avg_temp_c stays NULL — fall back
+            # to the weather snapshot's ambient temp so the bucket
+            # sensor still has data.
             rows = conn.execute(
                 """
-                SELECT avg_temp_c, consumption_kwh_100km, distance_km
+                SELECT COALESCE(avg_temp_c, ambient_temp_c) AS t,
+                       consumption_kwh_100km, distance_km
                 FROM trips
                 WHERE started_at >= ?
-                  AND avg_temp_c IS NOT NULL
+                  AND COALESCE(avg_temp_c, ambient_temp_c) IS NOT NULL
                   AND consumption_kwh_100km IS NOT NULL
                 """,
                 (since.isoformat(),),
