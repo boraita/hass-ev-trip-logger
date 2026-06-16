@@ -2676,6 +2676,21 @@ class BatterySohSensor(_BaseTripSensor):
                     rate_kwh_per_year = round(delta / years, 3)
             except Exception:  # pragma: no cover — defensive
                 rate_kwh_per_year = None
+        # v0.5.65 — surface the car's current km and age in the SoH
+        # sensor attributes. Pairs nicely with the history (which now
+        # carries odometer_km on every snapshot): the dashboard can
+        # render "100 % at 26 471 km" and plot SoH vs km.
+        odo = coord._read_float(coord._odometer)
+        first_reg = coord._vehicle_first_registered
+        age_years: float | None = None
+        if first_reg is not None:
+            try:
+                age_years = round(
+                    (dt_util.now() - first_reg).total_seconds() / (365.25 * 86400),
+                    2,
+                )
+            except Exception:  # pragma: no cover — defensive
+                age_years = None
         return {
             "declared_capacity_kwh": declared,
             "calibrated_capacity_kwh": (
@@ -2683,6 +2698,9 @@ class BatterySohSensor(_BaseTripSensor):
             ),
             "calibration_charges": coord._battery_capacity_calibration_n,
             "degradation_kwh_per_year": rate_kwh_per_year,
+            "odometer_km": round(odo, 1) if odo is not None else None,
+            "age_years": age_years,
+            "battery_chemistry": coord._battery_chemistry,
             "history": self._history,
         }
 

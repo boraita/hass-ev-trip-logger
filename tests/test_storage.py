@@ -568,21 +568,38 @@ async def test_aggregates_by_temp_bucket_filters_unknown(
 
 
 async def test_capacity_history_round_trip(storage: TripStorage) -> None:
-    """v0.5.54 — snapshots are returned oldest → newest."""
+    """v0.5.54/65 — snapshots are returned oldest → newest with odo."""
     t0 = datetime(2026, 1, 1, 12, 0)
-    await storage.async_insert_capacity_snapshot(82.5, 82.5, 10, t0)
+    await storage.async_insert_capacity_snapshot(82.5, 82.5, 10, t0, odometer_km=15000.0)
     await storage.async_insert_capacity_snapshot(
-        81.8, 82.5, 14, t0 + timedelta(days=90)
+        81.8, 82.5, 14, t0 + timedelta(days=90), odometer_km=22000.0
     )
     await storage.async_insert_capacity_snapshot(
-        81.2, 82.5, 18, t0 + timedelta(days=180)
+        81.2, 82.5, 18, t0 + timedelta(days=180), odometer_km=30000.0
     )
     history = await storage.async_capacity_history(limit=10)
     assert len(history) == 3
     assert history[0]["calibrated_kwh"] == pytest.approx(82.5)
+    assert history[0]["odometer_km"] == pytest.approx(15000.0)
     assert history[-1]["calibrated_kwh"] == pytest.approx(81.2)
+    assert history[-1]["odometer_km"] == pytest.approx(30000.0)
 
     latest = await storage.async_latest_capacity_snapshot()
     assert latest is not None
     assert latest[1] == pytest.approx(81.2)
     assert latest[3] == 18
+    assert latest[4] == pytest.approx(30000.0)
+
+
+async def test_capacity_snapshot_without_odometer_is_accepted(
+    storage: TripStorage,
+) -> None:
+    """v0.5.65 — `odometer_km` is optional. Callers without an odometer
+    sensor (or where the reading is unavailable at snapshot time) must
+    still be able to persist the calibration."""
+    await storage.async_insert_capacity_snapshot(
+        82.5, 82.5, 10, datetime(2026, 1, 1, 12, 0),
+    )
+    latest = await storage.async_latest_capacity_snapshot()
+    assert latest is not None
+    assert latest[4] is None

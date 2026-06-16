@@ -1310,27 +1310,31 @@ class EvTripLoggerCoordinator:
     async def _async_snapshot_capacity_history(
         self, calibrated_kwh: float, n_charges: int,
     ) -> None:
-        """v0.5.54 — append a row to `capacity_history` when the calibrated
-        value drifts ≥`_CAPACITY_HISTORY_MIN_DELTA_KWH` from the latest
-        snapshot. For smaller drifts, the SoH is effectively the same so
-        we don't bloat the table; the next bigger move will capture both.
+        """v0.5.54/65 — append a row to `capacity_history` when the
+        calibrated value drifts ≥`_CAPACITY_HISTORY_MIN_DELTA_KWH` from
+        the latest snapshot. v0.5.65 also records the odometer at the
+        time of the snapshot so the dashboard can plot SoH vs km, not
+        just vs time.
         """
         try:
             latest = await self.storage.async_latest_capacity_snapshot()
             if latest is not None:
-                _, last_kwh, _, _ = latest
+                _, last_kwh, _, _, _ = latest
                 if abs(calibrated_kwh - last_kwh) < _CAPACITY_HISTORY_MIN_DELTA_KWH:
                     return
+            odo = self._read_float(self._odometer)
             await self.storage.async_insert_capacity_snapshot(
                 calibrated_kwh=calibrated_kwh,
                 declared_kwh=self._battery_capacity_declared,
                 n_charges=n_charges,
                 when=dt_util.now(),
+                odometer_km=odo,
             )
             _LOGGER.info(
-                "Capacity snapshot: %.2f kWh (n=%d charges, declared=%.2f) "
-                "appended to history",
+                "Capacity snapshot: %.2f kWh (n=%d charges, declared=%.2f, "
+                "odo=%s km) appended to history",
                 calibrated_kwh, n_charges, self._battery_capacity_declared,
+                f"{odo:.0f}" if odo is not None else "?",
             )
         except Exception as exc:  # pragma: no cover — defensive
             _LOGGER.debug("capacity_history snapshot failed: %s", exc)

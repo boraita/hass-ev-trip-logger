@@ -395,10 +395,24 @@ class TripStorage:
                 observed_at TEXT NOT NULL,
                 calibrated_kwh REAL NOT NULL,
                 declared_kwh REAL NOT NULL,
-                n_charges INTEGER NOT NULL
+                n_charges INTEGER NOT NULL,
+                -- v0.5.65: odometer reading at the time of the snapshot.
+                -- Pairing SoH with km is what makes the dashboard's
+                -- degradation curve actually meaningful — without it,
+                -- a "5% drop in 200 days" hides whether it was 1k km
+                -- or 50k km of usage.
+                odometer_km REAL
             )
             """
         )
+        # Migration: if the table existed before v0.5.65, add the column.
+        cap_cols = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(capacity_history)"
+            ).fetchall()
+        }
+        if "odometer_km" not in cap_cols:
+            conn.execute("ALTER TABLE capacity_history ADD COLUMN odometer_km REAL")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_capacity_history_observed_at "
             "ON capacity_history(observed_at)"
@@ -2159,48 +2173,58 @@ class TripStorage:
 
     async def async_insert_capacity_snapshot(
         self, calibrated_kwh: float, declared_kwh: float, n_charges: int,
-        when: datetime,
+        when: datetime, odometer_km: float | None = None,
     ) -> int:
-        """v0.5.54 — persist a capacity-calibration snapshot.
+        """v0.5.54/65 — persist a capacity-calibration snapshot.
 
         The coordinator calls this when `_async_refresh_battery_capacity`
         produces a value that differs from the latest stored row by more
         than `_CAPACITY_HISTORY_MIN_DELTA_KWH` (0.5 kWh). Repeated calls
         with the same value just update the latest row's `n_charges`
         (more data, same conclusion).
+
+        `odometer_km` (v0.5.65) anchors the snapshot to the car's km at
+        that moment — letting the dashboard plot SoH vs km, not just
+        vs time.
         """
         return await self._hass.async_add_executor_job(
             self._insert_capacity_snapshot,
-            calibrated_kwh, declared_kwh, n_charges, when,
+            calibrated_kwh, declared_kwh, n_charges, when, odometer_km,
         )
 
     def _insert_capacity_snapshot(
         self, calibrated_kwh: float, declared_kwh: float,
-        n_charges: int, when: datetime,
+        n_charges: int, when: datetime, odometer_km: float | None,
     ) -> int:
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO capacity_history "
-                "(observed_at, calibrated_kwh, declared_kwh, n_charges) "
-                "VALUES (?, ?, ?, ?)",
-                (when.isoformat(), calibrated_kwh, declared_kwh, n_charges),
+                "(observed_at, calibrated_kwh, declared_kwh, n_charges, odometer_km) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (when.isoformat(), calibrated_kwh, declared_kwh,
+                 n_charges, odometer_km),
             )
             return int(cur.lastrowid or 0)
 
     async def async_latest_capacity_snapshot(
         self,
-    ) -> tuple[datetime, float, float, int] | None:
-        """v0.5.54 — return the most recent capacity snapshot or None."""
+    ) -> tuple[datetime, float, float, int, float | None] | None:
+        """v0.5.54/65 — return the most recent capacity snapshot or None.
+
+        Tuple: (observed_at, calibrated_kwh, declared_kwh, n_charges,
+        odometer_km). `odometer_km` may be None for pre-v0.5.65 rows.
+        """
         return await self._hass.async_add_executor_job(
             self._latest_capacity_snapshot
         )
 
     def _latest_capacity_snapshot(
         self,
-    ) -> tuple[datetime, float, float, int] | None:
+    ) -> tuple[datetime, float, float, int, float | None] | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT observed_at, calibrated_kwh, declared_kwh, n_charges "
+                "SELECT observed_at, calibrated_kwh, declared_kwh, "
+                "n_charges, odometer_km "
                 "FROM capacity_history ORDER BY id DESC LIMIT 1"
             ).fetchone()
         if row is None:
@@ -2210,6 +2234,7 @@ class TripStorage:
             float(row[1]),
             float(row[2]),
             int(row[3]),
+            float(row[4]) if row[4] is not None else None,
         )
 
     async def async_capacity_history(
@@ -2227,7 +2252,8 @@ class TripStorage:
     def _capacity_history(self, limit: int) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT observed_at, calibrated_kwh, declared_kwh, n_charges "
+                "SELECT observed_at, calibrated_kwh, declared_kwh, "
+                "n_charges, odometer_km "
                 "FROM capacity_history ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -2238,6 +2264,7 @@ class TripStorage:
                 "calibrated_kwh": float(r[1]),
                 "declared_kwh": float(r[2]),
                 "n_charges": int(r[3]),
+                "odometer_km": float(r[4]) if r[4] is not None else None,
             }
             for r in reversed(rows)
         ]
