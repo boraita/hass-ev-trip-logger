@@ -1918,3 +1918,64 @@ def test_is_charging_value_vocabulary() -> None:
               "NoPower", "idle", "done", "false", "0", ""):
         assert f(s) is False, f"{s!r} should NOT be charging"
     assert f(None) is None
+
+
+async def test_auto_detect_exterior_temp_sensor(hass: HomeAssistant) -> None:
+    """v0.5.69 — when CONF_TEMP is unset, the integration looks for
+    `sensor.<prefix>_exterior_temperature` (where <prefix> is derived
+    from the configured odometer entity_id) and uses it automatically.
+    """
+    # Pre-register a temp sensor with the expected naming.
+    EXT_TEMP = "sensor.odometer_exterior_temperature"  # prefix from "sensor.odometer"
+    hass.states.async_set(EXT_TEMP, "22.5")
+    # NOTE: _setup wires ODO = "sensor.odometer"; prefix derivation
+    # strips the trailing "_odometer" → empty. To make this test
+    # representative we use a non-trivial odometer name.
+    OUR_ODO = "sensor.byd_car_odometer"
+    hass.states.async_set(OUR_ODO, "1000")
+    hass.states.async_set("sensor.byd_car_exterior_temperature", "22.5")
+
+    data = {
+        "name": "BYD",
+        "odometer_sensor": OUR_ODO,
+        "battery_sensor": BAT,
+        "vehicle_on_sensor": VOK,
+        "battery_capacity_kwh": 75.0,
+        "min_trip_distance_km": 0.5,
+        "idle_timeout_minutes": 1,
+        # CONF_TEMP intentionally NOT set
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=data, title="BYD")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator._temp == "sensor.byd_car_exterior_temperature"
+
+
+async def test_auto_detect_temp_does_not_override_explicit_conf(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.69 — explicit CONF_TEMP wins over auto-detect."""
+    hass.states.async_set("sensor.byd_car_exterior_temperature", "30.0")
+    hass.states.async_set("sensor.my_custom_temp", "21.0")
+    hass.states.async_set("sensor.byd_car_odometer", "1000")
+
+    data = {
+        "name": "BYD",
+        "odometer_sensor": "sensor.byd_car_odometer",
+        "battery_sensor": BAT,
+        "vehicle_on_sensor": VOK,
+        "battery_capacity_kwh": 75.0,
+        "min_trip_distance_km": 0.5,
+        "idle_timeout_minutes": 1,
+        "exterior_temp_sensor": "sensor.my_custom_temp",  # explicit
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=data, title="BYD")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator._temp == "sensor.my_custom_temp"

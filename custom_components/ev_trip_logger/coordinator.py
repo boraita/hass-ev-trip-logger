@@ -591,7 +591,12 @@ class EvTripLoggerCoordinator:
         # push on, charging V2C → push off) toggle this flag.
         self.abrp_push_enabled: bool = True
         self._location = merged.get(CONF_LOCATION)
-        self._temp = merged.get(CONF_TEMP)
+        # v0.5.69 — auto-detect exterior temp sensor by naming convention
+        # when the user hasn't explicitly configured one. Most cloud-
+        # polled integrations expose an entity at
+        # `sensor.<vehicle_prefix>_exterior_temperature`; we derive the
+        # prefix from CONF_ODOMETER. Explicit CONF_TEMP always wins.
+        self._temp = merged.get(CONF_TEMP) or self._auto_detect_temp_sensor()
         # v0.5.68 — weather_entity dropped. Kept the config-key read so
         # an old entry doesn't blow up; we just log once and ignore the
         # value. `CONF_TEMP` is the canonical exterior-temp source now.
@@ -4160,6 +4165,37 @@ class EvTripLoggerCoordinator:
 
     def _read_str(self, entity_id: str | None) -> str | None:
         return self._read_state(entity_id)
+
+    def _auto_detect_temp_sensor(self) -> str | None:
+        """v0.5.69 — look for `sensor.<prefix>_exterior_temperature`
+        (or common synonyms) when the user hasn't configured CONF_TEMP.
+
+        Prefix is derived from `CONF_ODOMETER`: for
+        `sensor.byd_sealion_7_odometer` the prefix is `byd_sealion_7`.
+        Tries `_exterior_temperature`, `_outside_temperature`,
+        `_ambient_temperature`. Returns the first entity that exists
+        in the HA state machine. The runtime override is in-memory only
+        — the config entry isn't mutated, so the field stays empty in
+        the UI and the user can still override it later via Options.
+        """
+        if not self._odometer or not self._odometer.startswith("sensor."):
+            return None
+        # `sensor.byd_sealion_7_odometer` → `byd_sealion_7`
+        prefix = self._odometer[len("sensor."):].rsplit("_", 1)[0]
+        for suffix in (
+            "_exterior_temperature",
+            "_outside_temperature",
+            "_ambient_temperature",
+        ):
+            candidate = f"sensor.{prefix}{suffix}"
+            if self.hass.states.get(candidate) is not None:
+                _LOGGER.info(
+                    "Auto-detected exterior temp sensor: %s. "
+                    "(CONF_TEMP was empty — set it in Configure to override.)",
+                    candidate,
+                )
+                return candidate
+        return None
 
     def _read_driver(self) -> str | None:
         """Current driver name from the configured driver sensor.
