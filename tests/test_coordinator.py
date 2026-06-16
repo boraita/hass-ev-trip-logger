@@ -1849,3 +1849,68 @@ async def test_expected_soh_handles_date_only_first_registered(hass: HomeAssista
     # v0.5.60 — km is the odometer directly, not km-since-install.
     assert result["inputs"]["km"] == pytest.approx(26500.0)
     assert result["confidence"] == "medium"  # has age, no climate
+
+
+async def test_charge_sensor_accepts_tesla_state_enum(hass: HomeAssistant) -> None:
+    """v0.5.61 — Tesla's `sensor.<v>_charging_state` reports a string
+    enum (Charging / Disconnected / Complete / ...). The integration
+    must treat 'Charging' the same as binary_sensor 'on'.
+    """
+    from custom_components.ev_trip_logger.const import CONF_CHARGE_SENSOR
+
+    CHG = "sensor.tesla_charging_state"
+    hass.states.async_set(CHG, "Disconnected")
+    entry = await _setup(hass, **{CONF_CHARGE_SENSOR: CHG})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator.current_charge is None
+
+    hass.states.async_set(CHG, "Charging")
+    await hass.async_block_till_done()
+    assert coordinator.current_charge is not None, (
+        "Tesla 'Charging' state should open a charge session"
+    )
+
+    hass.states.async_set(CHG, "Complete")
+    await hass.async_block_till_done()
+    assert coordinator.current_charge is None, (
+        "'Complete' should close the charge session"
+    )
+
+
+async def test_charge_sensor_legacy_binary_still_works(hass: HomeAssistant) -> None:
+    """v0.5.61 — the new multi-vocab matcher must NOT regress the
+    classic binary_sensor 'on' / 'off' path.
+    """
+    from custom_components.ev_trip_logger.const import CONF_CHARGE_SENSOR
+
+    CHG = "binary_sensor.byd_charging"
+    hass.states.async_set(CHG, STATE_OFF)
+    entry = await _setup(hass, **{CONF_CHARGE_SENSOR: CHG})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current_charge is not None
+
+    hass.states.async_set(CHG, STATE_OFF)
+    await hass.async_block_till_done()
+    assert coordinator.current_charge is None
+
+
+def test_is_charging_value_vocabulary() -> None:
+    """v0.5.61 — explicit list of strings that count as 'charging'."""
+    from custom_components.ev_trip_logger.coordinator import EvTripLoggerCoordinator
+
+    f = EvTripLoggerCoordinator._is_charging_value
+    # truthy values
+    for s in ("on", "On", "ON",
+              "Charging", "charging",
+              "Starting", "starting",
+              "true", "True", "1",
+              "ac_charging", "DC_charging", "fast_charging"):
+        assert f(s) is True, f"{s!r} should be charging"
+    # falsy
+    for s in ("off", "Off", "Disconnected", "Complete", "Stopped",
+              "NoPower", "idle", "done", "false", "0", ""):
+        assert f(s) is False, f"{s!r} should NOT be charging"
+    assert f(None) is None

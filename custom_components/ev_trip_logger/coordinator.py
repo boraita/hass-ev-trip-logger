@@ -310,6 +310,22 @@ _DEGRADATION_PROFILES: dict[str, dict[str, float]] = {
 # the model is no longer reliable, and reporting 50% would alarm
 # without insight.
 _EXPECTED_SOH_FLOOR_PCT = 70.0
+# v0.5.61 — `charge_sensor` accepts both `binary_sensor.*` (Home
+# Assistant's classic on/off) and `sensor.*` with a state enum.
+# Different vehicle integrations use different vocabularies:
+#   * BYD / generic: 'on' / 'off'
+#   * Tesla:         'Charging' / 'Disconnected' / 'Complete' /
+#                    'Stopped' / 'NoPower' / 'Starting' / 'Engaged'
+#   * OVMS:          'charging' / 'idle' / 'done' / 'stopped'
+#   * Some bridges:  'true' / 'false' / '1' / '0'
+# We treat ANY of the values below as "currently delivering energy
+# to the battery" — everything else means "not charging right now".
+# Case-insensitive on the user's side; the helper normalises.
+_CHARGING_STATES: frozenset[str] = frozenset({
+    "on", "true", "1",
+    "charging", "starting", "engaged",
+    "ac_charging", "dc_charging", "slow_charging", "fast_charging",
+})
 # Buckets for the health-vs-expected sensor.
 _HEALTH_AHEAD_THRESHOLD_PP = 2.0   # observed ≥ expected + 2pp → ahead
 _HEALTH_BEHIND_THRESHOLD_PP = 2.0  # observed ≤ expected − 2pp → behind
@@ -1548,7 +1564,8 @@ class EvTripLoggerCoordinator:
         if self.current_charge is not None:
             return
         st = self.hass.states.get(self._charge_sensor)
-        if st is None or st.state != STATE_ON:
+        # v0.5.61 — accept Tesla / OVMS / any enum-style 'charging' state.
+        if st is None or self._is_charging_value(st.state) is not True:
             return
         soc = self._read_float(self._battery)
         started = st.last_changed or dt_util.now()
@@ -2380,7 +2397,9 @@ class EvTripLoggerCoordinator:
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _INVALID_STATES:
             return
-        is_charging = new_state.state == STATE_ON
+        # v0.5.61 — `state == STATE_ON` only matched binary_sensor 'on'.
+        # Now accepts Tesla's `Charging`, OVMS's `charging`, etc.
+        is_charging = self._is_charging_value(new_state.state) is True
         now = dt_util.now()
         if is_charging:
             if self.current_charge is not None:
@@ -2499,7 +2518,8 @@ class EvTripLoggerCoordinator:
                     lat = lon = None
         is_charging: bool | None = None
         if self._charge_sensor:
-            is_charging = self._read_bool(self._charge_sensor)
+            # v0.5.61 — multi-vocab. Tesla's `charging_state` etc.
+            is_charging = self._read_is_charging(self._charge_sensor)
         is_parked: bool | None = None
         veh_on = self._read_bool(self._vehicle_on)
         if veh_on is not None:
@@ -4268,6 +4288,24 @@ class EvTripLoggerCoordinator:
         if raw is None:
             return None
         return raw == STATE_ON
+
+    @staticmethod
+    def _is_charging_value(raw: str | None) -> bool | None:
+        """v0.5.61 — multi-vocab "is the car charging right now?".
+
+        Accepts:
+          * the classic binary_sensor 'on' / 'off'
+          * Tesla's `sensor.<v>_charging_state` enum
+          * OVMS / generic textual states
+        Returns None when the state itself is unknown/unavailable so
+        the caller can short-circuit just like before.
+        """
+        if raw is None:
+            return None
+        return raw.strip().lower() in _CHARGING_STATES
+
+    def _read_is_charging(self, entity_id: str | None) -> bool | None:
+        return self._is_charging_value(self._read_state(entity_id))
 
     def current_snapshot(self) -> dict[str, Any] | None:
         """Return live trip metrics for the sensor platform."""

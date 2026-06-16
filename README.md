@@ -145,7 +145,7 @@ The wizard asks for the entities the integration consumes. **Required** first, o
 | **Battery capacity (kWh)** | ✅ | E.g. 82.5 for a Sealion 7 Extended Range. Used as the **declared** capacity; the integration auto-calibrates the effective capacity from charges. |
 | **Home zone** | ✅ | Usually `zone.home`. Journey logic uses it. |
 | Power sensor | optional | kW, +discharge/-charge. Enables regen + power-integration backup + ABRP push. |
-| Charge binary sensor | optional | `binary_sensor.…_charging`. Auto-charge detection. |
+| Charge sensor | optional | `binary_sensor.…_charging` OR any `sensor.*` whose state names the charging mode. Recognised "charging" values: `on`, `true`, `1`, `Charging`, `Starting`, `Engaged`, `ac_charging`, `dc_charging`, `slow_charging`, `fast_charging` (case-insensitive). Anything else (`off`, `Disconnected`, `Complete`, `Stopped`, `NoPower`, `idle`, `done`…) counts as "not charging". |
 | Plug binary sensor | optional | Lets multi-pulse plugged sessions merge into one charge row. |
 | Polling-paused sensor | optional | A switch or binary_sensor that goes ON when the manufacturer integration sleeps. Synth trips in that window get tagged `reconstructed_polling_paused`. |
 | Location tracker | optional | `device_tracker.…_location`. Drives origin/destination + route map. |

@@ -106,10 +106,19 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_POWER,
                 EntitySelector(EntitySelectorConfig(domain="sensor", device_class="power")),
             ): EntitySelector(EntitySelectorConfig(domain="sensor", device_class="power")),
+            # v0.5.61 — accept `sensor.*` as well: Tesla exposes
+            # `sensor.<vehicle>_charging_state` (enum: Charging /
+            # Disconnected / Complete / Stopped / NoPower / Starting),
+            # not a binary_sensor. The integration recognises the
+            # textual states (see _CHARGING_STATES in coordinator).
             _optional(
                 CONF_CHARGE_SENSOR,
-                EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
-            ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
+                EntitySelector(
+                    EntitySelectorConfig(domain=["binary_sensor", "sensor"])
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain=["binary_sensor", "sensor"])
+            ),
             _optional(
                 CONF_PLUG_SENSOR,
                 EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
