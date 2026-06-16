@@ -341,39 +341,6 @@ _GPS_BUFFER_MAX = 256
 _PRE_TRIP_GPS_LOOKBACK_S = 600  # 10 min
 
 
-def _avg_weather(
-    start: dict[str, Any] | None, end: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """v0.5.54 — average two weather snapshots into the trip-row fields.
-
-    Numeric fields are mean(start, end) when both exist, else whichever
-    half is non-None. `weather_condition` takes the END snapshot when
-    available (matches what the user actually saw on arrival).
-    """
-    def _avg(key: str) -> float | None:
-        a = (start or {}).get(key)
-        b = (end or {}).get(key)
-        if a is not None and b is not None:
-            return (float(a) + float(b)) / 2.0
-        if a is not None:
-            return float(a)
-        if b is not None:
-            return float(b)
-        return None
-    condition = None
-    if end and end.get("condition"):
-        condition = end["condition"]
-    elif start and start.get("condition"):
-        condition = start["condition"]
-    return {
-        "ambient_temp_c": _avg("temperature_c"),
-        "weather_condition": condition,
-        "humidity_pct": _avg("humidity_pct"),
-        "wind_kmh": _avg("wind_kmh"),
-        "precipitation_mm": _avg("precipitation_mm"),
-    }
-
-
 def _haversine_km(
     lat1: float, lon1: float, lat2: float, lon2: float
 ) -> float:
@@ -537,8 +504,8 @@ class TripInProgress:
     # by `_async_close_trip` just before persistence; the trip row
     # then stores the START–END average (when both exist) or whichever
     # half is non-null. None when CONF_WEATHER_ENTITY is unset.
-    weather_start: dict[str, Any] | None = None
-    weather_end: dict[str, Any] | None = None
+    # v0.5.68 — weather snapshot fields removed from the dataclass; the
+    # logger no longer reads a weather entity.
 
 
 @dataclass
@@ -625,11 +592,18 @@ class EvTripLoggerCoordinator:
         self.abrp_push_enabled: bool = True
         self._location = merged.get(CONF_LOCATION)
         self._temp = merged.get(CONF_TEMP)
-        # v0.5.54 — optional weather.* entity. Snapshot at trip open/close,
-        # average the two and persist on the trip row so the
-        # consumption_by_season / by_temp / by_time_of_day sensors can
-        # bucket trips post-hoc. None means "feature disabled".
-        self._weather_entity = merged.get(CONF_WEATHER_ENTITY)
+        # v0.5.68 — weather_entity dropped. Kept the config-key read so
+        # an old entry doesn't blow up; we just log once and ignore the
+        # value. `CONF_TEMP` is the canonical exterior-temp source now.
+        self._weather_entity = None
+        if merged.get(CONF_WEATHER_ENTITY):
+            _LOGGER.info(
+                "weather_entity is deprecated and ignored from v0.5.68 — "
+                "configure CONF_TEMP (the car's exterior temperature "
+                "sensor) instead. Real-time updates, better granularity, "
+                "no extra HTTP. The other weather fields were never "
+                "consumed by the logger."
+            )
         # v0.5.57 — battery chemistry + first-registered date drive the
         # expected SoH model (see _DEGRADATION_PROFILES). Chemistry
         # defaults to LFP when the user doesn't specify, since most
@@ -3044,8 +3018,6 @@ class EvTripLoggerCoordinator:
             # v0.5.43 — may still be None here (BT pairs a few seconds
             # after ignition); the live tick keeps retrying.
             driver=self._read_driver(),
-            # v0.5.54 — first weather snapshot of the trip.
-            weather_start=self._read_weather_snapshot(),
         )
         # v0.5.25 — seed gps_samples with the most-recent buffered
         # sample (if any within the lookback window) so even very short
@@ -3449,10 +3421,9 @@ class EvTripLoggerCoordinator:
             # v0.5.43 — last-chance read in case the live tick never
             # caught the BT connection (very short trips).
             driver=active.driver if active.driver is not None else self._read_driver(),
-            # v0.5.54 — weather averages from start+end snapshots. We
-            # average the two so a trip that started cold and ended
-            # warm bucketsfairly. If only one half exists we use that.
-            **_avg_weather(active.weather_start, self._read_weather_snapshot()),
+            # v0.5.68 — weather fields stay as their dataclass defaults
+            # (None). They survive in the schema for backwards compat;
+            # nothing new fills them.
         )
 
         # v0.5.27 — attribute pre/intra-trip charging energy. Lets the
@@ -4189,35 +4160,6 @@ class EvTripLoggerCoordinator:
 
     def _read_str(self, entity_id: str | None) -> str | None:
         return self._read_state(entity_id)
-
-    def _read_weather_snapshot(self) -> dict[str, Any] | None:
-        """v0.5.54 — read the configured `weather.*` entity right now.
-
-        Returns a dict with the temperature/condition/humidity/wind/
-        precipitation attributes when the entity is configured and
-        readable, or None otherwise. The trip code averages start &
-        end snapshots; callers should be prepared for either side to
-        be None.
-        """
-        if not self._weather_entity:
-            return None
-        st = self.hass.states.get(self._weather_entity)
-        if st is None or st.state in _INVALID_STATES:
-            return None
-        a = st.attributes or {}
-        def _f(key: str) -> float | None:
-            try:
-                v = a.get(key)
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-        return {
-            "condition": st.state,
-            "temperature_c": _f("temperature"),
-            "humidity_pct": _f("humidity"),
-            "wind_kmh": _f("wind_speed"),
-            "precipitation_mm": _f("precipitation"),
-        }
 
     def _read_driver(self) -> str | None:
         """Current driver name from the configured driver sensor.

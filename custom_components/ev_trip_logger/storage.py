@@ -2381,9 +2381,14 @@ class TripStorage:
     async def async_avg_ambient_temp_recent(
         self, *, days: int = 90,
     ) -> float | None:
-        """v0.5.57 — average ambient_temp_c over recent trips. Used to
-        classify the climate (cold/temperate/hot) for the SoH model.
-        Returns None until enough trips with weather snapshots exist.
+        """v0.5.57/68 — average exterior temperature over recent trips.
+
+        Used to classify the climate (cold/temperate/hot) for the SoH
+        model. Prefers `avg_temp_c` (the car's own exterior temp
+        sensor, sampled every metric tick — best granularity). Falls
+        back to `ambient_temp_c` (legacy weather snapshot) for trips
+        logged before v0.5.68 when the weather entity was still
+        captured. None when neither side has data.
         """
         return await self._hass.async_add_executor_job(
             self._avg_ambient_temp_recent, days,
@@ -2393,8 +2398,10 @@ class TripStorage:
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT AVG(ambient_temp_c) FROM trips "
-                "WHERE ambient_temp_c IS NOT NULL AND started_at >= ?",
+                "SELECT AVG(COALESCE(avg_temp_c, ambient_temp_c)) "
+                "FROM trips "
+                "WHERE COALESCE(avg_temp_c, ambient_temp_c) IS NOT NULL "
+                "  AND started_at >= ?",
                 (cutoff,),
             ).fetchone()
         return float(row[0]) if row and row[0] is not None else None
@@ -2442,7 +2449,7 @@ class TripStorage:
                         COALESCE(SUM(distance_km), 0) AS d,
                         COALESCE(SUM(energy_kwh), 0) AS e,
                         AVG(consumption_kwh_100km) AS c,
-                        AVG(ambient_temp_c) AS t
+                        AVG(COALESCE(avg_temp_c, ambient_temp_c)) AS t
                     FROM trips
                     WHERE strftime('%m', started_at) IN (?, ?, ?)
                       AND distance_km IS NOT NULL AND distance_km > 0

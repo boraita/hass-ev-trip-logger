@@ -19,7 +19,6 @@
           "charge_sensor": "Binary sensor de carga (para auto-detección)",
           "location_tracker": "Entidad de ubicación (device_tracker, person, input_select…)",
           "exterior_temp_sensor": "Sensor de temperatura exterior",
-          "weather_entity": "Entidad de tiempo (weather.* — AEMET, Met.no, OpenWeatherMap…)",
           "driver_sensor": "Sensor de conductor (p. ej. dispositivo bluetooth conectado)",
           "battery_capacity_kwh": "Capacidad de batería (kWh)",
           "min_trip_distance_km": "Distancia mínima por viaje (km)",

@@ -381,11 +381,10 @@ class LastTripSensor(_BaseTripSensor):
         if trip is None:
             return None
         value = getattr(trip, self._meta.key, None)
-        # v0.5.62 — when the car's exterior_temp_sensor is not wired
-        # but a weather entity IS, fall back from the trip's
-        # `avg_temp_c` (always null in that config) to the weather
-        # snapshot's `ambient_temp_c`. The user sees a useful number
-        # instead of `unknown`.
+        # v0.5.68 — legacy fallback for old trips logged with weather
+        # entity (pre-v0.5.68). New trips populate `avg_temp_c` only;
+        # if it's None, fall back to `ambient_temp_c` for trips that
+        # already have it in storage.
         if value is None and self._meta.key == "avg_temp_c":
             return getattr(trip, "ambient_temp_c", None)
         # v0.5.63 — reconstructed-trip fallback (max_power / max_speed /

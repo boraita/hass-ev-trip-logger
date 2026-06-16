@@ -15,11 +15,13 @@ CONF_POWER: Final = "power_sensor"
 CONF_CHARGE_SENSOR: Final = "charge_sensor"
 CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
-# v0.5.54 — optional weather.* entity (any HA weather integration:
-# AEMET, Met.no, OpenWeatherMap, ...). When set, we snapshot temperature
-# / condition / humidity / wind / precipitation at trip open and close
-# and store the averages on the trip row, enabling season/temp/time
-# breakdowns of consumption.
+# v0.5.54-67 ʟᴇɢᴀᴄʏ — Weather entity support. Dropped in v0.5.68:
+# the only field actually consumed was `temperature`, and that was a
+# fallback for `CONF_TEMP` (the car's exterior temp sensor — better
+# granularity, real-time updates). Other fields (condition, humidity,
+# wind, precipitation) were stored but never used. The constant is
+# kept so old config entries don't error on load; new installs ignore
+# it and the field is hidden from the config flow.
 CONF_WEATHER_ENTITY: Final = "weather_entity"
 # v0.5.57 — battery chemistry + age for SoH-vs-expected modelling.
 # `battery_chemistry`: 'lfp' (BYD Blade, Tesla SR, MG, Atto3, Sealion 7)
