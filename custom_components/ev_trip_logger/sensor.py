@@ -2218,7 +2218,11 @@ class AvgTripMetricsSensor(_BaseTripSensor):
 
     @property
     def native_value(self) -> float | None:
-        return self._value
+        # v0.5.64 — show 0.0 instead of `unknown` when the 30d window
+        # has no data for this metric. Reconstructed trips never
+        # capture regen, so on cloud-polled cars `avg_trip_regen_30d`
+        # was stuck at `unknown` for weeks. 0.0 reads cleanly.
+        return self._value if self._value is not None else 0.0
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
