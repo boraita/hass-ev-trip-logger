@@ -1086,6 +1086,16 @@ class RecentTripsSensor(_BaseTripSensor):
             "battery_capacity_calibration_charges": (
                 self._coordinator._battery_capacity_calibration_n
             ),
+            # v0.5.71 — expose the resolved exterior-temp sensor + its
+            # current reading. Lets the user see whether the auto-detect
+            # (v0.5.69+) wired anything for them without digging through
+            # logs. None means: CONF_TEMP empty AND auto-detect found
+            # nothing.
+            "exterior_temp_sensor_entity": self._coordinator._temp,
+            "exterior_temp_c_now": (
+                self._coordinator._read_float(self._coordinator._temp)
+                if self._coordinator._temp else None
+            ),
         }
 
 
