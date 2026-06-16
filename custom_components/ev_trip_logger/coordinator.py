@@ -591,12 +591,12 @@ class EvTripLoggerCoordinator:
         # push on, charging V2C → push off) toggle this flag.
         self.abrp_push_enabled: bool = True
         self._location = merged.get(CONF_LOCATION)
-        # v0.5.69 — auto-detect exterior temp sensor by naming convention
-        # when the user hasn't explicitly configured one. Most cloud-
-        # polled integrations expose an entity at
-        # `sensor.<vehicle_prefix>_exterior_temperature`; we derive the
-        # prefix from CONF_ODOMETER. Explicit CONF_TEMP always wins.
-        self._temp = merged.get(CONF_TEMP) or self._auto_detect_temp_sensor()
+        # v0.5.69 — CONF_TEMP may be empty; `_auto_detect_temp_sensor`
+        # in `async_start` will set it from the entity registry if a
+        # `sensor.<prefix>_exterior_temperature` exists. Doing it here
+        # (in __init__) would race with HA loading the BYD integration's
+        # entities — they may not be in the state machine yet.
+        self._temp = merged.get(CONF_TEMP)
         # v0.5.68 — weather_entity dropped. Kept the config-key read so
         # an old entry doesn't blow up; we just log once and ignore the
         # value. `CONF_TEMP` is the canonical exterior-temp source now.
@@ -1392,6 +1392,11 @@ class EvTripLoggerCoordinator:
 
     async def async_start(self) -> None:
         """Wire up state listeners and seed from existing storage."""
+        # v0.5.69 — auto-detect exterior_temp_sensor here (not in
+        # __init__) so the BYD/Tesla integration has had time to
+        # publish its entities to the state machine.
+        if not self._temp:
+            self._temp = self._auto_detect_temp_sensor()
         self.last_trip = await self.storage.async_get_last()
         self.last_charge = await self.storage.async_get_last_charge()
         # Robust journey resume — derive from the actual trip log rather
