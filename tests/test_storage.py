@@ -603,3 +603,11 @@ async def test_capacity_snapshot_without_odometer_is_accepted(
     latest = await storage.async_latest_capacity_snapshot()
     assert latest is not None
     assert latest[4] is None
+
+
+async def test_logger_total_km_sums_distance(storage: TripStorage) -> None:
+    """v0.5.66 — logger_km is the SUM of distance_km across trips."""
+    assert await storage.async_logger_total_km() == 0.0
+    await storage.async_insert(_trip(distance_km=15.0))
+    await storage.async_insert(_trip(distance_km=23.5))
+    assert await storage.async_logger_total_km() == pytest.approx(38.5)

@@ -396,16 +396,20 @@ class TripStorage:
                 calibrated_kwh REAL NOT NULL,
                 declared_kwh REAL NOT NULL,
                 n_charges INTEGER NOT NULL,
-                -- v0.5.65: odometer reading at the time of the snapshot.
-                -- Pairing SoH with km is what makes the dashboard's
-                -- degradation curve actually meaningful — without it,
-                -- a "5% drop in 200 days" hides whether it was 1k km
-                -- or 50k km of usage.
-                odometer_km REAL
+                -- v0.5.65: car's lifetime odometer reading at the
+                -- snapshot moment. Informational only — see logger_km
+                -- below for the SoH-relevant figure.
+                odometer_km REAL,
+                -- v0.5.66: distance the logger has actually witnessed
+                -- (SUM(distance_km)) at the snapshot moment. This is
+                -- what the SoH model uses for the cycle-aging
+                -- component, since the model only knows habits/climate
+                -- during the period the logger has been running.
+                logger_km REAL
             )
             """
         )
-        # Migration: if the table existed before v0.5.65, add the column.
+        # Migration: if the table existed before v0.5.65/66, add columns.
         cap_cols = {
             row[1] for row in conn.execute(
                 "PRAGMA table_info(capacity_history)"
@@ -413,6 +417,8 @@ class TripStorage:
         }
         if "odometer_km" not in cap_cols:
             conn.execute("ALTER TABLE capacity_history ADD COLUMN odometer_km REAL")
+        if "logger_km" not in cap_cols:
+            conn.execute("ALTER TABLE capacity_history ADD COLUMN logger_km REAL")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_capacity_history_observed_at "
             "ON capacity_history(observed_at)"
@@ -2174,6 +2180,7 @@ class TripStorage:
     async def async_insert_capacity_snapshot(
         self, calibrated_kwh: float, declared_kwh: float, n_charges: int,
         when: datetime, odometer_km: float | None = None,
+        logger_km: float | None = None,
     ) -> int:
         """v0.5.54/65 — persist a capacity-calibration snapshot.
 
@@ -2189,20 +2196,23 @@ class TripStorage:
         """
         return await self._hass.async_add_executor_job(
             self._insert_capacity_snapshot,
-            calibrated_kwh, declared_kwh, n_charges, when, odometer_km,
+            calibrated_kwh, declared_kwh, n_charges, when,
+            odometer_km, logger_km,
         )
 
     def _insert_capacity_snapshot(
         self, calibrated_kwh: float, declared_kwh: float,
         n_charges: int, when: datetime, odometer_km: float | None,
+        logger_km: float | None,
     ) -> int:
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO capacity_history "
-                "(observed_at, calibrated_kwh, declared_kwh, n_charges, odometer_km) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "(observed_at, calibrated_kwh, declared_kwh, n_charges, "
+                " odometer_km, logger_km) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (when.isoformat(), calibrated_kwh, declared_kwh,
-                 n_charges, odometer_km),
+                 n_charges, odometer_km, logger_km),
             )
             return int(cur.lastrowid or 0)
 
@@ -2224,11 +2234,15 @@ class TripStorage:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT observed_at, calibrated_kwh, declared_kwh, "
-                "n_charges, odometer_km "
+                "n_charges, odometer_km, logger_km "
                 "FROM capacity_history ORDER BY id DESC LIMIT 1"
             ).fetchone()
         if row is None:
             return None
+        # Tuple kept 5-wide for callers that only need
+        # (when, calibrated, declared, n_charges, odometer_km). The
+        # full row including logger_km is available via
+        # async_capacity_history if needed.
         return (
             datetime.fromisoformat(row[0]),
             float(row[1]),
@@ -2253,7 +2267,7 @@ class TripStorage:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT observed_at, calibrated_kwh, declared_kwh, "
-                "n_charges, odometer_km "
+                "n_charges, odometer_km, logger_km "
                 "FROM capacity_history ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -2265,9 +2279,31 @@ class TripStorage:
                 "declared_kwh": float(r[2]),
                 "n_charges": int(r[3]),
                 "odometer_km": float(r[4]) if r[4] is not None else None,
+                "logger_km": float(r[5]) if r[5] is not None else None,
             }
             for r in reversed(rows)
         ]
+
+    async def async_logger_total_km(self) -> float:
+        """v0.5.66 — sum of distance_km across every persisted trip.
+
+        Returns the kilometres the logger has actually witnessed. For
+        SoH/degradation modelling this is what we want, not the car's
+        lifetime odometer: it represents the use under conditions the
+        logger knows about (DCFC habits, SoC ceiling, climate). 0.0
+        when the trip table is empty.
+        """
+        return await self._hass.async_add_executor_job(
+            self._logger_total_km
+        )
+
+    def _logger_total_km(self) -> float:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(distance_km), 0) FROM trips "
+                "WHERE distance_km IS NOT NULL"
+            ).fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     async def async_first_odometer_seen(self) -> float | None:
         """v0.5.57 — earliest non-NULL `odometer_start` ever recorded.

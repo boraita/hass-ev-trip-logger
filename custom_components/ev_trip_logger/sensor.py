@@ -2647,6 +2647,12 @@ class BatterySohSensor(_BaseTripSensor):
         self._history = await self._coordinator.storage.async_capacity_history(
             limit=24
         )
+        # v0.5.66 — pre-compute logger_km here (executor query) so the
+        # sync extra_state_attributes can read it from a cache without
+        # blocking the event loop.
+        self._logger_km_cache = (
+            await self._coordinator.storage.async_logger_total_km()
+        )
         self.async_write_ha_state()
 
     @property
@@ -2682,6 +2688,15 @@ class BatterySohSensor(_BaseTripSensor):
         # render "100 % at 26 471 km" and plot SoH vs km.
         odo = coord._read_float(coord._odometer)
         first_reg = coord._vehicle_first_registered
+        # v0.5.66 — logger_km: kilometres witnessed under the
+        # integration's monitoring (SUM of distance_km across all
+        # trips). This is the figure the SoH model uses, since model
+        # penalties only know about the period the logger has been
+        # active. Exposed alongside `odometer_km` for transparency.
+        try:
+            logger_km = self._logger_km_cache
+        except AttributeError:
+            logger_km = None
         age_years: float | None = None
         if first_reg is not None:
             try:
@@ -2698,6 +2713,13 @@ class BatterySohSensor(_BaseTripSensor):
             ),
             "calibration_charges": coord._battery_capacity_calibration_n,
             "degradation_kwh_per_year": rate_kwh_per_year,
+            # v0.5.66 — TWO km figures. `logger_km` drives the model
+            # (what the integration has actually observed). `odometer_km`
+            # is the car's lifetime mileage; useful for the dashboard
+            # banner ("100 % @ 26 471 km") but NOT used in the SoH model.
+            "logger_km": (
+                round(logger_km, 1) if logger_km is not None else None
+            ),
             "odometer_km": round(odo, 1) if odo is not None else None,
             "age_years": age_years,
             "battery_chemistry": coord._battery_chemistry,

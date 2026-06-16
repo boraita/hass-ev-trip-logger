@@ -1745,32 +1745,33 @@ async def test_brief_off_during_trip_does_not_close(hass: HomeAssistant) -> None
 
 
 async def test_expected_soh_lfp_low_km_high_soh(hass: HomeAssistant) -> None:
-    """v0.5.57 — fresh LFP car (low km, mid-warm climate) → SoH 95+%."""
+    """v0.5.66 — fresh LFP car (low km, mid-warm climate) → SoH 95+%.
+
+    `km` for the SoH model comes from SUM(distance_km) across logged
+    trips, NOT the live odometer reading.
+    """
     from custom_components.ev_trip_logger.storage import TripRecord
 
     entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
     coord = hass.data[DOMAIN][entry.entry_id]
-    # Seed 1 trip so first_odometer_seen has a value.
+    # Trip total = 26 500 km
     await coord.storage.async_insert(TripRecord(
         started_at=dt_util.now() - timedelta(days=10),
         ended_at=dt_util.now() - timedelta(days=10) + timedelta(minutes=30),
-        duration_min=30.0, distance_km=20.0,
-        odometer_start=20000.0, odometer_end=20020.0,
+        duration_min=30.0, distance_km=26500.0,
+        odometer_start=20000.0, odometer_end=46500.0,
         soc_used_pct=4.0, energy_kwh=3.3, consumption_kwh_100km=16.5,
     ))
-    hass.states.async_set("sensor.odometer", "26500")
     await hass.async_block_till_done()
     result = await coord.async_compute_expected_soh()
     assert result["inputs"]["chemistry"] == "lfp"
-    # v0.5.60 — km comes from the odometer reading directly (pack
-    # lifetime), not "since install".
     assert result["inputs"]["km"] == pytest.approx(26500.0)
     # LFP year-1 knee (3.5) + cycle loss 26.5 × 0.04 ≈ 1.06 → ~95.4 %
     assert 93.0 <= result["expected_soh_pct"] <= 97.0
 
 
 async def test_expected_soh_nmc_aged_with_dcfc(hass: HomeAssistant) -> None:
-    """v0.5.57 — older NMC car with DCFC habit loses more than LFP."""
+    """v0.5.66 — older NMC car with DCFC habit loses more than LFP."""
     from custom_components.ev_trip_logger.const import CONF_BATTERY_CHEMISTRY
     from custom_components.ev_trip_logger.storage import ChargeRecord, TripRecord
 
@@ -1778,15 +1779,14 @@ async def test_expected_soh_nmc_aged_with_dcfc(hass: HomeAssistant) -> None:
         CONF_BATTERY_CAPACITY: 75.0, CONF_BATTERY_CHEMISTRY: "nmc",
     })
     coord = hass.data[DOMAIN][entry.entry_id]
-    # First trip = baseline odo at 0.
+    # Single big trip carrying the 100 000 km we want to assert against.
     await coord.storage.async_insert(TripRecord(
         started_at=dt_util.now() - timedelta(days=1000),
         ended_at=dt_util.now() - timedelta(days=1000) + timedelta(minutes=30),
-        duration_min=30.0, distance_km=20.0,
-        odometer_start=0.0, odometer_end=20.0,
+        duration_min=30.0, distance_km=100000.0,
+        odometer_start=0.0, odometer_end=100000.0,
         soc_used_pct=4.0, energy_kwh=3.3,
     ))
-    hass.states.async_set("sensor.odometer", "100000")
     # 20% DCFC ratio
     for is_dcfc, kwh in [(False, 100.0), (False, 100.0), (False, 100.0), (True, 75.0)]:
         await coord.storage.async_insert_charge(ChargeRecord(
@@ -1806,7 +1806,7 @@ async def test_expected_soh_nmc_aged_with_dcfc(hass: HomeAssistant) -> None:
 
 
 async def test_expected_soh_floor_caps_at_70(hass: HomeAssistant) -> None:
-    """v0.5.57 — model never reports below 70% (warranty floor)."""
+    """v0.5.66 — model never reports below 70% (warranty floor)."""
     from custom_components.ev_trip_logger.const import CONF_BATTERY_CHEMISTRY
     from custom_components.ev_trip_logger.storage import TripRecord
 
@@ -1817,11 +1817,10 @@ async def test_expected_soh_floor_caps_at_70(hass: HomeAssistant) -> None:
     await coord.storage.async_insert(TripRecord(
         started_at=dt_util.now() - timedelta(days=4000),
         ended_at=dt_util.now() - timedelta(days=4000) + timedelta(minutes=30),
-        duration_min=30.0, distance_km=20.0,
-        odometer_start=0.0, odometer_end=20.0,
+        duration_min=30.0, distance_km=500000.0,
+        odometer_start=0.0, odometer_end=500000.0,
         soc_used_pct=4.0, energy_kwh=3.3,
     ))
-    hass.states.async_set("sensor.odometer", "500000")
     await hass.async_block_till_done()
     result = await coord.async_compute_expected_soh()
     assert result["expected_soh_pct"] == 70.0  # clamped to floor
@@ -1842,17 +1841,16 @@ async def test_expected_soh_handles_date_only_first_registered(hass: HomeAssista
     await coord.storage.async_insert(TripRecord(
         started_at=dt_util.now() - timedelta(days=10),
         ended_at=dt_util.now() - timedelta(days=10) + timedelta(minutes=30),
-        duration_min=30.0, distance_km=20.0,
-        odometer_start=20000.0, odometer_end=20020.0,
+        duration_min=30.0, distance_km=26500.0,
+        odometer_start=20000.0, odometer_end=46500.0,
         soc_used_pct=4.0, energy_kwh=3.3,
     ))
-    hass.states.async_set("sensor.odometer", "26500")
     await hass.async_block_till_done()
     # Should not raise.
     result = await coord.async_compute_expected_soh()
     assert result["expected_soh_pct"] is not None
     assert result["inputs"]["age_years"] > 0  # parsed correctly
-    # v0.5.60 — km is the odometer directly, not km-since-install.
+    # v0.5.66 — km is the SUM(distance_km) of logged trips.
     assert result["inputs"]["km"] == pytest.approx(26500.0)
     assert result["confidence"] == "medium"  # has age, no climate
 

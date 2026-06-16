@@ -1166,13 +1166,17 @@ class EvTripLoggerCoordinator:
         """
         profile = _DEGRADATION_PROFILES[self._battery_chemistry]
         # 1. Inputs
-        # v0.5.60 — use the odometer reading DIRECTLY. The pack has
-        # accumulated every km on the odometer, regardless of when we
-        # started logging. Previously we subtracted "first odo seen in
-        # DB", which gave km-since-install (always 0 for users who
-        # configured the integration after driving the car), making the
-        # cycle component of the SoH model report 0 forever.
-        km = self._read_float(self._odometer) or 0.0
+        # v0.5.66 — `km` for the SoH model is the SUM of distance_km
+        # across logged trips, NOT the car's lifetime odometer reading.
+        # Rationale: the model penalties (climate_hot, DCFC, SoC habit)
+        # only know about the period the logger has been watching.
+        # Charging a car bought used at 50 000 km against the curve at
+        # "50 000 + 6 000 km" would over-penalise it: the first 50 000
+        # were under a different owner with unknown habits. The
+        # vehicle's actual odometer is still exposed in the
+        # `battery_soh` sensor attributes for transparency.
+        logger_km = await self.storage.async_logger_total_km()
+        km = logger_km
         if self._vehicle_first_registered is not None:
             age_years = (
                 dt_util.now() - self._vehicle_first_registered
@@ -1323,18 +1327,21 @@ class EvTripLoggerCoordinator:
                 if abs(calibrated_kwh - last_kwh) < _CAPACITY_HISTORY_MIN_DELTA_KWH:
                     return
             odo = self._read_float(self._odometer)
+            logger_km = await self.storage.async_logger_total_km()
             await self.storage.async_insert_capacity_snapshot(
                 calibrated_kwh=calibrated_kwh,
                 declared_kwh=self._battery_capacity_declared,
                 n_charges=n_charges,
                 when=dt_util.now(),
                 odometer_km=odo,
+                logger_km=logger_km,
             )
             _LOGGER.info(
                 "Capacity snapshot: %.2f kWh (n=%d charges, declared=%.2f, "
-                "odo=%s km) appended to history",
+                "logger_km=%.0f, odo=%s) appended to history",
                 calibrated_kwh, n_charges, self._battery_capacity_declared,
-                f"{odo:.0f}" if odo is not None else "?",
+                logger_km,
+                f"{odo:.0f} km" if odo is not None else "?",
             )
         except Exception as exc:  # pragma: no cover — defensive
             _LOGGER.debug("capacity_history snapshot failed: %s", exc)
