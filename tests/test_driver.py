@@ -65,8 +65,9 @@ async def _drive(hass: HomeAssistant, *, odo_end: str, bat_end: str) -> None:
     await hass.async_block_till_done()
     hass.states.async_set(VOK, STATE_OFF)
     await hass.async_block_till_done()
-    # Idle window (1 min) must elapse before the close fires.
-    await _advance(hass, 2)
+    # v0.5.53 — vehicle-off grace is 180 s, advance past it so the
+    # debounced close actually fires before assertions run.
+    await _advance(hass, 4)
 
 
 async def test_driver_captured_at_trip_open(hass: HomeAssistant) -> None:
@@ -116,7 +117,7 @@ async def test_driver_resolved_late_via_close_read(hass: HomeAssistant) -> None:
 
     hass.states.async_set(VOK, STATE_OFF)
     await hass.async_block_till_done()
-    await _advance(hass, 2)
+    await _advance(hass, 4)
 
     assert coordinator.last_trip is not None
     assert coordinator.last_trip.driver == "Maria Pixel"
@@ -156,7 +157,7 @@ async def test_zero_soc_at_close_is_not_discarded(hass: HomeAssistant) -> None:
 
     hass.states.async_set(VOK, STATE_OFF)
     await hass.async_block_till_done()
-    await _advance(hass, 2)
+    await _advance(hass, 4)
 
     assert coordinator.last_trip is not None
     assert coordinator.last_trip.soc_end == pytest.approx(0.0)
