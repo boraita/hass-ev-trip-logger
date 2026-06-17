@@ -54,6 +54,8 @@ from .const import (
     CONF_DRIVER_SENSOR,
     CONF_PLUG_SENSOR,
     CONF_POLLING_PAUSED_SENSOR,
+    CONF_LAST_TRIP_ENERGY_SENSOR,
+    CONF_LAST_TRIP_DISTANCE_SENSOR,
     CONF_TRACKED_SENSORS,
     CONF_ODOMETER,
     CONF_DCFC_THRESHOLD_KW,
@@ -125,6 +127,17 @@ _GPS_DUP_EPSILON = 1e-5
 # drive; the window must be longer than the polling interval so we don't
 # fragment one drive into many micro-trips.
 _SYNTH_COALESCE_WINDOW_S = 300
+# v0.5.77 — delay after trip insert before we re-read the vehicle's
+# native `last_trip_energy` sensor. Cloud-polled integrations (BYD,
+# some Tesla setups) update this 1-3 min after the vehicle finishes
+# the trip. 240 s sits comfortably past that lag without making the
+# user wait noticeably for the corrected cost.
+_VEHICLE_TRIP_HEAL_DELAY_S = 240.0
+# v0.5.77 — distance tolerance when cross-checking that the vehicle
+# sensor refers to OUR just-closed trip. ≥1 km absolute or 20 %
+# relative — both must be exceeded to reject the override.
+_VEHICLE_TRIP_DIST_TOL_KM = 1.0
+_VEHICLE_TRIP_DIST_TOL_PCT = 0.20
 # How long after a trip closes we still accept a late device_tracker
 # transition as "the trip actually ended at <that zone>" (and use it to
 # amend the trip's destination, plus close the journey when the new
@@ -550,6 +563,12 @@ class EvTripLoggerCoordinator:
         # synth-trip window we tag confidence as
         # 'reconstructed_polling_paused'.
         self._polling_paused_sensor = merged.get(CONF_POLLING_PAUSED_SENSOR)
+        # v0.5.77 — vehicle-native per-trip energy + distance sensors.
+        # Used as ground truth at trip close to override the logger's
+        # SoC-delta / power-integration estimates. Auto-detected from
+        # the odometer prefix in async_start when not configured.
+        self._last_trip_energy_sensor = merged.get(CONF_LAST_TRIP_ENERGY_SENSOR)
+        self._last_trip_distance_sensor = merged.get(CONF_LAST_TRIP_DISTANCE_SENSOR)
         # v0.5.38 — list of external numeric sensors to roll up via the
         # HA recorder. The platform creates two AVG sensors per entry
         # (7-day and 30-day). Stored verbatim so multi-entry option
@@ -1405,6 +1424,18 @@ class EvTripLoggerCoordinator:
         # publish its entities to the state machine.
         if not self._temp:
             self._temp = self._auto_detect_temp_sensor()
+        # v0.5.77 — same deferred auto-detect for the vehicle-native
+        # last-trip energy / distance sensors.
+        if not self._last_trip_energy_sensor:
+            self._last_trip_energy_sensor = self._auto_detect_vehicle_sensor(
+                ("_last_trip_energy", "_last_trip_kwh", "_trip_energy"),
+                "last-trip energy",
+            )
+        if not self._last_trip_distance_sensor:
+            self._last_trip_distance_sensor = self._auto_detect_vehicle_sensor(
+                ("_last_trip_distance", "_last_trip_km"),
+                "last-trip distance",
+            )
         self.last_trip = await self.storage.async_get_last()
         self.last_charge = await self.storage.async_get_last_charge()
         # Robust journey resume — derive from the actual trip log rather
@@ -2258,6 +2289,9 @@ class EvTripLoggerCoordinator:
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+        # v0.5.77 — schedule the vehicle-native energy heal (no-op when
+        # the vehicle sensor isn't configured / auto-detected).
+        self._schedule_vehicle_heal(trip_id)
 
         # v0.5.76 — FIFO inventory replay so the new trip's cost
         # reflects the actual charge prices its energy was drawn from
@@ -3023,6 +3057,8 @@ class EvTripLoggerCoordinator:
             _LOGGER.warning("Orphan trip insert failed: %s", exc)
             return
         record.trip_id = trip_id
+        # v0.5.77 — schedule the vehicle-native energy heal.
+        self._schedule_vehicle_heal(trip_id)
         # v0.5.76 — keep FIFO inventory accounting consistent.
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
@@ -3522,6 +3558,8 @@ class EvTripLoggerCoordinator:
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+        # v0.5.77 — vehicle-native energy heal scheduled here too.
+        self._schedule_vehicle_heal(trip_id)
 
         # v0.5.76 — FIFO inventory replay: trip cost reflects what
         # the energy actually cost (charge prices in chronological
@@ -4180,6 +4218,10 @@ class EvTripLoggerCoordinator:
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+        # v0.5.77 — vehicle-native energy heal scheduled for the
+        # manually-logged trip too (user might invoke log_manual_trip
+        # immediately after the drive while the sensor is fresh).
+        self._schedule_vehicle_heal(trip_id)
 
         # v0.5.76 — FIFO cost replay so manual trips share the same
         # accounting as live / synth ones.
@@ -4260,6 +4302,125 @@ class EvTripLoggerCoordinator:
 
     def _read_str(self, entity_id: str | None) -> str | None:
         return self._read_state(entity_id)
+
+    def _schedule_vehicle_heal(self, trip_id: int) -> None:
+        """v0.5.77 — after `_VEHICLE_TRIP_HEAL_DELAY_S` re-read the vehicle's
+        last_trip_* sensors. If they refer to this trip (timestamp + distance
+        cross-check) and disagree with the logger's energy estimate, override.
+
+        Cloud integrations update `last_trip_energy` 1-3 min after the
+        physical trip ends. We schedule the heal once per insert; if the
+        sensor still hasn't refreshed when the callback fires, we leave
+        the row alone (next trip's heal naturally re-checks the
+        previous row by reading the row before triggering FIFO).
+        """
+        if not self._last_trip_energy_sensor:
+            return
+
+        @callback
+        def _fire(_at: datetime) -> None:
+            self.hass.async_create_task(self._async_heal_from_vehicle(trip_id))
+
+        async_call_later(self.hass, _VEHICLE_TRIP_HEAL_DELAY_S, _fire)
+
+    async def _async_heal_from_vehicle(self, trip_id: int) -> None:
+        """v0.5.77 — override `energy_kwh` from the vehicle-native sensor.
+
+        Guards:
+          - sensor's `last_changed` must be ≥ trip.ended_at (the sensor
+            refers to a trip that closed after ours, not a stale value
+            from the PREVIOUS trip)
+          - if `_last_trip_distance_sensor` is configured, its value must
+            match the logger's `distance_km` within tolerance (avoids
+            healing from a sensor that refers to a different trip the
+            logger missed)
+          - sensor value must be a positive float
+        """
+        trip = await self.storage.async_get_trip_by_id(trip_id)
+        if trip is None or trip.distance_km is None or trip.distance_km <= 0:
+            return
+        if trip.ended_at is None:
+            return
+        sensor_state = self.hass.states.get(self._last_trip_energy_sensor)
+        if sensor_state is None or sensor_state.state in _INVALID_STATES:
+            return
+        if sensor_state.last_changed < trip.ended_at:
+            _LOGGER.debug(
+                "Vehicle heal skipped for trip %s: sensor stale "
+                "(last_changed=%s, trip ended_at=%s)",
+                trip_id, sensor_state.last_changed, trip.ended_at,
+            )
+            return
+        try:
+            vehicle_kwh = float(sensor_state.state)
+        except (TypeError, ValueError):
+            return
+        if vehicle_kwh <= 0:
+            return
+        # Distance cross-check (optional).
+        if self._last_trip_distance_sensor:
+            dist_state = self.hass.states.get(self._last_trip_distance_sensor)
+            if dist_state and dist_state.state not in _INVALID_STATES:
+                try:
+                    vehicle_km = float(dist_state.state)
+                except (TypeError, ValueError):
+                    vehicle_km = None
+                if vehicle_km is not None and vehicle_km > 0:
+                    diff_abs = abs(vehicle_km - trip.distance_km)
+                    diff_rel = diff_abs / trip.distance_km
+                    if (
+                        diff_abs > _VEHICLE_TRIP_DIST_TOL_KM
+                        and diff_rel > _VEHICLE_TRIP_DIST_TOL_PCT
+                    ):
+                        _LOGGER.info(
+                            "Vehicle heal skipped for trip %s: distance "
+                            "mismatch (vehicle=%.1f km, logger=%.1f km)",
+                            trip_id, vehicle_km, trip.distance_km,
+                        )
+                        return
+        # All guards passed — override.
+        old_energy = trip.energy_kwh
+        new_consumption = vehicle_kwh / trip.distance_km * 100.0
+        await self.storage.async_update_trip(
+            trip_id,
+            {
+                "energy_kwh": round(vehicle_kwh, 3),
+                "consumption_kwh_100km": round(new_consumption, 2),
+                "energy_source": "vehicle",
+            },
+        )
+        _LOGGER.warning(
+            "Vehicle heal for trip %s: energy %.2f → %.2f kWh (source: "
+            "%s). Consumption now %.1f kWh/100km.",
+            trip_id, old_energy or 0.0, vehicle_kwh,
+            self._last_trip_energy_sensor, new_consumption,
+        )
+        # Re-cost via FIFO so the trip's cost + basis reflect the new
+        # energy. Idempotent.
+        await self.storage.async_recompute_trip_costs_from_charges(
+            self._energy_price,
+        )
+        self._notify_trip_log_listeners()
+
+    def _auto_detect_vehicle_sensor(
+        self, suffixes: tuple[str, ...], label: str
+    ) -> str | None:
+        """v0.5.77 — share the prefix-walk used for the temp auto-detect.
+        Returns the first `sensor.<prefix><suffix>` that exists in the
+        state machine, or None.
+        """
+        if not self._odometer or not self._odometer.startswith("sensor."):
+            return None
+        prefix = self._odometer[len("sensor."):].rsplit("_", 1)[0]
+        for suffix in suffixes:
+            candidate = f"sensor.{prefix}{suffix}"
+            if self.hass.states.get(candidate) is not None:
+                _LOGGER.warning(
+                    "Auto-detected %s sensor: %s.",
+                    label, candidate,
+                )
+                return candidate
+        return None
 
     def _auto_detect_temp_sensor(self) -> str | None:
         """v0.5.69 — look for `sensor.<prefix>_exterior_temperature`

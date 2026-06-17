@@ -42,6 +42,20 @@ CONF_PLUG_SENSOR: Final = "plug_sensor"
 # 'reconstructed_polling_paused' so the dashboard can show low
 # confidence.
 CONF_POLLING_PAUSED_SENSOR: Final = "polling_paused_sensor"
+# v0.5.77 — optional vehicle-native per-trip energy sensor. Many EV
+# integrations expose the energy of the last completed trip directly
+# (BYD: `last_trip_energy`, Tesla: trip-meter A/B kWh, OVMS, etc.).
+# When wired, the logger trusts this value over its own SoC delta or
+# power-integration estimate, sidestepping the regen/quantization
+# noise that inflates short trips. The coordinator auto-detects
+# common suffixes (`_last_trip_energy`, `_last_trip_kwh`, …) using
+# the odometer prefix.
+CONF_LAST_TRIP_ENERGY_SENSOR: Final = "last_trip_energy_sensor"
+# v0.5.77 — optional vehicle-native per-trip distance sensor. Cross-
+# check for `CONF_LAST_TRIP_ENERGY_SENSOR`: only override the trip's
+# energy when this matches the logger's odometer-derived distance
+# (defends against a stale sensor referring to the previous trip).
+CONF_LAST_TRIP_DISTANCE_SENSOR: Final = "last_trip_distance_sensor"
 # v0.5.43 — optional driver-identity sensor. Any entity whose state
 # names the person currently using the car: the manufacturer
 # integration's "connected bluetooth device" sensor, an input_select

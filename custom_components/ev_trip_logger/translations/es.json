@@ -52,6 +52,8 @@
           "exterior_temp_sensor": "Sensor de temperatura exterior — habilita avg_temp y consumo por temperatura",
           "driver_sensor": "Sensor de conductor — entidad cuyo estado indica quién conduce (BT conectado, input_select...)",
           "speed_sensor": "Sensor de velocidad (km/h) — habilita max_speed",
+          "last_trip_energy_sensor": "Energía del último viaje (kWh) — sensor del coche que se usa como ground truth (BYD last_trip_energy, Tesla Trip A, etc.)",
+          "last_trip_distance_sensor": "Distancia del último viaje (km) — cross-check del sensor anterior",
           "battery_capacity_kwh": "Capacidad de batería (kWh)",
           "min_trip_distance_km": "Distancia mínima por viaje (km)",
           "idle_timeout_minutes": "Tiempo de inactividad (min)",

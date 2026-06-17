@@ -577,7 +577,24 @@ class TripStorage:
         "start_address", "end_address", "gps_distance_km",
         "kwh_charged_before", "kwh_charged_during", "confidence",
         "driver", "cost_basis_per_kwh",
+        # v0.5.77 — the vehicle-heal path overrides energy_kwh and
+        # tags the row as `energy_source='vehicle'` for traceability.
+        "energy_source",
     })
+
+    async def async_get_trip_by_id(self, trip_id: int) -> "TripRecord | None":
+        """v0.5.77 — fetch a single trip by primary key."""
+        return await self._hass.async_add_executor_job(
+            self._get_trip_by_id, trip_id,
+        )
+
+    def _get_trip_by_id(self, trip_id: int) -> "TripRecord | None":
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM trips WHERE id = ?", (trip_id,),
+            ).fetchone()
+        return _row_to_record(row) if row else None
 
     async def async_trip_overlaps(
         self, start: datetime, end: datetime, tolerance_s: int = 120

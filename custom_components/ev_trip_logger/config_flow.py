@@ -44,6 +44,8 @@ from .const import (
     CONF_ABRP_TOKEN,
     CONF_PLUG_SENSOR,
     CONF_POLLING_PAUSED_SENSOR,
+    CONF_LAST_TRIP_ENERGY_SENSOR,
+    CONF_LAST_TRIP_DISTANCE_SENSOR,
     CONF_TRACKED_SENSORS,
     DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_POWER,
@@ -185,6 +187,23 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="speed")
+            ),
+            # v0.5.77 — vehicle-native per-trip energy + distance sensors.
+            # When set, the logger uses these as ground truth (avoids
+            # SoC quantization + regen-trapezoid noise). Generic by
+            # design: BYD `last_trip_energy`, Tesla `Trip A` etc. all
+            # satisfy this shape.
+            _optional(
+                CONF_LAST_TRIP_ENERGY_SENSOR,
+                EntitySelector(EntitySelectorConfig(domain="sensor")),
+            ): EntitySelector(EntitySelectorConfig(domain="sensor")),
+            _optional(
+                CONF_LAST_TRIP_DISTANCE_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="distance")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="distance")
             ),
             vol.Required(
                 CONF_BATTERY_CAPACITY,

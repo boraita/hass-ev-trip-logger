@@ -1988,3 +1988,143 @@ async def test_auto_detect_temp_does_not_override_explicit_conf(
 
     coordinator = hass.data[DOMAIN][entry.entry_id]
     assert coordinator._temp == "sensor.my_custom_temp"
+
+
+async def test_auto_detect_last_trip_energy_sensor(hass: HomeAssistant) -> None:
+    """v0.5.77 — prefix walk picks up `<prefix>_last_trip_energy` like
+    BYD exposes. Generic: same suffix works for any integration.
+    """
+    OUR_ODO = "sensor.byd_car_odometer"
+    hass.states.async_set(OUR_ODO, "1000")
+    hass.states.async_set("sensor.byd_car_last_trip_energy", "1.65")
+    hass.states.async_set("sensor.byd_car_last_trip_distance", "10.0")
+    data = {
+        "name": "BYD",
+        "odometer_sensor": OUR_ODO,
+        "battery_sensor": BAT,
+        "vehicle_on_sensor": VOK,
+        "battery_capacity_kwh": 75.0,
+        "min_trip_distance_km": 0.5,
+        "idle_timeout_minutes": 1,
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=data, title="BYD")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    c = hass.data[DOMAIN][entry.entry_id]
+    assert c._last_trip_energy_sensor == "sensor.byd_car_last_trip_energy"
+    assert c._last_trip_distance_sensor == "sensor.byd_car_last_trip_distance"
+
+
+async def test_vehicle_heal_overrides_inflated_energy(hass: HomeAssistant) -> None:
+    """v0.5.77 — when the vehicle's last_trip_energy disagrees with the
+    logger's estimate, the heal overrides energy_kwh + consumption +
+    energy_source. This is the trip 163 fix path.
+    """
+    from custom_components.ev_trip_logger.const import (
+        CONF_LAST_TRIP_ENERGY_SENSOR,
+        CONF_LAST_TRIP_DISTANCE_SENSOR,
+    )
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    VEH_E = "sensor.veh_last_trip_energy"
+    VEH_D = "sensor.veh_last_trip_distance"
+    hass.states.async_set(VEH_E, "1.65")
+    hass.states.async_set(VEH_D, "10.0")
+    entry = await _setup(hass, **{
+        CONF_LAST_TRIP_ENERGY_SENSOR: VEH_E,
+        CONF_LAST_TRIP_DISTANCE_SENSOR: VEH_D,
+    })
+    c = hass.data[DOMAIN][entry.entry_id]
+    # Insert a trip with the inflated 2.60 power_integration value.
+    now = dt_util.now()
+    inflated = TripRecord(
+        started_at=now - timedelta(minutes=30),
+        ended_at=now - timedelta(minutes=5),
+        duration_min=25.0,
+        distance_km=10.0,
+        energy_kwh=2.60,
+        consumption_kwh_100km=26.0,
+        energy_source="power_integration",
+        cost=0.18,
+        currency="EUR",
+    )
+    trip_id = await c.storage.async_insert(inflated)
+    # Re-set vehicle sensors AFTER trip ended so last_changed is fresh.
+    hass.states.async_set(VEH_E, "1.65")
+    hass.states.async_set(VEH_D, "10.0")
+    await c._async_heal_from_vehicle(trip_id)
+    healed = await c.storage.async_get_trip_by_id(trip_id)
+    assert healed.energy_kwh == pytest.approx(1.65)
+    assert healed.consumption_kwh_100km == pytest.approx(16.5)
+    assert healed.energy_source == "vehicle"
+
+
+async def test_vehicle_heal_skipped_when_sensor_stale(hass: HomeAssistant) -> None:
+    """v0.5.77 — the heal only fires when the sensor's last_changed is
+    later than the trip's ended_at. If the sensor still carries the
+    PREVIOUS trip's value (cloud hasn't updated yet), don't override.
+    """
+    from custom_components.ev_trip_logger.const import CONF_LAST_TRIP_ENERGY_SENSOR
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    VEH_E = "sensor.veh_last_trip_energy"
+    # Set sensor BEFORE inserting the trip → its last_changed is older.
+    hass.states.async_set(VEH_E, "1.65")
+    await hass.async_block_till_done()
+    entry = await _setup(hass, **{CONF_LAST_TRIP_ENERGY_SENSOR: VEH_E})
+    c = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    rec = TripRecord(
+        started_at=now - timedelta(minutes=30),
+        ended_at=now,  # trip ended AFTER the sensor was set
+        duration_min=25.0,
+        distance_km=10.0,
+        energy_kwh=2.60,
+        consumption_kwh_100km=26.0,
+        energy_source="power_integration",
+    )
+    trip_id = await c.storage.async_insert(rec)
+    await c._async_heal_from_vehicle(trip_id)
+    after = await c.storage.async_get_trip_by_id(trip_id)
+    assert after.energy_kwh == pytest.approx(2.60)  # untouched
+    assert after.energy_source == "power_integration"
+
+
+async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) -> None:
+    """v0.5.77 — defends against the vehicle sensor referring to a
+    different trip the logger missed: if vehicle distance disagrees
+    by >1 km AND >20 %, skip the override.
+    """
+    from custom_components.ev_trip_logger.const import (
+        CONF_LAST_TRIP_ENERGY_SENSOR,
+        CONF_LAST_TRIP_DISTANCE_SENSOR,
+    )
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    VEH_E = "sensor.veh_last_trip_energy"
+    VEH_D = "sensor.veh_last_trip_distance"
+    hass.states.async_set(VEH_E, "1.65")
+    hass.states.async_set(VEH_D, "50.0")  # vehicle says 50 km, trip says 10
+    entry = await _setup(hass, **{
+        CONF_LAST_TRIP_ENERGY_SENSOR: VEH_E,
+        CONF_LAST_TRIP_DISTANCE_SENSOR: VEH_D,
+    })
+    c = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    rec = TripRecord(
+        started_at=now - timedelta(minutes=30),
+        ended_at=now - timedelta(minutes=5),
+        duration_min=25.0,
+        distance_km=10.0,
+        energy_kwh=2.60,
+        consumption_kwh_100km=26.0,
+        energy_source="power_integration",
+    )
+    trip_id = await c.storage.async_insert(rec)
+    hass.states.async_set(VEH_E, "1.65")
+    hass.states.async_set(VEH_D, "50.0")
+    await c._async_heal_from_vehicle(trip_id)
+    after = await c.storage.async_get_trip_by_id(trip_id)
+    assert after.energy_kwh == pytest.approx(2.60)
+    assert after.energy_source == "power_integration"
