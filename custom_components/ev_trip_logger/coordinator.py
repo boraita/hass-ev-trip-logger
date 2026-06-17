@@ -258,6 +258,12 @@ _STUCK_TRIP_TIMER_INTERVAL = timedelta(minutes=5)
 # at `last_telemetry_ts`, not `now`, to avoid pinning a 2-hour
 # duration to a 20-minute drive whose polling silently stalled.
 _TELEMETRY_SILENCE_TIMEOUT_S = 480.0  # 8 min
+# v0.5.80 — hard ceiling on how far back we'll reconstruct a missed
+# drive when the cloud integration comes back from a long silence.
+# 24 h covers a full day of polling outage (rare even for BYD) while
+# keeping us from inserting stale trips after an install pause or HA
+# downtime that spans multiple days.
+_ORPHAN_DISCONNECT_MAX_AGE = timedelta(hours=24)
 # v0.5.49 — live-path retry on the vehicle_on=on edge. Cloud-polled
 # integrations (BYD, Tesla Fleet) often raise vehicle_on a poll-cycle
 # before the odometer entity catches up to the fresh value. Previously
@@ -2067,10 +2073,32 @@ class EvTripLoggerCoordinator:
         # during the "trip", making soc_used negative). Treat it as a
         # fresh observation instead.
         if (now - prev_t) > _MAX_SYNTH_BASELINE_AGE:
-            _LOGGER.debug(
-                "Synth baseline stale (%.1f h old) — resetting to now",
-                (now - prev_t).total_seconds() / 3600.0,
-            )
+            # v0.5.80 — before discarding the stale baseline: if the
+            # odometer ALSO jumped above min_trip_distance while we
+            # were silent, the user actually drove during the silence
+            # window (cloud integration was offline). Capture it as a
+            # disconnect-orphan trip instead of throwing the evidence
+            # away. Cap at _ORPHAN_DISCONNECT_MAX_AGE to avoid resur-
+            # recting trips from days ago after a long install pause.
+            delta_stale = odo - prev_odo
+            if (
+                delta_stale >= self._min_distance
+                and (now - prev_t) <= _ORPHAN_DISCONNECT_MAX_AGE
+            ):
+                _LOGGER.warning(
+                    "Disconnect-orphan: +%.2f km after %.1f h of silence "
+                    "(baseline at %s). Recording as 'orphan_disconnect'.",
+                    delta_stale, (now - prev_t).total_seconds() / 3600.0,
+                    prev_t.isoformat(),
+                )
+                await self._async_insert_disconnect_orphan(
+                    prev_t, now, prev_odo, odo, prev_soc, soc,
+                )
+            else:
+                _LOGGER.debug(
+                    "Synth baseline stale (%.1f h old) — resetting to now",
+                    (now - prev_t).total_seconds() / 3600.0,
+                )
             self._last_idle_odo = (now, odo, soc)
             return
         delta = odo - prev_odo
@@ -3110,6 +3138,69 @@ class EvTripLoggerCoordinator:
         _LOGGER.info(
             "Orphan trip inserted (%s): %.2f km, soc %s→%s, duration %.1f min",
             confidence, km_gap, last_trip.soc_end, new_soc, duration_min,
+        )
+        self._notify_trip_log_listeners()
+
+    async def _async_insert_disconnect_orphan(
+        self,
+        prev_t: datetime,
+        now: datetime,
+        prev_odo: float,
+        odo: float,
+        prev_soc: float | None,
+        soc: float | None,
+    ) -> None:
+        """v0.5.80 — record a drive that happened while the cloud
+        integration was offline. The integration came back from
+        silence with a clear odometer jump; we know it happened SOME
+        time inside [prev_t, now] but not exactly when, so we use the
+        widest bounds and tag the row as 'orphan_disconnect' so
+        dashboards / aggregates can de-emphasise it.
+        """
+        # SoC delta: only trust if it went DOWN (driving consumes).
+        soc_used: float | None = None
+        energy_kwh: float | None = None
+        if prev_soc is not None and soc is not None and prev_soc > soc:
+            soc_used = float(prev_soc) - float(soc)
+            energy_kwh = soc_used / 100.0 * self.battery_capacity
+        distance = float(odo) - float(prev_odo)
+        consumption = (
+            (energy_kwh / distance * 100.0)
+            if energy_kwh is not None and distance > 0
+            else None
+        )
+        duration_min = max(0.1, (now - prev_t).total_seconds() / 60.0)
+        record = TripRecord(
+            started_at=prev_t,
+            ended_at=now,
+            duration_min=duration_min,
+            distance_km=distance,
+            odometer_start=prev_odo,
+            odometer_end=odo,
+            soc_start=prev_soc,
+            soc_end=soc,
+            soc_used_pct=soc_used,
+            energy_kwh=energy_kwh,
+            consumption_kwh_100km=consumption,
+            confidence="orphan_disconnect",
+            energy_source="soc" if energy_kwh is not None else None,
+            origin=self.last_trip.destination if self.last_trip else None,
+            destination=None,
+        )
+        try:
+            trip_id = await self.storage.async_insert(record)
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.warning("Disconnect orphan insert failed: %s", exc)
+            return
+        record.trip_id = trip_id
+        self._schedule_vehicle_heal(trip_id)
+        if record.energy_kwh is not None and record.energy_kwh > 0:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                self._energy_price,
+            )
+        _LOGGER.info(
+            "Disconnect-orphan inserted #%s: %.2f km / %.1f min (soc %s→%s)",
+            trip_id, distance, duration_min, prev_soc, soc,
         )
         self._notify_trip_log_listeners()
 
