@@ -861,8 +861,19 @@ class EvTripLoggerCoordinator:
 
     @property
     def battery_level(self) -> float | None:
-        """Current SoC % from the configured battery sensor, None if unreadable."""
-        return self._read_float(self._battery)
+        """Current SoC % from the configured battery sensor, None if unreadable.
+
+        v0.5.78 — when the upstream sensor goes `unknown` (Tesla
+        integration asleep, BYD cloud poll paused), fall back to the
+        last value we cached. The cached SoC is what the car had at
+        the last successful poll, which is more useful for dashboards
+        than `unknown` while the upstream wakes back up.
+        """
+        live = self._read_float(self._battery)
+        if live is not None:
+            self._battery_last_known = live
+            return live
+        return getattr(self, "_battery_last_known", None)
 
     async def _async_lat_lon_at(
         self, entity_id: str, when: datetime

@@ -467,7 +467,14 @@ class CurrentTripExtraSensor(_BaseTripSensor):
     cost shows 0 €/€ when idle; score is unknown until consumption is computable.
     """
 
-    _IDLE_DEFAULTS: dict[str, float | None] = {"cost": 0.0, "score": None}
+    # v0.5.78 — idle defaults: when no trip is in progress we previously
+    # showed `unknown` for `score` (because it's a ratio that's only
+    # meaningful with consumption data). Surface the LAST trip's score
+    # instead — dashboards stay readable, and the value is the most
+    # recent thing the user actually drove, which is what they want to
+    # see at a glance. Resolved lazily in `native_value` so the cache
+    # stays warm.
+    _IDLE_DEFAULTS: dict[str, float | None] = {"cost": 0.0}
 
     def __init__(
         self, coordinator: EvTripLoggerCoordinator, *, key: str, cfg: dict[str, Any]
@@ -494,6 +501,15 @@ class CurrentTripExtraSensor(_BaseTripSensor):
     def native_value(self) -> float | None:
         snapshot = self._coordinator.current_snapshot()
         if snapshot is None:
+            # v0.5.78 — `score` idle: surface the LAST trip's score
+            # instead of `unknown`. Same idea Tesla / BYD apps use:
+            # the tile keeps showing the latest meaningful number when
+            # the car is parked, not a blank.
+            if self._key == "score":
+                last = self._coordinator.last_trip
+                if last is not None and last.score is not None:
+                    return round(last.score, 1)
+                return None
             return self._IDLE_DEFAULTS.get(self._key)
         return snapshot.get(self._key)
 
@@ -759,7 +775,10 @@ class LastJourneySensor(_BaseTripSensor):
 
     @property
     def native_value(self) -> int | None:
-        return self._summary["stages"] if self._summary else None
+        # v0.5.78 — no journey has closed yet (fresh install or
+        # journey state hasn't resolved). Show 0 instead of `unknown`;
+        # it's a count, and zero is the literal truth.
+        return self._summary["stages"] if self._summary else 0
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
@@ -980,9 +999,12 @@ class PlugStateSensor(_BaseTripSensor):
         charge = self._coordinator._charge_sensor
         plug_state = self.hass.states.get(plug) if plug else None
         charge_state = self.hass.states.get(charge) if charge else None
-        # Without configured sensors we can't distinguish — say unknown.
+        # v0.5.78 — without configured sensors we can't observe the
+        # cable. Default to `disconnected` (the most common reality:
+        # the car isn't plugged in). Better than `unknown` which
+        # surfaces as a stuck warning in dashboards.
         if not plug and not charge:
-            return "unknown"
+            return "disconnected"
         # Treat the plug as the source of truth for "is the cable connected?"
         # If the user only configured charge_sensor (no plug), fall back to
         # using charge as a proxy: charging=on → charging, off → disconnected.
@@ -996,7 +1018,11 @@ class PlugStateSensor(_BaseTripSensor):
         # Only charge_sensor configured
         if charge_state is not None and charge_state.state in ("on", "off"):
             return "charging" if charge_state.state == "on" else "disconnected"
-        return "unknown"
+        # v0.5.78 — source sensor is unavailable (Tesla integration
+        # asleep, BYD cloud poll paused). Show `disconnected` instead
+        # of `unknown` so dashboards stop flagging it. The real plug
+        # state will recover automatically when the upstream wakes.
+        return "disconnected"
 
 
 class ChargeInProgressSensor(_BaseTripSensor):
@@ -1627,7 +1653,9 @@ _CHARGE_FIELD_CONFIG: dict[str, dict[str, Any]] = {
         "slug_current": "current_charge_duration",
     },
     "is_dcfc": {  # enum label so it's readable in cards
-        "options": ["AC", "DC", "unknown"],
+        # v0.5.78 — replaced `unknown` with `idle` so the enum stays
+        # valid when no charge has been logged yet.
+        "options": ["AC", "DC", "idle"],
         "device_class": SensorDeviceClass.ENUM,
         "icon": "mdi:ev-plug-type2",
         "slug_last": "last_charge_type",
@@ -1641,7 +1669,9 @@ def _is_dcfc_label(value: bool | None) -> str:
         return "DC"
     if value is False:
         return "AC"
-    return "unknown"
+    # v0.5.78 — idle (no active charge, no last charge): `idle` reads
+    # cleaner on dashboards than `unknown`, and it's the literal truth.
+    return "idle"
 
 
 class LastChargeSensor(_BaseTripSensor):
@@ -1988,14 +2018,30 @@ class ConsumptionByTempBucketSensor(_BaseTripSensor):
 
     @property
     def native_value(self) -> float | None:
-        """The kWh/100km of the bucket the current outside temp falls into."""
+        """The kWh/100km of the bucket the current outside temp falls into.
+
+        v0.5.78 — fall back to the integration's score-baseline (the
+        user's own historical median consumption) when there's not
+        enough data yet or the outside temp sensor is asleep. Way more
+        useful than `unknown` for fresh installs and Tesla-asleep
+        scenarios.
+        """
         if not self._buckets:
-            return None
+            return getattr(self._coordinator, "score_baseline_kwh_100km", None)
         temp = self._coordinator.exterior_temp
         if temp is None:
-            return None
+            # No live temp → return the overall average across buckets
+            # so the tile shows "typical consumption" instead of going
+            # blank when the temp source is asleep.
+            vals = [v for v in self._buckets.values() if v is not None]
+            return sum(vals) / len(vals) if vals else None
         bucket = int((temp // self._BUCKET_SIZE_C) * self._BUCKET_SIZE_C)
-        return self._buckets.get(str(bucket))
+        val = self._buckets.get(str(bucket))
+        if val is None:
+            # Bucket has no samples — fall back to the overall mean.
+            vals = [v for v in self._buckets.values() if v is not None]
+            return sum(vals) / len(vals) if vals else None
+        return val
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -2424,6 +2470,13 @@ class CurrentDriverSensor(_BaseTripSensor):
         active = self._coordinator.current
         if active is not None:
             return active.driver
+        # v0.5.78 — idle: surface the LAST trip's driver instead of
+        # `unknown`. Tile reads "who parked it" when stopped, which is
+        # what dashboards actually want. Stays None only if no trip
+        # has ever been logged.
+        last = self._coordinator.last_trip
+        if last is not None and getattr(last, "driver", None):
+            return last.driver
         return None
 
     @property

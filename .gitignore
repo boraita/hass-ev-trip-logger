@@ -17,6 +17,7 @@ htmlcov/
 # Dev HA instance — keep ONLY configuration.yaml; tokens, DBs, .storage stay local.
 .dev/.token
 .dev/.real-ha-token
+.dev/.real-ha-token-*
 .dev/config/*
 !.dev/config/configuration.yaml
 
