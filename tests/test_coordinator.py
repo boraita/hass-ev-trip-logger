@@ -151,6 +151,102 @@ async def test_vehicle_off_closes_trip_immediately(hass: HomeAssistant) -> None:
     assert coordinator.last_trip.trip_id is not None
 
 
+async def test_stuck_trip_watchdog_closes_after_no_movement_and_off(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.79 — when vehicle_on=off but the off-edge close was lost,
+    the periodic watchdog force-closes the trip after the no-movement
+    timeout and tags confidence.
+
+    Reproduces the real bug: BYD's cloud poll dropped offline mid-drive,
+    the off transition never reached the listener, and self.current
+    stayed pinned at 'distance=11 km' for 30+ min even after the car
+    had been off for 5+ min.
+    """
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1015")
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+    assert coordinator.current is not None
+
+    # Backdate last_movement_ts to simulate 70 min of no movement.
+    coordinator.current.started_at = dt_util.now() - timedelta(minutes=80)
+    coordinator.current.last_movement_ts = dt_util.now() - timedelta(minutes=70)
+
+    # Simulate a lost off-edge: the upstream finally publishes off, but
+    # we cancel the debounced close that the listener queued so the
+    # watchdog is the only thing left that could rescue the trip.
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    if coordinator._pending_close_unsub is not None:
+        coordinator._pending_close_unsub()
+        coordinator._pending_close_unsub = None
+
+    # Fire the watchdog directly — exactly what async_track_time_interval
+    # would do every 5 min.
+    coordinator._async_check_stuck_trip(dt_util.now())
+    await hass.async_block_till_done()
+
+    assert coordinator.current is None
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.confidence == "force_closed_no_movement"
+
+
+async def test_stuck_trip_watchdog_closes_after_max_age_regardless(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.79 — beyond 4 h the watchdog force-closes even when
+    vehicle_on is still 'on'. The upstream's state machine is wedged
+    and can't be trusted; close at the last real movement timestamp.
+    """
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1020")
+    hass.states.async_set(BAT, "60")
+    await hass.async_block_till_done()
+    assert coordinator.current is not None
+
+    # Backdate to 5 h ago; vehicle_on still reads ON.
+    now = dt_util.now()
+    coordinator.current.started_at = now - timedelta(hours=5)
+    coordinator.current.last_movement_ts = now - timedelta(hours=4, minutes=30)
+    assert hass.states.get(VOK).state == STATE_ON
+
+    coordinator._async_check_stuck_trip(now)
+    await hass.async_block_till_done()
+
+    assert coordinator.current is None
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.confidence == "force_closed_max_age"
+
+
+async def test_stuck_trip_watchdog_leaves_healthy_trip_alone(
+    hass: HomeAssistant,
+) -> None:
+    """A trip with recent movement and vehicle_on=on stays open."""
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1005")
+    await hass.async_block_till_done()
+    assert coordinator.current is not None
+
+    coordinator._async_check_stuck_trip(dt_util.now())
+    await hass.async_block_till_done()
+
+    assert coordinator.current is not None
+    assert coordinator.last_trip is None
+
+
 async def test_short_trip_is_discarded(hass: HomeAssistant) -> None:
     entry = await _setup(hass, **{CONF_MIN_TRIP_DISTANCE: 1.0})
     coordinator = hass.data[DOMAIN][entry.entry_id]

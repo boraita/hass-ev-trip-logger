@@ -233,6 +233,25 @@ _VEHICLE_ON_OFF_DEBOUNCE_S = 3.0
 # duration. Live snapshot updates pause as soon as the off arrives —
 # the sensors don't keep ticking during the grace window.
 _VEHICLE_OFF_GRACE_S = 180.0
+# v0.5.79 — stuck-trip watchdog. The idle watchdog (_async_live_tick)
+# only force-closes when vehicle_on=off. When the upstream integration
+# (BYD cloud poll, Tesla Fleet) goes offline for hours, vehicle_on may
+# stay stuck at its last value, OR the off-edge gets lost entirely.
+# Net effect: self.current never clears and the dashboard shows a stale
+# "current_trip_distance=11 km" for hours after the car has been off.
+#
+# This watchdog is a defence-in-depth periodic check independent of the
+# live-tick (which only registers when a trip opens). It fires every
+# _STUCK_TRIP_TIMER_INTERVAL regardless and force-closes trips that:
+#  - Have not seen movement for _STUCK_TRIP_NO_MOVEMENT_MIN minutes AND
+#    vehicle_on is currently off (lost off-edge), or
+#  - Are older than _STUCK_TRIP_MAX_AGE_H hours regardless of vehicle_on
+#    (upstream wedged; we can't trust its state machine).
+# Closed trips get a `confidence` tag so the user can spot reconstructed
+# closes on the dashboard.
+_STUCK_TRIP_NO_MOVEMENT_MIN = 60.0
+_STUCK_TRIP_MAX_AGE_H = 4.0
+_STUCK_TRIP_TIMER_INTERVAL = timedelta(minutes=5)
 # v0.5.53 — telemetry silence watchdog. If no odometer/battery sample
 # arrives for this long while a trip is "open", we assume the upstream
 # polling has died and the car was actually parked. Close retroactively
@@ -714,6 +733,9 @@ class EvTripLoggerCoordinator:
         self._unsub_charge: CALLBACK_TYPE | None = None
         self._unsub_idle: CALLBACK_TYPE | None = None
         self._unsub_live_tick: CALLBACK_TYPE | None = None
+        # v0.5.79 — periodic stuck-trip watchdog (always-on; runs even
+        # when no live tick is active).
+        self._unsub_stuck_watchdog: CALLBACK_TYPE | None = None
         # Pending synthetic-trip finalize timer + baseline (start_t, start_odo,
         # start_soc) of the in-progress synth trip being coalesced. When the
         # underlying integration (e.g. BYD cloud) reports odo updates in many
@@ -1535,6 +1557,14 @@ class EvTripLoggerCoordinator:
                 self.hass, [self._location], self._async_location_changed
             )
 
+        # v0.5.79 — always-on periodic stuck-trip watchdog. Independent
+        # of the live-tick (which only runs while a trip is open), so it
+        # can rescue trips whose live-tick has been silenced by an
+        # upstream integration outage.
+        self._unsub_stuck_watchdog = async_track_time_interval(
+            self.hass, self._async_check_stuck_trip, _STUCK_TRIP_TIMER_INTERVAL
+        )
+
         if self.hass.state == CoreState.running:
             self._maybe_resume_trip()
             self._maybe_resume_charge()
@@ -1634,6 +1664,7 @@ class EvTripLoggerCoordinator:
             self._unsub_live_tick,
             self._unsub_synth_finalize,
             self._unsub_location,
+            self._unsub_stuck_watchdog,
         ):
             if unsub:
                 unsub()
@@ -1643,6 +1674,7 @@ class EvTripLoggerCoordinator:
         self._unsub_charge = self._unsub_live_tick = None
         self._unsub_synth_finalize = None
         self._unsub_location = None
+        self._unsub_stuck_watchdog = None
         self._synth_baseline = None
         # v0.5.49 — make sure a deferred live-open retry doesn't fire
         # after async_stop (would touch a stopped coordinator).
@@ -3309,7 +3341,96 @@ class EvTripLoggerCoordinator:
             self._unsub_live_tick()
             self._unsub_live_tick = None
 
-    async def _async_close_trip(self, now: datetime) -> None:
+    @callback
+    def _async_check_stuck_trip(self, _now: datetime) -> None:
+        """v0.5.79 — periodic safety net for trips that get stuck open
+        when the upstream integration goes offline or drops the off-edge.
+
+        Two independent triggers:
+          1. No movement for `_STUCK_TRIP_NO_MOVEMENT_MIN` minutes AND
+             vehicle_on is currently off. The off-edge handler must have
+             missed (or the on→off→on debounce hid it); close at the
+             last movement time and tag confidence.
+          2. Trip age exceeds `_STUCK_TRIP_MAX_AGE_H` hours regardless of
+             vehicle_on state. At this point the upstream's state machine
+             can't be trusted — even if vehicle_on is still 'on', the
+             integration may simply not be polling. We close at the last
+             known movement (a real timestamp) rather than `now` to avoid
+             pinning a 6-hour duration on a 30-minute drive.
+
+        Both close paths use `_async_close_trip` with a confidence
+        override so the dashboard can show the user that the close was
+        reconstructed rather than observed.
+
+        TODO (integration-disconnect detection): when vehicle_on falls
+        normally but the recorder shows the vehicle_on entity itself
+        was unavailable for > 10 min before the off-edge, the off
+        transition is suspect — the integration was offline and the
+        edge may not coincide with the real parking moment. Tag as
+        `reconstructed_disconnect` and use last_movement_ts as
+        ended_at. Implementation requires reading recorder history for
+        the vehicle_on entity in the off-edge path, ordering it
+        relative to the debounced close, and threading the tag through.
+        Deferred until we have a confirmed disconnect case to test
+        against.
+        """
+        if self.current is None:
+            return
+        # If a debounced close is already pending from a real off-edge,
+        # let it run instead of racing it.
+        if self._pending_close_unsub is not None:
+            return
+        now = dt_util.now()
+        last_move = self.current.last_movement_ts or self.current.started_at
+        age_h = (now - self.current.started_at).total_seconds() / 3600.0
+        no_move_min = (now - last_move).total_seconds() / 60.0
+
+        # Trigger 2: trip is too old to be plausible. Close regardless of
+        # vehicle_on (upstream may be wedged).
+        if age_h > _STUCK_TRIP_MAX_AGE_H:
+            close_ts = last_move
+            _LOGGER.warning(
+                "Stuck-trip watchdog: trip open for %.1f h (> %.1f h cap) — "
+                "force-closing at last movement %s",
+                age_h, _STUCK_TRIP_MAX_AGE_H, close_ts.isoformat(),
+            )
+            self.hass.async_create_task(
+                self._async_close_trip(
+                    close_ts, confidence_override="force_closed_max_age",
+                )
+            )
+            return
+
+        # Trigger 1: no movement AND vehicle_on=off → lost off-edge.
+        if no_move_min > _STUCK_TRIP_NO_MOVEMENT_MIN:
+            vehicle_on = self._read_bool(self._vehicle_on)
+            if vehicle_on is False:
+                close_ts = last_move
+                _LOGGER.warning(
+                    "Stuck-trip watchdog: no movement for %.0f min AND "
+                    "vehicle_on=off — force-closing at %s "
+                    "(lost off-edge)",
+                    no_move_min, close_ts.isoformat(),
+                )
+                self.hass.async_create_task(
+                    self._async_close_trip(
+                        close_ts,
+                        confidence_override="force_closed_no_movement",
+                    )
+                )
+
+    async def _async_close_trip(
+        self,
+        now: datetime,
+        *,
+        confidence_override: str | None = None,
+    ) -> None:
+        """Close the in-memory trip and persist a TripRecord.
+
+        v0.5.79 — `confidence_override` lets callers (e.g. the stuck-
+        trip watchdog) tag a non-live close so the dashboard can warn
+        the user. None preserves the existing 'live' tag.
+        """
         active = self.current
         if active is None:
             return
@@ -3532,8 +3653,9 @@ class EvTripLoggerCoordinator:
                 if active.gps_samples and len(active.gps_samples) >= 2 else None
             ),
             # v0.5.35 — live path always tags as 'live' (precise
-            # times + full metrics).
-            confidence="live",
+            # times + full metrics). v0.5.79 — the stuck-trip watchdog
+            # (and similar reconstructed-close callers) override this.
+            confidence=confidence_override or "live",
             # v0.5.43 — last-chance read in case the live tick never
             # caught the BT connection (very short trips).
             driver=active.driver if active.driver is not None else self._read_driver(),

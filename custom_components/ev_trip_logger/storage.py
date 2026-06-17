@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1717,11 +1717,26 @@ class TripStorage:
                     id
                 """
             ).fetchall()
+            # v0.5.79 — normalise tz: older rows persisted as tz-naive,
+            # newer rows as tz-aware. Comparing them later raises
+            # TypeError ("can't compare offset-naive and offset-aware
+            # datetimes") and the whole recompute crashes. Treat naive
+            # ISO strings as UTC.
+            def _as_utc(s: str | None) -> datetime | None:
+                if not s:
+                    return None
+                try:
+                    ts = datetime.fromisoformat(s)
+                except (TypeError, ValueError):
+                    return None
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                return ts
+
             pending_charges: deque[tuple[datetime, float, float]] = deque()
             for r in charge_rows:
-                try:
-                    ts = datetime.fromisoformat(r["ended_at"])
-                except (TypeError, ValueError):
+                ts = _as_utc(r["ended_at"])
+                if ts is None:
                     continue
                 kwh = float(r["kwh"] or 0.0)
                 if kwh <= 0:
@@ -1743,9 +1758,8 @@ class TripStorage:
                 energy = trow["energy_kwh"]
                 if energy is None or float(energy) <= 0:
                     continue
-                try:
-                    trip_started = datetime.fromisoformat(trow["started_at"])
-                except (TypeError, ValueError):
+                trip_started = _as_utc(trow["started_at"])
+                if trip_started is None:
                     continue
                 # Advance: charges with ended_at <= trip_started become
                 # available inventory now.
