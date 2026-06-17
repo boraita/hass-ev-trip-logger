@@ -108,7 +108,13 @@ CREATE TABLE IF NOT EXISTS trips (
     -- (e.g. the car's "connected bluetooth device" entity) captured
     -- while the trip was open. NULL when no sensor is configured or
     -- nobody was identified. Powers the per-driver km/hours stats.
-    driver TEXT
+    driver TEXT,
+    -- v0.5.76: weighted-average €/kWh experienced by the trip after
+    -- the FIFO inventory replay. NULL when energy_kwh is missing.
+    -- Equals cost / energy_kwh; useful for dashboards to surface the
+    -- "what did this trip actually cost per kWh" answer (mixes home
+    -- tariff and external charges).
+    cost_basis_per_kwh REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -196,6 +202,10 @@ class TripRecord:
     humidity_pct: float | None = None
     wind_kmh: float | None = None
     precipitation_mm: float | None = None
+    # v0.5.76: weighted-average €/kWh the FIFO inventory replay
+    # produced for this trip. Equals cost / energy_kwh once the
+    # post-insert recompute has run; None until then.
+    cost_basis_per_kwh: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -374,6 +384,9 @@ class TripStorage:
         # v0.5.43: per-trip driver identity.
         if "driver" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN driver TEXT")
+        # v0.5.76: weighted-average €/kWh from FIFO inventory replay.
+        if "cost_basis_per_kwh" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN cost_basis_per_kwh REAL")
         # v0.5.54: weather snapshot — averages of start/close readings
         # from the configured weather.* entity. All optional (NULL when
         # CONF_WEATHER_ENTITY isn't set).
@@ -480,8 +493,9 @@ class TripStorage:
                     gps_distance_km, kwh_charged_before, kwh_charged_during,
                     confidence, driver,
                     ambient_temp_c, weather_condition, humidity_pct,
-                    wind_kmh, precipitation_mm
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    wind_kmh, precipitation_mm,
+                    cost_basis_per_kwh
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -524,6 +538,7 @@ class TripStorage:
                     record.humidity_pct,
                     record.wind_kmh,
                     record.precipitation_mm,
+                    record.cost_basis_per_kwh,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -561,7 +576,7 @@ class TripStorage:
         "journey_id", "start_lat", "start_lon", "end_lat", "end_lon",
         "start_address", "end_address", "gps_distance_km",
         "kwh_charged_before", "kwh_charged_during", "confidence",
-        "driver",
+        "driver", "cost_basis_per_kwh",
     })
 
     async def async_trip_overlaps(
@@ -1602,6 +1617,16 @@ class TripStorage:
         )
 
     def _recompute_trip_costs_from_charges(self, default_price: float) -> int:
+        """v0.5.76 — FIFO inventory replay.
+
+        Charges add (kWh, price) slices to an inventory queue (oldest first);
+        each trip withdraws energy_kwh from the queue and accumulates cost as
+        `sum(used × slice_price)`. When the inventory is empty the remainder
+        is priced at the configured home tariff (`default_price`). The
+        result is written back to `cost` and `cost_basis_per_kwh`.
+        """
+        from collections import deque
+
         price = float(default_price)
         with self._connect() as conn:
             # v0.5.14 — heal trips poisoned by the unbounded
@@ -1658,14 +1683,85 @@ class TripStorage:
                     (avg_per_100, avg_per_100),
                 )
 
-            # Step 2 — re-cost every trip with energy from the configured
-            # home tariff (free / external one-off charges don't propagate).
-            cur = conn.execute(
-                "UPDATE trips SET cost = energy_kwh * ? "
-                "WHERE energy_kwh IS NOT NULL AND energy_kwh > 0",
-                (price,),
-            )
-            return int(cur.rowcount or 0)
+            # Step 2 — FIFO inventory replay. Load all charges in
+            # chronological order (null started_at sorts as oldest, then
+            # by id), push their (kwh, €/kWh) onto a queue, and walk
+            # trips in started_at order, withdrawing energy from the
+            # oldest slices first. Cost = Σ(used × slice_price); when
+            # the queue empties before the trip is satisfied the
+            # remainder falls back to `default_price`.
+            charge_rows = conn.execute(
+                """
+                SELECT ended_at, kwh, price_per_kwh
+                FROM charges
+                ORDER BY
+                    CASE WHEN started_at IS NULL THEN 0 ELSE 1 END,
+                    started_at,
+                    id
+                """
+            ).fetchall()
+            pending_charges: deque[tuple[datetime, float, float]] = deque()
+            for r in charge_rows:
+                try:
+                    ts = datetime.fromisoformat(r["ended_at"])
+                except (TypeError, ValueError):
+                    continue
+                kwh = float(r["kwh"] or 0.0)
+                if kwh <= 0:
+                    continue
+                pp = float(r["price_per_kwh"] or 0.0)
+                pending_charges.append((ts, kwh, pp))
+
+            inventory: deque[tuple[float, float]] = deque()
+            trip_rows = conn.execute(
+                """
+                SELECT id, started_at, energy_kwh
+                FROM trips
+                ORDER BY started_at, id
+                """
+            ).fetchall()
+
+            updated = 0
+            for trow in trip_rows:
+                energy = trow["energy_kwh"]
+                if energy is None or float(energy) <= 0:
+                    continue
+                try:
+                    trip_started = datetime.fromisoformat(trow["started_at"])
+                except (TypeError, ValueError):
+                    continue
+                # Advance: charges with ended_at <= trip_started become
+                # available inventory now.
+                while pending_charges and pending_charges[0][0] <= trip_started:
+                    _ts, c_kwh, c_price = pending_charges.popleft()
+                    inventory.append((c_kwh, c_price))
+
+                remaining = float(energy)
+                cost_accum = 0.0
+                while remaining > 0 and inventory:
+                    slice_kwh, slice_price = inventory[0]
+                    if slice_kwh <= remaining:
+                        cost_accum += slice_kwh * slice_price
+                        remaining -= slice_kwh
+                        inventory.popleft()
+                    else:
+                        cost_accum += remaining * slice_price
+                        inventory[0] = (slice_kwh - remaining, slice_price)
+                        remaining = 0.0
+                if remaining > 0:
+                    # Fall back to home tariff for whatever the FIFO
+                    # inventory couldn't cover (typical at startup
+                    # before any charge was logged).
+                    cost_accum += remaining * price
+                basis = cost_accum / float(energy) if float(energy) > 0 else None
+                cur = conn.execute(
+                    "UPDATE trips SET cost = ?, cost_basis_per_kwh = ? "
+                    "WHERE id = ?",
+                    (round(cost_accum, 4), round(basis, 6) if basis is not None else None, trow["id"]),
+                )
+                if cur.rowcount:
+                    updated += 1
+            return updated
 
     async def async_extend_last_charge(
         self, extra_kwh: float, ended_at: datetime, soc_end: float | None = None
@@ -2627,6 +2723,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         humidity_pct=row["humidity_pct"] if "humidity_pct" in row.keys() else None,
         wind_kmh=row["wind_kmh"] if "wind_kmh" in row.keys() else None,
         precipitation_mm=row["precipitation_mm"] if "precipitation_mm" in row.keys() else None,
+        cost_basis_per_kwh=row["cost_basis_per_kwh"] if "cost_basis_per_kwh" in row.keys() else None,
     )
 
 

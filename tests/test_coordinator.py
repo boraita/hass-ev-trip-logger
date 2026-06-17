@@ -973,9 +973,10 @@ async def test_recent_trips_sensor_lists_trips_in_attributes(
     assert t["distance_km"] == pytest.approx(30.0)
     assert t["energy_kwh"] == pytest.approx(11.25)
     assert t["consumption_kwh_100km"] == pytest.approx(37.5)
-    # 11.25 kWh × 0.15 €/kWh (configured home tariff) = 1.69 €
-    # (Trip cost does NOT inherit the 0.30 from the one-off external charge.)
-    assert t["cost"] == pytest.approx(1.69, abs=0.01)
+    # v0.5.76 — FIFO inventory: 10 kWh @ 0.30 sits in inventory ahead of
+    # the trip → 10×0.30 + 1.25×0.15 (home fallback for the overflow) =
+    # 3.19 €. Each kWh is now priced at the rate it was charged at.
+    assert t["cost"] == pytest.approx(3.19, abs=0.01)
     assert t["score"] is not None  # depends on consumption
 
 

@@ -1061,13 +1061,21 @@ class EvTripLoggerCoordinator:
         return label
 
     def _trip_cost_price_per_kwh(self) -> float:
-        """€/kWh used to compute trip cost — ALWAYS the configured home tariff.
+        """€/kWh fallback for trip cost when FIFO inventory is empty.
 
-        Trips don't carry the price of "the last charge" forward. An external
-        DC-fast at €0.40 or a free public charger were one-off events; the
-        car's battery holds a mix of home + external energy and trip cost is
-        more honestly modelled as `energy × home tariff`. Individual charge
-        records keep their actual price (free / home / DC) in their own row.
+        v0.5.76 — Trip cost is now computed by the FIFO inventory
+        replay in `TripStorage._recompute_trip_costs_from_charges`:
+        each charge becomes a (kWh, price) slice consumed by later
+        trips in chronological order, so the trip's actual cost is the
+        weighted average of the charge prices its energy was drawn
+        from. The configured home tariff (returned here) is used:
+
+          * as the seed `cost_basis_per_kwh` at insert time (before
+            the post-insert recompute), so the live snapshot shows
+            something sensible immediately;
+          * as the price for any energy consumed before any charge
+            was logged (typical at fresh install) or when the
+            inventory queue runs dry mid-trip.
         """
         return float(self._energy_price)
 
@@ -2229,6 +2237,9 @@ class EvTripLoggerCoordinator:
             # v0.5.44 — resolve driver from recorder history: the live
             # capture never ran for reconstructed trips.
             driver=await self._async_driver_during(started_at, ended_at),
+            # v0.5.76 — seed with the home tariff; post-insert FIFO
+            # recompute overwrites with the actual weighted-average.
+            cost_basis_per_kwh=price_per_kwh if cost is not None else None,
         )
 
         # v0.5.27 — same charges-window attribution as the live close.
@@ -2247,6 +2258,14 @@ class EvTripLoggerCoordinator:
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        # v0.5.76 — FIFO inventory replay so the new trip's cost
+        # reflects the actual charge prices its energy was drawn from
+        # (and earlier trips heal if their basis changed).
+        if record.energy_kwh is not None and record.energy_kwh > 0:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                self._energy_price,
+            )
 
         # v0.5.25 — persist the route so the dashboard map can render
         # intermediate waypoints, not just start/end. Same table that
@@ -2341,10 +2360,30 @@ class EvTripLoggerCoordinator:
                 and abs(value) <= _MAX_PLAUSIBLE_POWER_KW
             )
             if within_bounds:
-                # Take the negative portion of each endpoint (regen only).
-                a = -min(prev_kw, 0.0)
-                b = -min(value, 0.0)
-                self.current.regen_kwh += (a + b) / 2.0 * dt_h
+                # v0.5.75 — exact area below zero, not the trapezoid of
+                # negative-only endpoints. Convention: discharge>0, regen<0.
+                # Cases:
+                #   both ≤0 → trapezoid of |P| (whole segment is regen)
+                #   both ≥0 → 0 (whole segment is discharge)
+                #   cross   → triangle whose base is the fraction of dt
+                #             below zero. Linear interp gives root at
+                #             t* = |a|/(|a|+|b|); area = b²/(2·(|a|+|b|))·dt
+                #             on the side where b<0, taking |b|.
+                # Old formula (a+b)/2·dt with a=-min(prev,0), b=-min(val,0)
+                # over-counted by ~3× when one endpoint was a deep
+                # discharge and the next a deep regen (e.g. coasting →
+                # foot off): trip 163 logged 1.97 kWh regen in 10 km of
+                # city driving, physically impossible.
+                if prev_kw <= 0 and value <= 0:
+                    self.current.regen_kwh += (-prev_kw + -value) / 2.0 * dt_h
+                elif prev_kw < 0 and value > 0:
+                    span = -prev_kw + value
+                    if span > 0:
+                        self.current.regen_kwh += (prev_kw * prev_kw) / (2.0 * span) * dt_h
+                elif prev_kw > 0 and value < 0:
+                    span = prev_kw + -value
+                    if span > 0:
+                        self.current.regen_kwh += (value * value) / (2.0 * span) * dt_h
                 # v0.5.13 — independent kWh estimator. Trapezoid over
                 # |power| gives the trip's gross throughput; we compare
                 # against SoC-derived energy on close and keep the more
@@ -2984,6 +3023,11 @@ class EvTripLoggerCoordinator:
             _LOGGER.warning("Orphan trip insert failed: %s", exc)
             return
         record.trip_id = trip_id
+        # v0.5.76 — keep FIFO inventory accounting consistent.
+        if record.energy_kwh is not None and record.energy_kwh > 0:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                self._energy_price,
+            )
         _LOGGER.info(
             "Orphan trip inserted (%s): %.2f km, soc %s→%s, duration %.1f min",
             confidence, km_gap, last_trip.soc_end, new_soc, duration_min,
@@ -3287,9 +3331,18 @@ class EvTripLoggerCoordinator:
         # the trip is an independent estimator that doesn't depend on the
         # SoC sensor's cadence. We pick the larger of the two so a stale
         # SoC reading can never under-report consumption.
+        # v0.5.75 — energy_from_power_kwh is GROSS throughput
+        # (discharge + regen as magnitudes). To compare apples-to-apples
+        # with the SoC delta, subtract regen twice: gross = discharge +
+        # regen, net = discharge − regen = gross − 2·regen. Without this
+        # the max() rule systematically inflated live trips: trip 163
+        # reported 2.6 kWh / 26 kWh·100km when the SoC said 1.65 / 16.5,
+        # because regen energy was double-counted (once as discharge in
+        # |P|, once subtracted as regen).
+        net_pwr = active.energy_from_power_kwh - 2.0 * (active.regen_kwh or 0.0)
         energy_pwr = (
-            active.energy_from_power_kwh
-            if self._power and active.energy_from_power_kwh > 0
+            net_pwr
+            if self._power and net_pwr > 0
             else None
         )
         candidates = [e for e in (energy_soc, energy_pwr) if e is not None and e > 0]
@@ -3440,6 +3493,11 @@ class EvTripLoggerCoordinator:
             # v0.5.68 — weather fields stay as their dataclass defaults
             # (None). They survive in the schema for backwards compat;
             # nothing new fills them.
+            # v0.5.76 — initial cost-basis seed = home tariff. The
+            # post-insert recompute below replays the FIFO inventory
+            # and overwrites this with the weighted-average price the
+            # trip actually experienced.
+            cost_basis_per_kwh=price_per_kwh if cost is not None else None,
         )
 
         # v0.5.27 — attribute pre/intra-trip charging energy. Lets the
@@ -3464,6 +3522,15 @@ class EvTripLoggerCoordinator:
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        # v0.5.76 — FIFO inventory replay: trip cost reflects what
+        # the energy actually cost (charge prices in chronological
+        # order). Earlier trips may also heal if the queue shape
+        # changed.
+        if record.energy_kwh is not None and record.energy_kwh > 0:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                self._energy_price,
+            )
 
         # v0.5.30 (issue #5) — when we just auto-stitched a new
         # one-stage journey for this home arrival, retro-absorb any
@@ -3599,6 +3666,12 @@ class EvTripLoggerCoordinator:
         charge_id = await self.storage.async_insert_charge(record)
         record.charge_id = charge_id
         self.last_charge = record
+
+        # v0.5.76 — a new charge slice changes future FIFO cost basis;
+        # rebuild trip costs so everything stays consistent.
+        await self.storage.async_recompute_trip_costs_from_charges(
+            self._energy_price,
+        )
 
         self.hass.bus.async_fire(
             EVENT_CHARGE_LOGGED,
@@ -3986,6 +4059,10 @@ class EvTripLoggerCoordinator:
                 trip_id, s_ts.isoformat(), e_ts.isoformat(), distance,
             )
         if inserted:
+            # v0.5.76 — heal cost basis for the freshly-inserted batch.
+            await self.storage.async_recompute_trip_costs_from_charges(
+                self._energy_price,
+            )
             self.last_trip = await self.storage.async_get_last()
             self._notify_listeners()
             self._notify_trip_log_listeners()
@@ -4103,6 +4180,13 @@ class EvTripLoggerCoordinator:
 
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
+
+        # v0.5.76 — FIFO cost replay so manual trips share the same
+        # accounting as live / synth ones.
+        if record.energy_kwh is not None and record.energy_kwh > 0:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                self._energy_price,
+            )
 
         if stitched_orphan_home and journey_id is not None:
             await self.storage.async_absorb_orphans_into_journey(
