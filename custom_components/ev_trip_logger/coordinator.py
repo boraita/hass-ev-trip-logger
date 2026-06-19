@@ -2971,10 +2971,21 @@ class EvTripLoggerCoordinator:
                 return soc_end_f, "snap_short_park"
 
         # (b) Freshest sample within the pre-on lookback window.
+        # v0.5.81 — defensive silence gate: if the SoC sample is older
+        # than `_TELEMETRY_SILENCE_TIMEOUT_S` it predates a cloud
+        # disconnect or polling pause. The pre-silence reading does
+        # NOT reflect the SoC right before this trip — vampire drain
+        # during the disconnect would otherwise be billed as trip
+        # consumption. Skip it and let branch (c) use the freshest
+        # current value instead.
         cutoff = now - _PRE_ON_LOOKBACK
+        silence_floor = now - timedelta(seconds=_TELEMETRY_SILENCE_TIMEOUT_S)
         for ts, soc in reversed(self._soc_history):
             if ts < cutoff:
                 break
+            if ts < silence_floor:
+                # Sample lived through telemetry silence — distrust it.
+                continue
             # SoC should be ≥ current — the car only drains after on.
             # If pre < current, the buffer entry is stale or a noisy dip
             # (78→77→78 across polls); keep scanning back to the cutoff
