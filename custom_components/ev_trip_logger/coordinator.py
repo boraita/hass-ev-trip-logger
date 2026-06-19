@@ -3081,6 +3081,14 @@ class EvTripLoggerCoordinator:
 
         duration_s = max(0.0, (now - last_trip.ended_at).total_seconds())
         duration_min = duration_s / 60.0
+        # v0.5.83 — orphan windows default to the full prev-end → now
+        # span, which for `orphan_odo_only` catch-up snapshots (single
+        # odo delta with no SoC drop) produces multi-hour "trips" that
+        # mislead the dashboard. We can't know the exact moment the
+        # catch-up landed, but we DO know it's bounded by the silence
+        # window — 30 min is a reasonable best-guess upper bound.
+        # Concrete fix is applied below after we classify.
+        orphan_started_at = last_trip.ended_at
 
         # Classify by SoC↔km consistency.
         confidence: str
@@ -3114,6 +3122,26 @@ class EvTripLoggerCoordinator:
                 )
                 return
 
+        # v0.5.83 — bound the orphan window for catch-up snapshots.
+        # When confidence is `orphan_odo_only` (km appeared but SoC
+        # didn't drop) AND the prev→now gap is > 30 min, the row is
+        # almost certainly a single catch-up odo delta that landed
+        # during silence — NOT a 6 h missed drive. Cap the visible
+        # window at 30 min ending at `now` so the dashboard reads
+        # "short missed drive" instead of "6 h trip with 2 km".
+        if confidence == "orphan_odo_only" and duration_s > 1800:
+            bounded = now - timedelta(seconds=1800)
+            if bounded > last_trip.ended_at:
+                orphan_started_at = bounded
+                duration_s = 1800.0
+                duration_min = 30.0
+                _LOGGER.info(
+                    "Orphan window bounded: catch-up snapshot, %.1f h → 30 min "
+                    "(prev_end=%s, now=%s)",
+                    (now - last_trip.ended_at).total_seconds() / 3600.0,
+                    last_trip.ended_at.isoformat(), now.isoformat(),
+                )
+
         avg_speed = (
             (km_gap / (duration_min / 60.0))
             if duration_min > 0 and km_gap > 0
@@ -3124,7 +3152,7 @@ class EvTripLoggerCoordinator:
             avg_speed = None
 
         record = TripRecord(
-            started_at=last_trip.ended_at,
+            started_at=orphan_started_at,
             ended_at=now,
             duration_min=duration_min,
             distance_km=km_gap,
