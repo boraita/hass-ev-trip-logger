@@ -123,6 +123,44 @@ async def test_driver_resolved_late_via_close_read(hass: HomeAssistant) -> None:
     assert coordinator.last_trip.driver == "Maria Pixel"
 
 
+async def test_driver_dominant_wins_over_bt_race(hass: HomeAssistant) -> None:
+    """v0.5.82 — when two drivers appear during a trip (passenger phone
+    paired at ignition for 30 s, real driver's phone takes over for
+    the remaining minutes), the LONGER-RUNNING value wins. This is
+    the BT-race-at-open scenario that v0.5.43's 'first non-empty
+    wins' got wrong.
+    """
+    # Open: passenger Elena's phone is already paired.
+    hass.states.async_set(DRV, "Elena Pixel")
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    # The "first non-empty wins" world locks in Elena here.
+    assert coordinator.current is not None
+    assert coordinator.current.driver == "Elena Pixel"
+
+    # 30 s later Rafa's phone takes over and Elena's drops.
+    hass.states.async_set(DRV, "Rafa iPhone")
+    hass.states.async_set(ODO, "1015")
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+    # Rafa stays connected for the rest of the trip — advance time so
+    # the live-tick accumulates Rafa-seconds on the dominant bucket.
+    await _advance(hass, 5)
+
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 4)
+
+    # Dominant resolution: Rafa held the sensor for ~5+ min vs Elena's
+    # initial blip → Rafa wins on the persisted row even though Elena
+    # was the open-time read.
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.driver == "Rafa iPhone"
+
+
 async def test_driver_stats_groups_by_driver(hass: HomeAssistant) -> None:
     """async_driver_stats aggregates km/hours per driver with unknown bucket."""
     hass.states.async_set(DRV, "Rafa iPhone")

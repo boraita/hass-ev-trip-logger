@@ -537,6 +537,16 @@ class TripInProgress:
     # open; re-checked on every live tick until it resolves, since BT
     # pairing often completes a few seconds after ignition.
     driver: str | None = None
+    # v0.5.82 — accumulate the time-on-each-driver-value during the
+    # trip so the close path can pick the LONGEST DOMINANT driver
+    # instead of the brittle "first non-empty wins" rule. Fixes the
+    # BYD/Tesla BT-race-at-open case where someone else's phone gets
+    # paired first and the actual driver's connection arrives 30 s
+    # later. Keys are the cleaned driver-sensor states, values are
+    # accumulated seconds.
+    driver_samples: dict[str, float] = field(default_factory=dict)
+    _last_driver_sample_ts: datetime | None = None
+    _last_driver_sample_value: str | None = None
     # v0.5.54 — snapshot of the configured weather.* entity at trip
     # open (start_*) and close (end_*). The end_* fields are filled
     # by `_async_close_trip` just before persistence; the trip row
@@ -3390,12 +3400,33 @@ class EvTripLoggerCoordinator:
                             or abs(lon - prev[2]) >= _GPS_DUP_EPSILON
                         ):
                             self.current.gps_samples.append((now, lat, lon))
-        # v0.5.43 — driver capture retry. BT pairing often completes a
-        # few seconds after ignition, so the open-time read may have
-        # missed it. First non-empty value wins (mid-trip BT handoffs
-        # to a passenger's phone shouldn't reassign the trip).
-        if self.current.driver is None and self._driver_sensor:
-            self.current.driver = self._read_driver()
+        # v0.5.82 — accumulate driver-sensor samples weighted by time.
+        # The close path picks the longest-dominant non-none value
+        # instead of the brittle "first non-empty wins" of v0.5.43.
+        # Same retry purpose (BT pairing completes seconds after
+        # ignition) but the resolution is now evidence-based: a
+        # passenger's phone briefly connecting then dropping does NOT
+        # overwrite the actual driver's longer-running connection.
+        if self._driver_sensor:
+            fresh = self._read_driver()
+            now = dt_util.now()
+            # Accumulate time on the PREVIOUS sample before moving on.
+            prev_ts = self.current._last_driver_sample_ts
+            prev_val = self.current._last_driver_sample_value
+            if prev_ts is not None and prev_val is not None:
+                dt_s = (now - prev_ts).total_seconds()
+                if dt_s > 0:
+                    self.current.driver_samples[prev_val] = (
+                        self.current.driver_samples.get(prev_val, 0.0) + dt_s
+                    )
+            self.current._last_driver_sample_ts = now
+            self.current._last_driver_sample_value = fresh
+            # Backwards-compat: keep `current.driver` set to the first
+            # non-none value so any code that reads it mid-trip (e.g.
+            # current_driver sensor) still has something to display.
+            # Close-path replaces it with the dominant value.
+            if self.current.driver is None and fresh is not None:
+                self.current.driver = fresh
         # Periodic upstream poll-nudge so denser GPS data lands while
         # the trip is in progress (above & beyond what the integration
         # natively reports).
@@ -3760,7 +3791,7 @@ class EvTripLoggerCoordinator:
             confidence=confidence_override or "live",
             # v0.5.43 — last-chance read in case the live tick never
             # caught the BT connection (very short trips).
-            driver=active.driver if active.driver is not None else self._read_driver(),
+            driver=self._resolve_dominant_driver(active),
             # v0.5.68 — weather fields stay as their dataclass defaults
             # (None). They survive in the schema for backwards compat;
             # nothing new fills them.
@@ -4705,6 +4736,47 @@ class EvTripLoggerCoordinator:
         if not cleaned or cleaned.casefold() in DRIVER_NONE_STATES:
             return None
         return cleaned
+
+    def _resolve_dominant_driver(self, active: "TripInProgress") -> str | None:
+        """v0.5.82 — pick the driver who held the sensor the LONGEST
+        during the trip, not the brittle 'first non-empty wins' of
+        v0.5.43. Fixes the BT-race-at-open case: when a passenger's
+        phone connects first and the actual driver's connection
+        arrives ~30 s later, the dominant value over the full trip
+        window is the driver — not the brief 30 s passenger sample.
+
+        Falls back to the live-tick "first valid" (`active.driver`)
+        when no samples were accumulated, then to a final-read of the
+        sensor. None when no sensor is wired.
+        """
+        # Close out the in-flight sample window: add the last
+        # observation's elapsed time to its bucket so the final tally
+        # covers the full trip duration.
+        if (
+            active._last_driver_sample_ts is not None
+            and active._last_driver_sample_value is not None
+        ):
+            now = dt_util.now()
+            dt_s = (now - active._last_driver_sample_ts).total_seconds()
+            if dt_s > 0:
+                active.driver_samples[active._last_driver_sample_value] = (
+                    active.driver_samples.get(
+                        active._last_driver_sample_value, 0.0,
+                    ) + dt_s
+                )
+        # Pick the value with the most accumulated time. `None` is
+        # already filtered by `_read_driver` so the dict only carries
+        # real driver names.
+        if active.driver_samples:
+            dominant = max(
+                active.driver_samples,
+                key=lambda k: active.driver_samples[k],
+            )
+            return dominant
+        # No samples: fall through to legacy behaviour.
+        if active.driver is not None:
+            return active.driver
+        return self._read_driver()
 
     async def _async_plug_stayed_connected_since(self, since: datetime) -> bool:
         """True when the plug sensor never reported 'off' since `since`.
