@@ -104,6 +104,7 @@ DEFAULT_IDLE_TRIP_TIMEOUT_MIN: Final = 10
 CONF_MIN_TRIP_DISTANCE: Final = "min_trip_distance_km"
 CONF_IDLE_TIMEOUT: Final = "idle_timeout_minutes"
 CONF_ENERGY_PRICE: Final = "energy_price_kwh"
+CONF_ENERGY_PRICE_ENTITY: Final = "energy_price_entity"
 CONF_CURRENCY: Final = "currency"
 CONF_HOME_ZONE: Final = "home_zone"
 CONF_RECENT_LIMIT: Final = "recent_trips_limit"

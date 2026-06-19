@@ -158,6 +158,7 @@ The wizard asks for the entities the integration consumes. **Required** first, o
 | Min trip distance | ✅ | Default 0.5 km. Trips under this are discarded (precon/climate, not real drives). |
 | Idle timeout | ✅ | Mid-trip stop tolerance (minutes). |
 | Energy price (€/kWh) | ✅ | Home tariff. Trip cost = energy × this price (NOT per-charge price — see [why](#why-trip-cost-is-the-home-tariff)). |
+| Energy price entity | optional | Live €/kWh tariff sensor (Octopus/Nordpool/PVPC…). When set, overrides the fixed price for trip/charge cost — read at trip/charge close, so it follows time-of-use periods. Falls back to the fixed price when unavailable or non-numeric. |
 | Currency | ✅ | "EUR", "USD", etc. |
 | Recent trips limit | ✅ | How many rows the `_recent_trips` attribute exposes (5..200, default 50). |
 | ABRP token / api_key / car_model | optional | Enables ABRP telemetry push. |
