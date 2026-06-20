@@ -1541,6 +1541,17 @@ class EvTripLoggerCoordinator:
         except Exception as err:  # pragma: no cover — defensive
             _LOGGER.debug("Trip cost heal failed (non-fatal): %s", err)
 
+        # v0.5.86 — startup vehicle-heal sweep. The v0.5.77 per-trip
+        # heal is single-shot (`async_call_later` 240 s). If HA
+        # restarts inside that window, the heal is lost forever and
+        # the trip stays on the noisier SoC-derived energy. On
+        # startup, re-scan the last 24 h of trips that aren't tagged
+        # `energy_source="vehicle"` and re-run the heal — it'll pick
+        # up any trips where the BYD-native sensor has since updated
+        # and we missed the live heal.
+        if self._last_trip_energy_sensor:
+            self.hass.async_create_task(self._async_startup_vehicle_heal_sweep())
+
         # v0.5.20 — one-shot GPS backfill from recorder history first,
         # which then chains into the geocode backfill so trips logged
         # before v0.5.3 (synth, no GPS) get street/town labels too. The
@@ -2360,6 +2371,21 @@ class EvTripLoggerCoordinator:
             # v0.5.76 — seed with the home tariff; post-insert FIFO
             # recompute overwrites with the actual weighted-average.
             cost_basis_per_kwh=price_per_kwh if cost is not None else None,
+            # v0.5.86 — confidence band on the synth-derived consumption.
+            **dict(zip(
+                (
+                    "consumption_lower_kwh_100km",
+                    "consumption_upper_kwh_100km",
+                    "low_confidence",
+                ),
+                self._compute_consumption_band(
+                    distance_km=distance,
+                    energy_kwh=energy,
+                    consumption=consumption,
+                    energy_source=energy_source,
+                    soc_used_pct=soc_used,
+                ),
+            )),
         )
 
         # v0.5.27 — same charges-window attribution as the live close.
@@ -3856,6 +3882,21 @@ class EvTripLoggerCoordinator:
                 active.regen_kwh,
                 soc_used,
             ),
+            # v0.5.86 — confidence band + low-confidence flag.
+            **dict(zip(
+                (
+                    "consumption_lower_kwh_100km",
+                    "consumption_upper_kwh_100km",
+                    "low_confidence",
+                ),
+                self._compute_consumption_band(
+                    distance_km=distance,
+                    energy_kwh=energy,
+                    consumption=consumption,
+                    energy_source=energy_source,
+                    soc_used_pct=soc_used,
+                ),
+            )),
         )
 
         # v0.5.27 — attribute pre/intra-trip charging energy. Lets the
@@ -4625,6 +4666,52 @@ class EvTripLoggerCoordinator:
     def _read_str(self, entity_id: str | None) -> str | None:
         return self._read_state(entity_id)
 
+    async def _async_startup_vehicle_heal_sweep(self) -> None:
+        """v0.5.86 — re-run the vehicle-native energy heal on recent
+        trips that escaped the live `_async_heal_from_vehicle` pass.
+
+        The live heal is `async_call_later`-scheduled 240 s after
+        insert. If HA restarts inside that window, the task is gone
+        and the trip keeps whatever SoC-derived energy it landed
+        with at close. On startup, sweep the last 24 h of trips
+        where `energy_source != "vehicle"` and re-attempt heal — the
+        BYD `last_trip_energy` sensor may have refreshed by now and
+        the existing guards (`last_changed >= trip.ended_at` +
+        distance cross-check) ensure we don't overwrite with a
+        stale or mismatched value.
+        """
+        try:
+            recent = await self.storage.async_trips_needing_vehicle_heal(
+                hours=24,
+            )
+        except Exception as err:  # pragma: no cover — defensive
+            _LOGGER.debug("Vehicle-heal sweep query failed: %s", err)
+            return
+        healed = 0
+        for trip_id in recent:
+            try:
+                before = await self.storage.async_get_trip_by_id(trip_id)
+                await self._async_heal_from_vehicle(trip_id)
+                after = await self.storage.async_get_trip_by_id(trip_id)
+                if (
+                    after is not None
+                    and after.energy_source == "vehicle"
+                    and (
+                        before is None
+                        or before.energy_source != "vehicle"
+                    )
+                ):
+                    healed += 1
+            except Exception as err:  # pragma: no cover — defensive
+                _LOGGER.debug(
+                    "Vehicle-heal sweep skipped trip %s: %s", trip_id, err,
+                )
+        if healed:
+            _LOGGER.info(
+                "Startup vehicle-heal sweep: %d/%d trip(s) recovered with "
+                "vehicle-native energy.", healed, len(recent),
+            )
+
     def _schedule_vehicle_heal(self, trip_id: int) -> None:
         """v0.5.77 — after `_VEHICLE_TRIP_HEAL_DELAY_S` re-read the vehicle's
         last_trip_* sensors. If they refer to this trip (timestamp + distance
@@ -4792,6 +4879,68 @@ class EvTripLoggerCoordinator:
         if not cleaned or cleaned.casefold() in DRIVER_NONE_STATES:
             return None
         return cleaned
+
+    def _compute_consumption_band(
+        self,
+        *,
+        distance_km: float | None,
+        energy_kwh: float | None,
+        consumption: float | None,
+        energy_source: str | None,
+        soc_used_pct: float | None,
+    ) -> tuple[float | None, float | None, bool]:
+        """v0.5.86 — 95% confidence band on `consumption_kwh_100km`.
+
+        The headline `consumption` is a point estimate. This function
+        derives lower/upper bounds and a `low_confidence` flag that
+        capture the noise of the source actually used:
+
+        - `soc` source: SoC is reported to 1% by most car APIs, so the
+          true delta is `recorded ± 0.5%`. The band width is
+          `0.5 × kwh_per_step / distance × 100`.
+        - `power_integration`: 15% relative error band (sampling gaps).
+        - `vehicle`: 3% relative error (vendor rounding).
+        - `estimated` / `vehicle_eff`: same as power.
+
+        Returns (lower, upper, low_confidence). Lower/upper are None
+        when consumption is None. `low_confidence` is True when:
+          - distance < 2 km on SoC-derived energy, OR
+          - relative band exceeds 40 % of consumption, OR
+          - energy_source == 'estimated'
+
+        The dashboard reads these to decide whether to show the trip
+        with full opacity or grey it out; aggregates can filter on
+        the flag to keep rolling baselines clean.
+        """
+        if consumption is None or distance_km is None or distance_km <= 0:
+            return None, None, True
+        # Per-step quantization. Use the calibrated effective capacity
+        # when available — the K-rolling-median refines `nominal` from
+        # real charges, and that's the right unit for "how many kWh
+        # does one SoC step actually carry".
+        kwh_per_step = float(self.battery_capacity) / 100.0  # 1 % = nominal/100
+        rel_sigma: float
+        if energy_source == "vehicle":
+            rel_sigma = 0.03  # 3 % vendor rounding
+        elif energy_source == "soc":
+            # σ_consumption = 0.5 × kwh_per_step / distance × 100
+            sigma_abs = 0.5 * kwh_per_step / distance_km * 100.0
+            rel_sigma = sigma_abs / consumption if consumption > 0 else 1.0
+        elif energy_source == "power_integration":
+            rel_sigma = 0.15
+        else:
+            # estimated, vehicle_eff, None
+            rel_sigma = 0.25
+        half_band = 1.96 * rel_sigma * consumption
+        lower = max(0.0, consumption - half_band)
+        upper = consumption + half_band
+        band_ratio = (upper - lower) / consumption if consumption > 0 else 1.0
+        low_conf = (
+            (distance_km < 2.0 and energy_source in ("soc", None))
+            or band_ratio > 0.40
+            or energy_source == "estimated"
+        )
+        return round(lower, 2), round(upper, 2), bool(low_conf)
 
     def _compute_calibration_k(
         self,
