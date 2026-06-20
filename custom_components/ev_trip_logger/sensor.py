@@ -716,6 +716,24 @@ def _trip_to_attr(
         # v0.5.43 — who drove (state of the configured driver sensor,
         # e.g. the BT-connected phone). NULL when unidentified.
         "driver": getattr(trip, "driver", None),
+        # v0.5.76 — weighted-avg €/kWh after FIFO replay.
+        "cost_basis_per_kwh": _r(
+            getattr(trip, "cost_basis_per_kwh", None), 3
+        ),
+        # v0.5.84 — per-trip battery-capacity calibration factor K.
+        "calibration_factor_k": _r(
+            getattr(trip, "calibration_factor_k", None), 3
+        ),
+        # v0.5.86 — 95 % CI band on consumption + low-confidence flag.
+        # Dashboards can render "16.5 ± 8" instead of just "16.5" so
+        # quantization noise on short trips is visible at a glance.
+        "consumption_lower_kwh_100km": _r(
+            getattr(trip, "consumption_lower_kwh_100km", None), 1
+        ),
+        "consumption_upper_kwh_100km": _r(
+            getattr(trip, "consumption_upper_kwh_100km", None), 1
+        ),
+        "low_confidence": getattr(trip, "low_confidence", None),
     }
 
 
