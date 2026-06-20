@@ -12,6 +12,14 @@ CONF_ODOMETER: Final = "odometer_sensor"
 CONF_BATTERY: Final = "battery_sensor"
 CONF_VEHICLE_ON: Final = "vehicle_on_sensor"
 CONF_POWER: Final = "power_sensor"
+# v0.5.85 — sign convention of the configured power sensor. Default
+# is "discharge_positive": power > 0 when the motor draws energy
+# from the battery (Tesla, most EVs). Some integrations (BYD cloud
+# entity) report the opposite — discharge as negative. When the user
+# sees inflated `regen_kwh` and a `battery_calibration_factor`
+# stuck at None for every trip, this flag flips the integration so
+# discharge / regen accounting is correct again.
+CONF_POWER_SIGN_INVERTED: Final = "power_sign_inverted"
 CONF_CHARGE_SENSOR: Final = "charge_sensor"
 CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"

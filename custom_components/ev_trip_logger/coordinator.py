@@ -56,6 +56,7 @@ from .const import (
     CONF_POLLING_PAUSED_SENSOR,
     CONF_LAST_TRIP_ENERGY_SENSOR,
     CONF_LAST_TRIP_DISTANCE_SENSOR,
+    CONF_POWER_SIGN_INVERTED,
     CONF_TRACKED_SENSORS,
     CONF_ODOMETER,
     CONF_DCFC_THRESHOLD_KW,
@@ -598,6 +599,13 @@ class EvTripLoggerCoordinator:
         # synth-trip window we tag confidence as
         # 'reconstructed_polling_paused'.
         self._polling_paused_sensor = merged.get(CONF_POLLING_PAUSED_SENSOR)
+        # v0.5.85 — power-sensor polarity. Some integrations (BYD cloud)
+        # report discharge as NEGATIVE; default convention is positive.
+        # Toggling this flag flips the value before regen / energy
+        # integration so accounting is correct.
+        self._power_sign_inverted: bool = bool(
+            merged.get(CONF_POWER_SIGN_INVERTED, False)
+        )
         # v0.5.77 — vehicle-native per-trip energy + distance sensors.
         # Used as ground truth at trip close to override the logger's
         # SoC-delta / power-integration estimates. Auto-detected from
@@ -2434,6 +2442,14 @@ class EvTripLoggerCoordinator:
         value = self._read_float(self._power)
         if value is None:
             return
+        # v0.5.85 — normalise the polarity: the rest of this function
+        # assumes `value > 0 = motor drawing from battery (discharge)`.
+        # When the configured sensor reports the opposite (BYD cloud),
+        # flip it once at the entry point so every downstream branch
+        # (regen accumulator, energy_from_power_kwh, max_power) gets
+        # the right sign.
+        if self._power_sign_inverted:
+            value = -value
         # Charge tracking: capture live power so current_charge sensors can
         # display "charging at X kW right now". Runs even with no trip open.
         if self.current_charge is not None:

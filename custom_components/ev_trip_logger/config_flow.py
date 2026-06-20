@@ -46,6 +46,7 @@ from .const import (
     CONF_POLLING_PAUSED_SENSOR,
     CONF_LAST_TRIP_ENERGY_SENSOR,
     CONF_LAST_TRIP_DISTANCE_SENSOR,
+    CONF_POWER_SIGN_INVERTED,
     CONF_TRACKED_SENSORS,
     DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_POWER,
@@ -205,6 +206,13 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="distance")
             ),
+            # v0.5.85 — power-sensor polarity. Default off (positive =
+            # discharge). Flip ON for BYD-cloud-style sensors that
+            # report discharge as negative.
+            vol.Optional(
+                CONF_POWER_SIGN_INVERTED,
+                default=defaults.get(CONF_POWER_SIGN_INVERTED, False),
+            ): bool,
             vol.Required(
                 CONF_BATTERY_CAPACITY,
                 default=defaults.get(CONF_BATTERY_CAPACITY, DEFAULT_BATTERY_CAPACITY),
