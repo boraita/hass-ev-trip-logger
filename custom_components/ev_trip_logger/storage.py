@@ -123,7 +123,20 @@ CREATE TABLE IF NOT EXISTS trips (
     -- many trips signals real degradation (or power-integration gap).
     -- NULL when soc_delta is too small (<2%, quantization-dominated)
     -- or when energy_from_power is missing.
-    calibration_factor_k REAL
+    calibration_factor_k REAL,
+    -- v0.5.86: 95% confidence band on consumption_kwh_100km. Lower
+    -- and upper bounds capture quantization noise of the energy
+    -- source used. Useful when a 5km trip shows 16.5 with band
+    -- [11-22] vs a 30km trip showing 16.5 with band [15-18]; same
+    -- headline number, very different signal quality.
+    consumption_lower_kwh_100km REAL,
+    consumption_upper_kwh_100km REAL,
+    -- v0.5.86: heuristic flag. True when the trip's data has noise
+    -- dominating the signal (distance < 2 km on SoC-only, or
+    -- relative band > 40 %). Dashboards hide / grey these out of
+    -- aggregates so the rolling baselines aren't polluted by
+    -- quantization artifacts.
+    low_confidence INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -219,6 +232,15 @@ class TripRecord:
     # nominal energy. ~1.0 when battery capacity matches nominal;
     # rolling median across many trips estimates real degradation.
     calibration_factor_k: float | None = None
+    # v0.5.86: 95% confidence band on `consumption_kwh_100km`. Lower
+    # and upper bounds derived from quantization noise of the source
+    # used. None when not computed.
+    consumption_lower_kwh_100km: float | None = None
+    consumption_upper_kwh_100km: float | None = None
+    # v0.5.86: heuristic — trips where noise dominates signal. True
+    # for sub-2km trips on SoC-only, or trips where the band is more
+    # than 40% of the headline value.
+    low_confidence: bool | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -403,6 +425,15 @@ class TripStorage:
         # v0.5.84: per-trip battery-capacity calibration factor.
         if "calibration_factor_k" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN calibration_factor_k REAL")
+        # v0.5.86: consumption confidence band + low-confidence flag.
+        for col in (
+            "consumption_lower_kwh_100km",
+            "consumption_upper_kwh_100km",
+        ):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
+        if "low_confidence" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN low_confidence INTEGER")
         # v0.5.54: weather snapshot — averages of start/close readings
         # from the configured weather.* entity. All optional (NULL when
         # CONF_WEATHER_ENTITY isn't set).
@@ -511,8 +542,11 @@ class TripStorage:
                     ambient_temp_c, weather_condition, humidity_pct,
                     wind_kmh, precipitation_mm,
                     cost_basis_per_kwh,
-                    calibration_factor_k
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    calibration_factor_k,
+                    consumption_lower_kwh_100km,
+                    consumption_upper_kwh_100km,
+                    low_confidence
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -557,6 +591,9 @@ class TripStorage:
                     record.precipitation_mm,
                     record.cost_basis_per_kwh,
                     record.calibration_factor_k,
+                    record.consumption_lower_kwh_100km,
+                    record.consumption_upper_kwh_100km,
+                    int(record.low_confidence) if record.low_confidence is not None else None,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -595,6 +632,8 @@ class TripStorage:
         "start_address", "end_address", "gps_distance_km",
         "kwh_charged_before", "kwh_charged_during", "confidence",
         "driver", "cost_basis_per_kwh", "calibration_factor_k",
+        "consumption_lower_kwh_100km", "consumption_upper_kwh_100km",
+        "low_confidence",
         # v0.5.77 — the vehicle-heal path overrides energy_kwh and
         # tags the row as `energy_source='vehicle'` for traceability.
         "energy_source",
@@ -605,6 +644,36 @@ class TripStorage:
         return await self._hass.async_add_executor_job(
             self._get_trip_by_id, trip_id,
         )
+
+    async def async_trips_needing_vehicle_heal(
+        self, hours: int = 24,
+    ) -> list[int]:
+        """v0.5.86 — IDs of recent trips that didn't get vehicle-heal.
+
+        Returns trips closed in the last `hours` whose `energy_source`
+        is anything except `'vehicle'`. The coordinator sweeps these
+        on startup so trips that missed the live heal (HA restart in
+        the 240 s window) get a second chance against the BYD-native
+        sensor.
+        """
+        return await self._hass.async_add_executor_job(
+            self._trips_needing_vehicle_heal, hours,
+        )
+
+    def _trips_needing_vehicle_heal(self, hours: int) -> list[int]:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM trips "
+                "WHERE ended_at >= ? "
+                "  AND (energy_source IS NULL OR energy_source != 'vehicle') "
+                "  AND distance_km IS NOT NULL AND distance_km > 0 "
+                "ORDER BY id DESC LIMIT 50",
+                (cutoff,),
+            ).fetchall()
+        return [int(r[0]) for r in rows]
 
     def _get_trip_by_id(self, trip_id: int) -> "TripRecord | None":
         with self._connect() as conn:
@@ -2819,6 +2888,9 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         precipitation_mm=row["precipitation_mm"] if "precipitation_mm" in row.keys() else None,
         cost_basis_per_kwh=row["cost_basis_per_kwh"] if "cost_basis_per_kwh" in row.keys() else None,
         calibration_factor_k=row["calibration_factor_k"] if "calibration_factor_k" in row.keys() else None,
+        consumption_lower_kwh_100km=row["consumption_lower_kwh_100km"] if "consumption_lower_kwh_100km" in row.keys() else None,
+        consumption_upper_kwh_100km=row["consumption_upper_kwh_100km"] if "consumption_upper_kwh_100km" in row.keys() else None,
+        low_confidence=bool(row["low_confidence"]) if ("low_confidence" in row.keys() and row["low_confidence"] is not None) else None,
     )
 
 
