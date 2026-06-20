@@ -189,6 +189,7 @@
       "consumption_by_season": { "name": "Consumo por estación" },
       "consumption_by_time_of_day": { "name": "Consumo por franja horaria" },
       "battery_soh": { "name": "Salud de la batería" },
+      "battery_calibration_factor": { "name": "Factor de calibración batería (K)" },
       "expected_battery_soh": { "name": "SoH esperado de la batería" },
       "battery_health_vs_expected": {
         "name": "Salud vs esperado",

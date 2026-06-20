@@ -3828,6 +3828,18 @@ class EvTripLoggerCoordinator:
             # and overwrites this with the weighted-average price the
             # trip actually experienced.
             cost_basis_per_kwh=price_per_kwh if cost is not None else None,
+            # v0.5.84 — battery-capacity calibration factor. K compares
+            # the power-integration NET energy (real motor draw) to
+            # the SoC-derived nominal energy. K < 1 over many trips
+            # signals real degradation; spikes per trip are sampling
+            # noise. Only computed when both signals are confident:
+            # SoC delta ≥ 2 % (above 1 % quantization) and the trip
+            # has accumulated power samples (energy_from_power > 0).
+            calibration_factor_k=self._compute_calibration_k(
+                active.energy_from_power_kwh,
+                active.regen_kwh,
+                soc_used,
+            ),
         )
 
         # v0.5.27 — attribute pre/intra-trip charging energy. Lets the
@@ -4764,6 +4776,51 @@ class EvTripLoggerCoordinator:
         if not cleaned or cleaned.casefold() in DRIVER_NONE_STATES:
             return None
         return cleaned
+
+    def _compute_calibration_k(
+        self,
+        energy_from_power_kwh: float | None,
+        regen_kwh: float | None,
+        soc_used_pct: float | None,
+    ) -> float | None:
+        """v0.5.84 — battery-capacity calibration factor per trip.
+
+        K = net_power_kwh / soc_delta_kwh_nominal
+
+        Where:
+          - net_power_kwh  = ∫|P|·dt − 2·regen (real energy drawn from
+            battery, measured at the motor side via power integration)
+          - soc_delta_kwh_nominal = soc_used_pct / 100 × nominal_capacity
+            (theoretical energy assuming nominal pack capacity)
+
+        K ≈ 1.0 → capacity matches nominal. K consistently < 1.0
+        across many trips → real degradation OR systematic power-
+        integration undercount. Median across a rolling window
+        smooths individual-trip noise; that aggregate is the actual
+        SoH proxy.
+
+        Returns None when either side is unreliable:
+          - SoC delta < 2 % (1 % quantization dominates)
+          - energy_from_power ≤ 0 (no power samples accumulated)
+          - nominal capacity not set
+        """
+        if soc_used_pct is None or soc_used_pct < 2.0:
+            return None
+        if energy_from_power_kwh is None or energy_from_power_kwh <= 0:
+            return None
+        nominal = self.battery_capacity
+        if not nominal or nominal <= 0:
+            return None
+        net_power = energy_from_power_kwh - 2.0 * (regen_kwh or 0.0)
+        if net_power <= 0:
+            # Regen overcounted vs discharge — sampling artefact, drop
+            # this trip from the calibration pool rather than letting a
+            # negative K poison the rolling median.
+            return None
+        soc_delta_kwh = soc_used_pct / 100.0 * float(nominal)
+        if soc_delta_kwh <= 0:
+            return None
+        return round(net_power / soc_delta_kwh, 3)
 
     def _resolve_dominant_driver(self, active: "TripInProgress") -> str | None:
         """v0.5.82 — pick the driver who held the sensor the LONGEST

@@ -114,7 +114,16 @@ CREATE TABLE IF NOT EXISTS trips (
     -- Equals cost / energy_kwh; useful for dashboards to surface the
     -- "what did this trip actually cost per kWh" answer (mixes home
     -- tariff and external charges).
-    cost_basis_per_kwh REAL
+    cost_basis_per_kwh REAL,
+    -- v0.5.84: per-trip battery-capacity calibration factor. Ratio of
+    -- the power-integration net energy (∫|P|·dt − 2·regen, the real
+    -- kWh drawn from the battery measured at the motor) to the SoC-
+    -- delta energy assuming nominal capacity. K ≈ 1.0 means battery
+    -- capacity matches nominal. Persistent drift toward K < 1.0 across
+    -- many trips signals real degradation (or power-integration gap).
+    -- NULL when soc_delta is too small (<2%, quantization-dominated)
+    -- or when energy_from_power is missing.
+    calibration_factor_k REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -206,6 +215,10 @@ class TripRecord:
     # produced for this trip. Equals cost / energy_kwh once the
     # post-insert recompute has run; None until then.
     cost_basis_per_kwh: float | None = None
+    # v0.5.84: ratio of power-integrated net energy to SoC-derived
+    # nominal energy. ~1.0 when battery capacity matches nominal;
+    # rolling median across many trips estimates real degradation.
+    calibration_factor_k: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -387,6 +400,9 @@ class TripStorage:
         # v0.5.76: weighted-average €/kWh from FIFO inventory replay.
         if "cost_basis_per_kwh" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN cost_basis_per_kwh REAL")
+        # v0.5.84: per-trip battery-capacity calibration factor.
+        if "calibration_factor_k" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN calibration_factor_k REAL")
         # v0.5.54: weather snapshot — averages of start/close readings
         # from the configured weather.* entity. All optional (NULL when
         # CONF_WEATHER_ENTITY isn't set).
@@ -494,8 +510,9 @@ class TripStorage:
                     confidence, driver,
                     ambient_temp_c, weather_condition, humidity_pct,
                     wind_kmh, precipitation_mm,
-                    cost_basis_per_kwh
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    cost_basis_per_kwh,
+                    calibration_factor_k
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -539,6 +556,7 @@ class TripStorage:
                     record.wind_kmh,
                     record.precipitation_mm,
                     record.cost_basis_per_kwh,
+                    record.calibration_factor_k,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -576,7 +594,7 @@ class TripStorage:
         "journey_id", "start_lat", "start_lon", "end_lat", "end_lon",
         "start_address", "end_address", "gps_distance_km",
         "kwh_charged_before", "kwh_charged_during", "confidence",
-        "driver", "cost_basis_per_kwh",
+        "driver", "cost_basis_per_kwh", "calibration_factor_k",
         # v0.5.77 — the vehicle-heal path overrides energy_kwh and
         # tags the row as `energy_source='vehicle'` for traceability.
         "energy_source",
@@ -1141,6 +1159,51 @@ class TripStorage:
                 continue
         n = len(samples)
         if n < min_charges:
+            return (None, n)
+        samples.sort()
+        mid = n // 2
+        median = (
+            samples[mid] if n % 2 == 1
+            else (samples[mid - 1] + samples[mid]) / 2.0
+        )
+        return (median, n)
+
+    async def async_calibration_factor_k_median(
+        self,
+        *,
+        window: int = 30,
+        min_trips: int = 5,
+    ) -> tuple[float | None, int]:
+        """v0.5.84 — rolling-median per-trip battery calibration factor.
+
+        Each trip stores `calibration_factor_k = net_power_kwh /
+        (soc_delta_pct/100 × nominal_capacity_kwh)`. Aggregating the
+        median over the last `window` non-NULL trips smooths individual-
+        trip noise (sampling gaps in power integration) and surfaces a
+        proxy for real battery degradation. K ≈ 1.0 → capacity matches
+        nominal; persistent drift toward K < 1.0 → effective capacity
+        has dropped.
+
+        Returns `(median_k, n_samples)`. `(None, n)` when n < min_trips.
+        """
+        return await self._hass.async_add_executor_job(
+            self._calibration_factor_k_median, window, min_trips,
+        )
+
+    def _calibration_factor_k_median(
+        self, window: int, min_trips: int
+    ) -> tuple[float | None, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT calibration_factor_k FROM trips "
+                "WHERE calibration_factor_k IS NOT NULL "
+                "  AND calibration_factor_k > 0 "
+                "ORDER BY id DESC LIMIT ?",
+                (window,),
+            ).fetchall()
+        samples = [float(r[0]) for r in rows if r[0] is not None]
+        n = len(samples)
+        if n < min_trips:
             return (None, n)
         samples.sort()
         mid = n // 2
@@ -2755,6 +2818,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         wind_kmh=row["wind_kmh"] if "wind_kmh" in row.keys() else None,
         precipitation_mm=row["precipitation_mm"] if "precipitation_mm" in row.keys() else None,
         cost_basis_per_kwh=row["cost_basis_per_kwh"] if "cost_basis_per_kwh" in row.keys() else None,
+        calibration_factor_k=row["calibration_factor_k"] if "calibration_factor_k" in row.keys() else None,
     )
 
 

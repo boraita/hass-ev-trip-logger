@@ -246,6 +246,9 @@ async def async_setup_entry(
     entities.append(ConsumptionBySeasonSensor(coordinator))
     entities.append(ConsumptionByTimeOfDaySensor(coordinator))
     entities.append(BatterySohSensor(coordinator))
+    # v0.5.84 — measured-degradation proxy from per-trip power-vs-SoC
+    # cross-validation. Independent signal vs the chemistry-model SoH.
+    entities.append(BatteryCalibrationFactorSensor(coordinator))
     # v0.5.57 — expected SoH model based on age/km/chemistry/climate.
     entities.append(ExpectedBatterySohSensor(coordinator))
     entities.append(BatteryHealthVsExpectedSensor(coordinator))
@@ -2795,6 +2798,81 @@ class BatterySohSensor(_BaseTripSensor):
             "age_years": age_years,
             "battery_chemistry": coord._battery_chemistry,
             "history": self._history,
+        }
+
+
+class BatteryCalibrationFactorSensor(_BaseTripSensor):
+    """v0.5.84 — rolling-median per-trip battery-capacity calibration K.
+
+    K = net_power_kwh / (soc_delta × nominal_capacity). Aggregated as
+    the median over the last 30 trips with both signals available.
+    Persistent K < 1.0 indicates real degradation (real capacity is
+    K × nominal). Per-trip K is noisy due to power-integration
+    sampling gaps; the rolling median is the actionable number.
+    """
+
+    _unrecorded_attributes = frozenset({"history"})
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="battery_calibration_factor",
+            translation_key="battery_calibration_factor",
+            icon="mdi:scale-balance",
+            suggested_display_precision=3,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = (
+            f"{coordinator.entry_id}_battery_calibration_factor"
+        )
+        self._median: float | None = None
+        self._n: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._median, self._n = (
+            await self._coordinator.storage.async_calibration_factor_k_median(
+                window=30, min_trips=5,
+            )
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._median
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "sample_count": self._n,
+            "window_trips": 30,
+            "min_trips_required": 5,
+            "nominal_capacity_kwh": self._coordinator.battery_capacity,
+            "effective_capacity_kwh": (
+                round(self._median * self._coordinator.battery_capacity, 2)
+                if self._median is not None else None
+            ),
+            "interpretation": (
+                "K ≈ 1.0 → capacity matches nominal. K < 1.0 → real "
+                "capacity is K × nominal (degradation). Per-trip K is "
+                "noisy; this median over 30 trips is the trustworthy "
+                "signal. Only trips with SoC delta ≥ 2% AND non-zero "
+                "power integration AND positive net energy contribute."
+            ),
         }
 
 
