@@ -3716,17 +3716,80 @@ class EvTripLoggerCoordinator:
             if self._power and net_pwr > 0
             else None
         )
-        candidates = [e for e in (energy_soc, energy_pwr) if e is not None and e > 0]
-        if candidates:
-            energy = max(candidates)
-            energy_source = (
-                "power_integration"
-                if energy_pwr is not None and energy_pwr >= (energy_soc or 0)
-                else "soc"
-            )
+        # v0.5.88 — priority-based selection replaces the v0.5.13 `max()`.
+        # The old "pessimistic" rule biased the row upward whenever
+        # power_integration over-counted (trapezoidal zero-crossings
+        # double-account when adjacent BYD cloud samples straddle the
+        # zero line, e.g. +50→-50 reports area=50·dt instead of 0).
+        # With v0.5.81 silence-gate making SoC anchoring robust, the
+        # `max()` defence is no longer justified — SoC is now ground
+        # truth above the 1 % quantization noise floor.
+        #
+        # Decision ladder:
+        #   a) SoC delta ≥ 3 %  → use SoC unconditionally (above
+        #      quantization, trustworthy). Power is logged but ignored.
+        #   b) SoC delta 1–2 %  → use min(soc, power) when power passes
+        #      sanity guards. The lower of the two is the more honest
+        #      estimate in this regime.
+        #   c) SoC delta 0      → use power if it passes sanity, else
+        #      fall through to the historical-average fallback below.
+        # Sanity guards reject power_integration when:
+        #   - regen_kwh > 0.5 × energy_from_power_kwh (polarity flip
+        #     suspected mid-trip — see v0.5.85)
+        #   - net_pwr > 2 × energy_soc when both exist (bias evidence)
+        regen = active.regen_kwh or 0.0
+        gross = active.energy_from_power_kwh or 0.0
+        power_polarity_ok = gross <= 0 or regen <= 0.5 * gross
+        if energy_pwr is not None and energy_soc is not None:
+            power_ratio_ok = energy_pwr <= 2.0 * energy_soc
+        else:
+            power_ratio_ok = True
+        power_trusted = (
+            energy_pwr is not None
+            and power_polarity_ok
+            and power_ratio_ok
+        )
+        soc_pct = soc_used or 0.0
+        if energy_soc is not None and soc_pct >= 3.0:
+            energy = energy_soc
+            energy_source = "soc"
+        elif energy_soc is not None and soc_pct >= 1.0:
+            # Marginal SoC delta: defend against quantization noise on
+            # short trips by anchoring to the LOWER of soc / power when
+            # both signals exist. Picks the more honest of the two
+            # instead of letting either side inflate freely.
+            if power_trusted:
+                energy = min(energy_soc, energy_pwr)
+                energy_source = "soc" if energy_soc <= energy_pwr else "power_integration"
+            else:
+                energy = energy_soc
+                energy_source = "soc"
+        elif power_trusted:
+            energy = energy_pwr
+            energy_source = "power_integration"
+        elif energy_soc is not None:
+            energy = energy_soc
+            energy_source = "soc"
         else:
             energy = None
             energy_source = None
+        # When SoC won but power existed and disagrees by >50%, log the
+        # divergence so future tuning has data without enabling DEBUG.
+        if (
+            energy_source == "soc"
+            and energy is not None
+            and energy_pwr is not None
+            and energy_pwr > 0
+        ):
+            divergence = abs(energy_pwr - energy) / energy
+            if divergence > 0.5:
+                _LOGGER.info(
+                    "Energy source: SoC won (%.2f kWh) over power-int "
+                    "(%.2f kWh, %.0f%% divergence). polarity_ok=%s "
+                    "ratio_ok=%s regen=%.2f gross=%.2f",
+                    energy, energy_pwr, divergence * 100,
+                    power_polarity_ok, power_ratio_ok, regen, gross,
+                )
         # v0.5.15 — inline fallback when both SoC delta and power
         # integration come back empty. For BYD's integer-step SoC
         # (1 % resolution) any short trip that doesn't cross a 1 %
