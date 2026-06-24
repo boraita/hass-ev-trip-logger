@@ -5429,6 +5429,23 @@ class EvTripLoggerCoordinator:
         elif duration_min > 1 and kwh_so_far and kwh_so_far > 0:
             avg_kw = kwh_so_far / (duration_min / 60.0)
             is_dcfc = avg_kw > self._dcfc_threshold_kw
+        # v0.5.92 — live EVSE-side energy and AC→DC efficiency. The
+        # snapshot exposes both so current_charge_* sensors can render
+        # them while the session is in progress.
+        evse_kwh = (
+            round(active.evse_energy_kwh, 3)
+            if active.evse_energy_kwh > 0 else None
+        )
+        eff_pct: float | None = None
+        if evse_kwh and evse_kwh > 0:
+            # Prefer the integrated battery-side value when we have it,
+            # otherwise fall back to the SoC-derived kwh_so_far.
+            battery_kwh = (
+                active.energy_added_kwh if active.energy_added_kwh > 0
+                else (kwh_so_far or 0)
+            )
+            if battery_kwh > 0:
+                eff_pct = round(battery_kwh / evse_kwh * 100.0, 1)
         return {
             "kwh": round(kwh_so_far, 2) if kwh_so_far else 0.0,
             "total_cost": round(total_cost, 2),
@@ -5438,4 +5455,6 @@ class EvTripLoggerCoordinator:
             "is_dcfc": is_dcfc,
             "soc_start": active.soc_start,
             "soc_now": soc_now,
+            "evse_energy_kwh": evse_kwh,
+            "charging_efficiency_pct": eff_pct,
         }

@@ -292,6 +292,9 @@ async def async_setup_entry(
             CurrentChargeSensor(coordinator, key="power_kw"),
             CurrentChargeSensor(coordinator, key="duration_min"),
             CurrentChargeSensor(coordinator, key="is_dcfc"),
+            # v0.5.92 — also expose current-charge EVSE energy + efficiency.
+            CurrentChargeSensor(coordinator, key="evse_energy_kwh"),
+            CurrentChargeSensor(coordinator, key="charging_efficiency_pct"),
             ChargesAggregateSensor(coordinator, period="month", key="kwh"),
             ChargesAggregateSensor(coordinator, period="month", key="total_cost"),
             ChargesAggregateSensor(coordinator, period="month", key="count"),
@@ -1796,6 +1799,10 @@ class CurrentChargeSensor(_BaseTripSensor):
     # via _is_dcfc_label.
     _IDLE_NUMERIC_KEYS = frozenset({
         "kwh", "total_cost", "power_kw", "duration_min",
+        # v0.5.92 — show 0 in idle for these too so the dashboard
+        # reads "0 kWh / 0 %" cleanly instead of "unknown" between
+        # sessions.
+        "evse_energy_kwh", "charging_efficiency_pct",
     })
 
     @property
