@@ -22,6 +22,25 @@ Works with **any cloud-polled EV integration** — BYD, Tesla Fleet, OVMS, Bounc
 
 ---
 
+## Screenshots
+
+A few views from the companion [`hass-ev-trip-dashboard`](https://github.com/boraita/hass-ev-trip-dashboard) — every value below comes from sensors / attributes this integration exposes.
+
+| | |
+|---|---|
+| ![Status, live charging & driving](docs/screenshots/01-status-charging-driving.png) | ![Trips list with search & filter](docs/screenshots/02-trips-list-search.png) |
+| Live status: battery curve, plug state, today's journey + charging / driving sparklines. | Recent trips with kWh/100km, score, cost — filter by date / score / max consumption. |
+| ![Calendar activity](docs/screenshots/03-activity-calendar.png) | ![Trends & savings vs petrol](docs/screenshots/04-trends-savings.png) |
+| Monthly calendar with trips + charges per day. | Savings vs petrol baseline, monthly cost projection, long-trip / avg-trip records. |
+| ![Driving patterns + per-driver stats](docs/screenshots/05-patterns-drivers.png) | ![Efficiency analytics](docs/screenshots/06-efficiency-analysis.png) |
+| When you drive (hour-of-day, weekday) + per-driver breakdown when a `driver_sensor` is wired. | Consumption by speed / season / time-of-day / temperature, scatter chart, battery health (SoH 100 %). |
+| ![Charges history & insights](docs/screenshots/07-charges-history.png) | |
+| Per-period kWh charged / spent / driving, charging insights (cheapest / DCFC / avg session), full charge history. | |
+
+The dashboard is **optional** — every metric is a regular HA sensor or sensor-attribute, so you can build your own card or template against them.
+
+---
+
 ## Why
 
 Cloud-polled EVs have stale, integer-step SoC, sparse odometer ticks, and unreliable `vehicle_on` transitions. Out of the box that makes:
