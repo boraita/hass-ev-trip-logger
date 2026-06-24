@@ -57,6 +57,7 @@ from .const import (
     CONF_LAST_TRIP_ENERGY_SENSOR,
     CONF_LAST_TRIP_DISTANCE_SENSOR,
     CONF_POWER_SIGN_INVERTED,
+    CONF_EVSE_POWER_SENSOR,
     CONF_TRACKED_SENSORS,
     CONF_ODOMETER,
     CONF_DCFC_THRESHOLD_KW,
@@ -568,6 +569,23 @@ class ChargeInProgress:
     # surfaced by the current_charge_* sensors so the dashboard can show
     # "charging at 7.2 kW right now". Captured even when no trip is active.
     last_power_kw: float | None = None
+    # v0.5.89 — integrate the car-side power sensor during the charge to
+    # measure the actual kWh that landed in the battery, independent of
+    # the SoC delta (which suffers from 1% quantization on most BYD-
+    # class cars). Charging convention after `power_sign_inverted` flip:
+    # negative value = battery receiving energy. We sum the absolute
+    # value of the integral so the result is positive kWh in.
+    energy_added_kwh: float = 0.0
+    _last_power_kw_signed: float | None = None
+    _last_power_ts: datetime | None = None
+    # v0.5.89 — same integral but from the EVSE / wallbox side
+    # (`CONF_EVSE_POWER_SENSOR`). Charger output is typically 5-15 %
+    # higher than what the battery receives — AC→DC conversion losses
+    # + onboard charger efficiency. Exposing both lets the dashboard
+    # show real charging efficiency.
+    evse_energy_kwh: float = 0.0
+    _last_evse_kw: float | None = None
+    _last_evse_ts: datetime | None = None
 
 
 class EvTripLoggerCoordinator:
@@ -606,6 +624,11 @@ class EvTripLoggerCoordinator:
         self._power_sign_inverted: bool = bool(
             merged.get(CONF_POWER_SIGN_INVERTED, False)
         )
+        # v0.5.89 — optional EVSE / wallbox power sensor. When wired,
+        # the integration tracks AC-side energy delivered during each
+        # charge session. Auto-detects W vs kW from the entity's
+        # unit_of_measurement at sample time.
+        self._evse_power_sensor = merged.get(CONF_EVSE_POWER_SENSOR)
         # v0.5.77 — vehicle-native per-trip energy + distance sensors.
         # Used as ground truth at trip close to override the logger's
         # SoC-delta / power-integration estimates. Auto-detected from
@@ -1587,6 +1610,10 @@ class EvTripLoggerCoordinator:
             self._unsub_charge = async_track_state_change_event(
                 self.hass, [self._charge_sensor], self._async_charge_sensor_changed
             )
+        if self._evse_power_sensor:
+            self._unsub_evse = async_track_state_change_event(
+                self.hass, [self._evse_power_sensor], self._async_evse_power_changed
+            )
         if self._location:
             self._unsub_location = async_track_state_change_event(
                 self.hass, [self._location], self._async_location_changed
@@ -2480,6 +2507,28 @@ class EvTripLoggerCoordinator:
         # display "charging at X kW right now". Runs even with no trip open.
         if self.current_charge is not None:
             self.current_charge.last_power_kw = abs(value)
+            # v0.5.89 — integrate the car-side power into the charge
+            # session so we have an independent measurement of kWh
+            # delivered to the battery (cross-checks the SoC-derived
+            # number, which has 1 % quantization noise). After the
+            # `power_sign_inverted` flip the convention is "battery
+            # receiving = negative"; we sum `-value` only when it's
+            # negative (= actually charging) so AC inrush blips or
+            # sensor noise crossing zero never inflates the total.
+            now = dt_util.now()
+            prev_kw = self.current_charge._last_power_kw_signed
+            prev_ts = self.current_charge._last_power_ts
+            if prev_kw is not None and prev_ts is not None:
+                dt_h = (now - prev_ts).total_seconds() / 3600.0
+                if 0 < dt_h <= _MAX_POWER_TRAPEZOID_DT_H:
+                    # Charge contribution: trapezoidal area on the
+                    # battery-receiving side only (both samples ≤ 0).
+                    if prev_kw <= 0 and value <= 0:
+                        self.current_charge.energy_added_kwh += (
+                            (-prev_kw + -value) / 2.0 * dt_h
+                        )
+            self.current_charge._last_power_kw_signed = value
+            self.current_charge._last_power_ts = now
             self._notify_listeners()
             # v0.5.16 — cable power is NOT trip energy. When a charge
             # session is in progress, return early so we don't integrate
@@ -2588,6 +2637,48 @@ class EvTripLoggerCoordinator:
         self._notify_listeners()
 
     _AUTO_CHARGE_DEDUP_WINDOW_S = 300  # 5 min — skip auto if a manual charge just logged
+
+    @callback
+    def _async_evse_power_changed(self, event: Event[EventStateChangedData]) -> None:
+        """v0.5.89 — integrate the EVSE / wallbox power into the active
+        charge session. Handles W or kW units transparently. No-op
+        when no charge is in progress (saves the integral state for
+        when one opens).
+        """
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state in _INVALID_STATES:
+            return
+        try:
+            value = float(new_state.state)
+        except (TypeError, ValueError):
+            return
+        # Normalise to kW. The EVSE often reports in W (e.g. Shelly
+        # 3EM, Wallbox Pulsar, V2C Trydan ≈ 7400 W during AC charge).
+        unit = (
+            new_state.attributes.get("unit_of_measurement") or ""
+        ).strip()
+        if unit.lower() in ("w", "watt", "watts"):
+            value = value / 1000.0
+        if self.current_charge is None:
+            # Save the latest reading anyway so the first sample after
+            # the charge opens is a valid baseline (not from minutes
+            # before the cable was plugged in).
+            return
+        now = dt_util.now()
+        prev_kw = self.current_charge._last_evse_kw
+        prev_ts = self.current_charge._last_evse_ts
+        if prev_kw is not None and prev_ts is not None:
+            dt_h = (now - prev_ts).total_seconds() / 3600.0
+            if 0 < dt_h <= _MAX_POWER_TRAPEZOID_DT_H:
+                # EVSE always reports positive while delivering power
+                # (some report 0 in idle). Trapezoidal area between
+                # consecutive readings.
+                a = max(0.0, prev_kw)
+                b = max(0.0, value)
+                self.current_charge.evse_energy_kwh += (a + b) / 2.0 * dt_h
+        self.current_charge._last_evse_kw = value
+        self.current_charge._last_evse_ts = now
+        self._notify_listeners()
 
     @callback
     def _async_charge_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -2888,7 +2979,42 @@ class EvTripLoggerCoordinator:
                 self._notify_listeners()
                 return
 
-        kwh = (soc_end - active.soc_start) / 100.0 * self.battery_capacity
+        kwh_soc = (soc_end - active.soc_start) / 100.0 * self.battery_capacity
+        # v0.5.89 — prefer the power-integration measurement when it
+        # exists and is within reasonable bounds of the SoC delta.
+        # The integral covers the FULL charge curve (incl. taper at
+        # high SoC where 1 % covers more time than 1 % at low SoC),
+        # so it's a more accurate estimate than `(Δ% × nominal_cap)`
+        # which assumes uniform energy-per-percent.
+        kwh = kwh_soc
+        if (
+            active.energy_added_kwh > 0
+            and 0.7 * kwh_soc <= active.energy_added_kwh <= 1.3 * kwh_soc
+        ):
+            kwh = round(active.energy_added_kwh, 3)
+            _LOGGER.info(
+                "Charge kWh: using power-integration %.2f (SoC said %.2f, "
+                "delta %.0f %%)",
+                kwh, kwh_soc, (kwh - kwh_soc) / kwh_soc * 100.0,
+            )
+        elif active.energy_added_kwh > 0:
+            _LOGGER.info(
+                "Charge kWh: power-integration %.2f outside ±30 %% of SoC "
+                "(%.2f kWh) — falling back to SoC math.",
+                active.energy_added_kwh, kwh_soc,
+            )
+        # v0.5.89 — log the EVSE/wallbox side delivery + implied
+        # AC→DC efficiency. Stored in attributes later; for now the
+        # info log gives the user a real-time number to check against
+        # their utility / EVSE app.
+        if active.evse_energy_kwh > 0:
+            eff = kwh / active.evse_energy_kwh if active.evse_energy_kwh > 0 else None
+            _LOGGER.info(
+                "Charge EVSE side: %.2f kWh delivered → %.2f kWh battery, "
+                "efficiency = %.1f %%",
+                active.evse_energy_kwh, kwh,
+                eff * 100.0 if eff else 0.0,
+            )
 
         if can_merge:
             merged = await self.storage.async_extend_last_charge(

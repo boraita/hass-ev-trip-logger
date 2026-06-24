@@ -20,6 +20,12 @@ CONF_POWER: Final = "power_sensor"
 # stuck at None for every trip, this flag flips the integration so
 # discharge / regen accounting is correct again.
 CONF_POWER_SIGN_INVERTED: Final = "power_sign_inverted"
+# v0.5.89 — optional EVSE (wallbox) power sensor in WATTS or KW. When
+# wired, the integration sums it during the charge session to measure
+# AC-side energy delivered (independent of the car-side power sensor).
+# Comparing car battery input vs charger output exposes real AC→DC
+# losses + onboard charger efficiency (typically 10-15 % delta).
+CONF_EVSE_POWER_SENSOR: Final = "evse_power_sensor"
 CONF_CHARGE_SENSOR: Final = "charge_sensor"
 CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
