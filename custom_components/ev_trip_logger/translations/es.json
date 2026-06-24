@@ -190,6 +190,11 @@
       "consumption_by_time_of_day": { "name": "Consumo por franja horaria" },
       "battery_soh": { "name": "Salud de la batería" },
       "battery_calibration_factor": { "name": "Factor de calibración batería (K)" },
+      "last_charge_evse_kwh": { "name": "Energía entregada por wallbox (última carga)" },
+      "last_charge_efficiency": { "name": "Eficiencia carga AC→DC (última)" },
+      "current_charge_evse_kwh": { "name": "Energía entregada por wallbox (carga actual)" },
+      "current_charge_efficiency": { "name": "Eficiencia carga AC→DC (actual)" },
+      "avg_charging_efficiency_30d": { "name": "Eficiencia carga media (30d)" },
       "expected_battery_soh": { "name": "SoH esperado de la batería" },
       "battery_health_vs_expected": {
         "name": "Salud vs esperado",

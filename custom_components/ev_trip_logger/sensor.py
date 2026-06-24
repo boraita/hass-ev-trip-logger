@@ -249,6 +249,8 @@ async def async_setup_entry(
     # v0.5.84 — measured-degradation proxy from per-trip power-vs-SoC
     # cross-validation. Independent signal vs the chemistry-model SoH.
     entities.append(BatteryCalibrationFactorSensor(coordinator))
+    # v0.5.90 — rolling-median AC→DC efficiency from EVSE-side energy.
+    entities.append(AvgChargingEfficiencySensor(coordinator))
     # v0.5.57 — expected SoH model based on age/km/chemistry/climate.
     entities.append(ExpectedBatterySohSensor(coordinator))
     entities.append(BatteryHealthVsExpectedSensor(coordinator))
@@ -281,6 +283,9 @@ async def async_setup_entry(
             LastChargeSensor(coordinator, key="total_cost"),
             LastChargeSensor(coordinator, key="price_per_kwh"),
             LastChargeSensor(coordinator, key="is_dcfc"),
+            # v0.5.90 — AC-side energy + AC→DC efficiency.
+            LastChargeSensor(coordinator, key="evse_energy_kwh"),
+            LastChargeSensor(coordinator, key="charging_efficiency_pct"),
             CurrentChargeSensor(coordinator, key="kwh"),
             CurrentChargeSensor(coordinator, key="total_cost"),
             CurrentChargeSensor(coordinator, key="price_per_kwh"),
@@ -754,6 +759,13 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         "notes": charge.notes,
         "is_dcfc": charge.is_dcfc,
         "price_locked": getattr(charge, "price_locked", False),
+        # v0.5.90 — AC-side metered energy + AC→DC efficiency.
+        "evse_energy_kwh": _r(
+            getattr(charge, "evse_energy_kwh", None), 2
+        ),
+        "charging_efficiency_pct": _r(
+            getattr(charge, "charging_efficiency_pct", None), 1
+        ),
     }
 
 
@@ -1681,6 +1693,23 @@ _CHARGE_FIELD_CONFIG: dict[str, dict[str, Any]] = {
         "icon": "mdi:ev-plug-type2",
         "slug_last": "last_charge_type",
         "slug_current": "current_charge_type",
+    },
+    "evse_energy_kwh": {
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "device_class": SensorDeviceClass.ENERGY,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "precision": 2,
+        "icon": "mdi:transmission-tower",
+        "slug_last": "last_charge_evse_kwh",
+        "slug_current": "current_charge_evse_kwh",
+    },
+    "charging_efficiency_pct": {
+        "unit": PERCENTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "icon": "mdi:percent",
+        "slug_last": "last_charge_efficiency",
+        "slug_current": "current_charge_efficiency",
     },
 }
 
@@ -2816,6 +2845,74 @@ class BatterySohSensor(_BaseTripSensor):
             "age_years": age_years,
             "battery_chemistry": coord._battery_chemistry,
             "history": self._history,
+        }
+
+
+class AvgChargingEfficiencySensor(_BaseTripSensor):
+    """v0.5.90 — rolling-median AC→DC charging efficiency across the
+    last 30 charge sessions where both EVSE energy and battery kWh are
+    recorded. State is the median %; attributes show sample count.
+
+    Useful for catching: lossy cables (drops below 85 %), EVSE
+    derating issues, or DCFC sessions interleaved with AC (DCFC is
+    typically 92-97 %, AC home 88-94 %).
+    """
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="avg_charging_efficiency_30d",
+            translation_key="avg_charging_efficiency_30d",
+            native_unit_of_measurement=PERCENTAGE,
+            state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:percent-circle",
+            suggested_display_precision=1,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = (
+            f"{coordinator.entry_id}_avg_charging_efficiency_30d"
+        )
+        self._median: float | None = None
+        self._n: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._median, self._n = (
+            await self._coordinator.storage.async_avg_charging_efficiency_pct(
+                window=30, min_charges=3,
+            )
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._median
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "sample_count": self._n,
+            "window_charges": 30,
+            "interpretation": (
+                "AC home charger typical 88-94 %, DCFC 92-97 %. "
+                "Below 85 % signals lossy cable / wallbox derating "
+                "/ onboard charger inefficiency. Only charges with "
+                "an EVSE power sensor wired contribute."
+            ),
         }
 
 

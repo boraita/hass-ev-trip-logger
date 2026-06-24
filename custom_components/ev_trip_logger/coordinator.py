@@ -3043,6 +3043,9 @@ class EvTripLoggerCoordinator:
             notes=f"auto-detected from {self._charge_sensor}",
             started_at=active.started_at,
             soc_start=active.soc_start,
+            evse_energy_kwh=(
+                active.evse_energy_kwh if active.evse_energy_kwh > 0 else None
+            ),
         )
 
     @callback
@@ -4203,6 +4206,7 @@ class EvTripLoggerCoordinator:
         started_at: datetime | None = None,
         soc_start: float | None = None,
         is_dcfc: bool | None = None,
+        evse_energy_kwh: float | None = None,
     ) -> ChargeRecord:
         """Persist a charge session.
 
@@ -4240,6 +4244,10 @@ class EvTripLoggerCoordinator:
                 if avg_kw <= 400:
                     is_dcfc = avg_kw > self._dcfc_threshold_kw
 
+        # v0.5.90 — AC→DC efficiency from the EVSE-side integral.
+        charging_eff_pct: float | None = None
+        if evse_energy_kwh is not None and evse_energy_kwh > 0:
+            charging_eff_pct = round(kwh / evse_energy_kwh * 100.0, 1)
         record = ChargeRecord(
             started_at=started_at,
             ended_at=now,
@@ -4252,6 +4260,12 @@ class EvTripLoggerCoordinator:
             location=location,
             notes=notes,
             is_dcfc=is_dcfc,
+            evse_energy_kwh=(
+                round(evse_energy_kwh, 3)
+                if evse_energy_kwh is not None and evse_energy_kwh > 0
+                else None
+            ),
+            charging_efficiency_pct=charging_eff_pct,
         )
         charge_id = await self.storage.async_insert_charge(record)
         record.charge_id = charge_id

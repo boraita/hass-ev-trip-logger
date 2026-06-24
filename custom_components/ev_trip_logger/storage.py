@@ -156,7 +156,16 @@ CREATE TABLE IF NOT EXISTS charges (
     -- price_locked = 1 when the user has explicitly corrected the price via
     -- set_last_charge_price. Auto-detect must NOT stomp it with a phantom
     -- second insert. NULL/0 = price is just the default fallback.
-    price_locked INTEGER
+    price_locked INTEGER,
+    -- v0.5.90: AC-side energy delivered by the EVSE/wallbox (W·h
+    -- converted to kWh by the integration). Comparing kwh (battery
+    -- input) vs evse_energy_kwh (charger output) gives real AC→DC
+    -- efficiency. NULL when no `evse_power_sensor` was configured.
+    evse_energy_kwh REAL,
+    -- v0.5.90: kwh / evse_energy_kwh × 100. Typical AC home charger:
+    -- 88-94 %. DC fast: 92-97 %. Below 85 % signals lossy cable /
+    -- wallbox / onboard charger derating.
+    charging_efficiency_pct REAL
 );
 CREATE INDEX IF NOT EXISTS idx_charges_ended_at ON charges(ended_at);
 
@@ -318,6 +327,12 @@ class ChargeRecord:
     # True if the user has explicitly set the price (incl. €0 for "free").
     # Auto-detect must not stomp it.
     price_locked: bool = False
+    # v0.5.90: AC-side energy from the configured EVSE / wallbox sensor.
+    # None when no `evse_power_sensor` was wired.
+    evse_energy_kwh: float | None = None
+    # v0.5.90: kwh / evse_energy_kwh × 100 — real AC→DC charging
+    # efficiency. None when evse_energy_kwh is missing or zero.
+    charging_efficiency_pct: float | None = None
     charge_id: int | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -503,6 +518,10 @@ class TripStorage:
             conn.execute("ALTER TABLE charges ADD COLUMN is_dcfc INTEGER")
         if "price_locked" not in charge_cols:
             conn.execute("ALTER TABLE charges ADD COLUMN price_locked INTEGER")
+        # v0.5.90: AC-side energy + AC→DC efficiency.
+        for col in ("evse_energy_kwh", "charging_efficiency_pct"):
+            if col not in charge_cols:
+                conn.execute(f"ALTER TABLE charges ADD COLUMN {col} REAL")
         # v0.5.0: trip_positions table for route-map drilldown.
         conn.execute(
             """
@@ -1237,6 +1256,48 @@ class TripStorage:
         )
         return (median, n)
 
+    async def async_avg_charging_efficiency_pct(
+        self,
+        *,
+        window: int = 30,
+        min_charges: int = 3,
+    ) -> tuple[float | None, int]:
+        """v0.5.90 — rolling-median AC→DC charging efficiency.
+
+        Each charge row with both `kwh` (battery input) and
+        `evse_energy_kwh` (charger output) contributes one sample:
+        kwh / evse_energy_kwh × 100. Median over the last `window`
+        eligible charges; (None, n) when n < `min_charges`. The
+        median is more robust than a mean when one DCFC session
+        skews the distribution.
+        """
+        return await self._hass.async_add_executor_job(
+            self._avg_charging_efficiency_pct, window, min_charges,
+        )
+
+    def _avg_charging_efficiency_pct(
+        self, window: int, min_charges: int,
+    ) -> tuple[float | None, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT charging_efficiency_pct FROM charges "
+                "WHERE charging_efficiency_pct IS NOT NULL "
+                "  AND charging_efficiency_pct > 0 "
+                "ORDER BY id DESC LIMIT ?",
+                (window,),
+            ).fetchall()
+        samples = [float(r[0]) for r in rows if r[0] is not None]
+        n = len(samples)
+        if n < min_charges:
+            return (None, n)
+        samples.sort()
+        mid = n // 2
+        median = (
+            samples[mid] if n % 2 == 1
+            else (samples[mid - 1] + samples[mid]) / 2.0
+        )
+        return (round(median, 2), n)
+
     async def async_calibration_factor_k_median(
         self,
         *,
@@ -1370,8 +1431,9 @@ class TripStorage:
                 """
                 INSERT INTO charges (
                     started_at, ended_at, kwh, price_per_kwh, total_cost,
-                    currency, soc_start, soc_end, location, notes, is_dcfc
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    currency, soc_start, soc_end, location, notes, is_dcfc,
+                    evse_energy_kwh, charging_efficiency_pct
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat() if record.started_at else None,
@@ -1385,6 +1447,8 @@ class TripStorage:
                     record.location,
                     record.notes,
                     int(record.is_dcfc) if record.is_dcfc is not None else None,
+                    record.evse_energy_kwh,
+                    record.charging_efficiency_pct,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -2910,6 +2974,14 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
         notes=row["notes"],
         is_dcfc=bool(is_dcfc_raw) if is_dcfc_raw is not None else None,
         price_locked=bool(row["price_locked"]) if "price_locked" in row.keys() and row["price_locked"] else False,
+        evse_energy_kwh=(
+            row["evse_energy_kwh"]
+            if "evse_energy_kwh" in row.keys() else None
+        ),
+        charging_efficiency_pct=(
+            row["charging_efficiency_pct"]
+            if "charging_efficiency_pct" in row.keys() else None
+        ),
     )
 
 
