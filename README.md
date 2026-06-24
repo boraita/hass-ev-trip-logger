@@ -98,6 +98,8 @@ This integration solves all of that with explicit state machines, **per-car self
 - `_maybe_resume_charge` recovers a session that started before HA restarted (without it, the entire charge would be dropped).
 - `kwh_charged_before` and `kwh_charged_during` attributes on every trip let the dashboard show "+24 kWh between trips" so a SoC bump isn't mysterious.
 - Per-session `soc_start` + `soc_end` are stored so the battery-capacity calibration can derive the real pack size from observation.
+- **Power-integration during charge (v0.5.89+)** — if your `power_sensor` is wired, the integration sums ∫P·dt over the whole charge and uses it as the kWh persisted when it's within ±30 % of the SoC-derived number. Captures the full charge curve including the high-SoC taper where each percent represents more time → more accurate than `Δ% × nominal_capacity`.
+- **EVSE / wallbox tracking (v0.5.90+, optional)** — wire any wallbox power sensor as `evse_power_sensor` (W or kW auto-detected). The integration measures AC-side energy delivered and computes real AC→DC efficiency = `battery_kwh / evse_kwh × 100`. Works with **any wallbox**: V2C Trydan, Shelly EM/Pro 3EM, Wallbox Pulsar / Quasar, Tesla Wall Connector, Easee, Zappi, Smartfox, OpenEVSE, etc. Five new sensors expose the data — see [Sensors exposed](#sensors-exposed). A 30-day rolling-median efficiency catches lossy cables / derated chargers (drop below 85 %).
 
 ### GPS / routing
 - Every cloud poll fills a ring buffer of `(ts, lat, lon)` samples. Trips open with a real start anchor; synth trips persist a route to `trip_positions`.
@@ -144,7 +146,9 @@ The wizard asks for the entities the integration consumes. **Required** first, o
 | **Vehicle-on binary sensor** | ✅ | `binary_sensor.…_vehicle_on`. Primary trip trigger. |
 | **Battery capacity (kWh)** | ✅ | E.g. 82.5 for a Sealion 7 Extended Range. Used as the **declared** capacity; the integration auto-calibrates the effective capacity from charges. |
 | **Home zone** | ✅ | Usually `zone.home`. Journey logic uses it. |
-| Power sensor | optional | kW, +discharge/-charge. Enables regen + power-integration backup + ABRP push. |
+| Power sensor | optional | kW, +discharge/-charge. Enables regen + power-integration backup + ABRP push. If your car reports the opposite convention (e.g. some BYD cloud entities are -discharge/+charge), toggle **Power sign inverted**. |
+| Power sign inverted | optional | Default off (positive = discharge). Flip ON when your car's `power_sensor` reports the inverse — telltale sign: persistent `regen_kwh` higher than `energy_kwh` even on flat trips. Auto-detected sensors that need this: BYD cloud-API `*_power`. |
+| **EVSE power sensor** | optional | Any wallbox or socket-meter power entity (W or kW auto-detected). Enables AC-side energy + AC→DC efficiency measurement. Works with V2C Trydan, Shelly Pro/EM, Wallbox Pulsar/Quasar, Tesla Wall Connector, Easee, Zappi, Smartfox, OpenEVSE, generic Shelly relays. See [Wallbox examples](#wallbox-examples). |
 | Charge sensor | optional | `binary_sensor.…_charging` OR any `sensor.*` whose state names the charging mode. Recognised "charging" values: `on`, `true`, `1`, `Charging`, `Starting`, `Engaged`, `ac_charging`, `dc_charging`, `slow_charging`, `fast_charging` (case-insensitive). Anything else (`off`, `Disconnected`, `Complete`, `Stopped`, `NoPower`, `idle`, `done`…) counts as "not charging". |
 | Plug binary sensor | optional | Lets multi-pulse plugged sessions merge into one charge row. |
 | Polling-paused sensor | optional | A switch or binary_sensor that goes ON when the manufacturer integration sleeps. Synth trips in that window get tagged `reconstructed_polling_paused`. |
@@ -162,6 +166,37 @@ The wizard asks for the entities the integration consumes. **Required** first, o
 | Recent trips limit | ✅ | How many rows the `_recent_trips` attribute exposes (5..200, default 50). |
 | ABRP token / api_key / car_model | optional | Enables ABRP telemetry push. |
 | ABRP push interval (s) | optional | Throttle for outbound pushes (5..600, default 30). |
+
+---
+
+### Vehicle examples (the integration is car-agnostic)
+
+| Car / source | `odometer` | `battery` | `vehicle_on` | `power` | Notes |
+|---|---|---|---|---|---|
+| **BYD** (cloud) | `sensor.<car>_odometer` | `sensor.<car>_battery_level` | `binary_sensor.<car>_vehicle_on` | `sensor.<car>_power` | Enable **Power sign inverted** (BYD cloud uses +charge/-discharge). |
+| **Tesla** (Fleet / Teslemetry) | `sensor.<car>_odometer` | `sensor.<car>_battery_level` | `binary_sensor.<car>_vehicle_on` | `sensor.<car>_power` (when exposed) | Power sign inverted **OFF** (Tesla uses +discharge). |
+| **BMW** (BimmerConnected) | `sensor.<car>_mileage` | `sensor.<car>_remaining_battery_percent` | `binary_sensor.<car>_charging_status` (inverted) | — | No live power → SoC-only trip math, still works. |
+| **Hyundai/Kia** (Bluelink) | `sensor.<car>_odometer` | `sensor.<car>_ev_battery_level` | template from `Engine` enum | — | Same as BMW. |
+| **OVMS** (CAN dongle) | `sensor.ovms_<id>_v_p_odometer` | `sensor.ovms_<id>_v_b_soc` | `binary_sensor.ovms_<id>_v_e_on` | `sensor.ovms_<id>_v_b_power` | Best-case: real CAN-rate power → consumption math near-perfect. |
+| **MQTT manual** | any `sensor.*` | any `sensor.*` | any `binary_sensor.*` | optional | DIY setups: just publish the metrics. |
+
+### Wallbox examples
+
+Any HA entity that reports **charger output power in W or kW** works as `evse_power_sensor`:
+
+| Wallbox / meter | Typical entity_id | Unit |
+|---|---|---|
+| V2C Trydan | `sensor.evse_<ip>_charge_power` | W |
+| Shelly EM / Pro 3EM (meter on the cable) | `sensor.shellyemxxx_channel_<n>_power` | W |
+| Wallbox Pulsar Plus / Quasar | `sensor.wallbox_<id>_charging_power` | kW |
+| Tesla Wall Connector | `sensor.tesla_wall_connector_power` | kW |
+| Easee | `sensor.easee_<id>_session_energy_or_power` | W or kW |
+| Zappi (myenergi) | `sensor.zappi_<sn>_ct_ev` | W |
+| Smartfox | `sensor.smartfox_charging_power` | W |
+| OpenEVSE | `sensor.openevse_<host>_charge_power` | W |
+| Generic Shelly relay metering charger socket | `sensor.<shelly>_power` | W |
+
+The integration auto-detects the unit (`W` → divides by 1000 internally). Pick the sensor that reports **only the EV charging power**, not the whole house — otherwise the AC→DC efficiency will be skewed by background loads.
 
 ---
 
@@ -243,6 +278,11 @@ A complete list lives in the source (`sensor.py`). The headline ones, all prefix
 
 ### Charges
 `last_charge_*`, `current_charge_*`, `charges_30d_*`, plus AC/DC price breakdowns.
+
+**EVSE / efficiency (v0.5.89+, requires `evse_power_sensor` wired)**
+- `last_charge_evse_kwh` / `current_charge_evse_kwh` — AC-side energy delivered by the wallbox.
+- `last_charge_efficiency` / `current_charge_efficiency` — `battery_kwh / evse_kwh × 100`.
+- `avg_charging_efficiency_30d` — rolling median across the last 30 charge sessions with an EVSE sensor wired. AC home charger: 88–94 %. DCFC: 92–97 %. Below 85 % signals a lossy cable / wallbox derating / inefficient onboard charger.
 
 ### Journeys
 `current_journey`, `last_journey`, `recent_journeys` (with stages list).
