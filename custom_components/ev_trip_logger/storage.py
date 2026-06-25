@@ -1991,7 +1991,11 @@ class TripStorage:
             return updated
 
     async def async_extend_last_charge(
-        self, extra_kwh: float, ended_at: datetime, soc_end: float | None = None
+        self,
+        extra_kwh: float,
+        ended_at: datetime,
+        soc_end: float | None = None,
+        extra_evse_kwh: float | None = None,
     ) -> ChargeRecord | None:
         """Append to the most recent charge instead of inserting a new row.
 
@@ -2008,7 +2012,7 @@ class TripStorage:
         what we store now.
         """
         return await self._hass.async_add_executor_job(
-            self._extend_last_charge, extra_kwh, ended_at, soc_end
+            self._extend_last_charge, extra_kwh, ended_at, soc_end, extra_evse_kwh,
         )
 
     def _extend_last_charge(
@@ -2016,6 +2020,7 @@ class TripStorage:
         extra_kwh: float,
         ended_at: datetime,
         soc_end: float | None,
+        extra_evse_kwh: float | None = None,
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -2029,10 +2034,33 @@ class TripStorage:
             new_soc_end = (
                 float(soc_end) if soc_end is not None else row["soc_end"]
             )
+            # v0.5.94 — accumulate EVSE-side energy too. Without this,
+            # merged sessions (multi-pulse plugged windows) lost the
+            # AC measurement: subsequent merges UPDATEd the row but
+            # never wrote evse_energy_kwh / charging_efficiency_pct.
+            cur_evse = (
+                float(row["evse_energy_kwh"])
+                if ("evse_energy_kwh" in row.keys()
+                    and row["evse_energy_kwh"] is not None)
+                else 0.0
+            )
+            new_evse: float | None
+            if extra_evse_kwh is not None and extra_evse_kwh > 0:
+                new_evse = round(cur_evse + float(extra_evse_kwh), 3)
+            else:
+                new_evse = cur_evse if cur_evse > 0 else None
+            new_eff = (
+                round(new_kwh / new_evse * 100.0, 1)
+                if new_evse and new_evse > 0 else None
+            )
             conn.execute(
                 "UPDATE charges SET kwh = ?, total_cost = ?, ended_at = ?, "
-                "soc_end = ? WHERE id = ?",
-                (new_kwh, new_total, ended_at.isoformat(), new_soc_end, row["id"]),
+                "soc_end = ?, evse_energy_kwh = ?, charging_efficiency_pct = ? "
+                "WHERE id = ?",
+                (
+                    new_kwh, new_total, ended_at.isoformat(), new_soc_end,
+                    new_evse, new_eff, row["id"],
+                ),
             )
             updated = conn.execute(
                 "SELECT * FROM charges WHERE id = ?", (row["id"],)

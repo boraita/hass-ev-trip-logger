@@ -3017,8 +3017,16 @@ class EvTripLoggerCoordinator:
             )
 
         if can_merge:
+            # v0.5.94 — propagate the new pulse's EVSE-side energy so
+            # merged multi-pulse sessions accumulate the AC reading
+            # instead of dropping it on the floor.
+            extra_evse = (
+                active.evse_energy_kwh
+                if active.evse_energy_kwh > 0 else None
+            )
             merged = await self.storage.async_extend_last_charge(
                 extra_kwh=kwh, ended_at=now, soc_end=soc_end,
+                extra_evse_kwh=extra_evse,
             )
             if merged is not None:
                 self.last_charge = merged
