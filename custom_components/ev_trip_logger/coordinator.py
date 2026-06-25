@@ -4993,12 +4993,28 @@ class EvTripLoggerCoordinator:
         # All guards passed — override.
         old_energy = trip.energy_kwh
         new_consumption = vehicle_kwh / trip.distance_km * 100.0
+        # v0.5.93 — recompute the confidence band with the new source.
+        # The old band was sized for SoC quantization noise; for a
+        # vehicle-native value the relative uncertainty is ~3 % so the
+        # band collapses dramatically. Without this the dashboard
+        # shows "27.6 kWh/100km, band [12-21]" — the band excludes the
+        # value because it was calculated under different assumptions.
+        lower, upper, low_conf = self._compute_consumption_band(
+            distance_km=trip.distance_km,
+            energy_kwh=vehicle_kwh,
+            consumption=new_consumption,
+            energy_source="vehicle",
+            soc_used_pct=trip.soc_used_pct,
+        )
         await self.storage.async_update_trip(
             trip_id,
             {
                 "energy_kwh": round(vehicle_kwh, 3),
                 "consumption_kwh_100km": round(new_consumption, 2),
                 "energy_source": "vehicle",
+                "consumption_lower_kwh_100km": lower,
+                "consumption_upper_kwh_100km": upper,
+                "low_confidence": low_conf,
             },
         )
         _LOGGER.warning(
