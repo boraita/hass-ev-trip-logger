@@ -2226,6 +2226,79 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     assert after.energy_source == "power_integration"
 
 
+async def test_recover_segments_via_vehicle_on_handles_sparse_odo(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.99 — vehicle_on-driven segmentation must split two separate
+    missed drives even when the recorder only has 3 odometer samples.
+
+    The trip-193 case in miniature: cloud-polled odometer reports at
+    18:08 (post-trip-192), 18:20 (mid mini-drive A), 19:07 (mid mini-
+    drive B). The old odometer-walker coalesced these into ONE big
+    segment (no plateau-finalize between samples because no sample
+    arrived during the 47-min idle) AND skipped it because the
+    segment started 26 s before trip 192's recorded end. v0.5.99
+    walks vehicle_on edges instead, producing two clean segments.
+    """
+    from types import SimpleNamespace
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    base = datetime(2026, 6, 25, 18, 0, 0, tzinfo=timezone.utc)
+    # Mock state objects with the recorder's expected shape.
+    def _s(ts_min, ts_sec, state):
+        ts = base + timedelta(minutes=ts_min, seconds=ts_sec)
+        return SimpleNamespace(state=str(state), last_updated=ts,
+                               attributes={})
+
+    vehicle_on_states = [
+        _s(8, 26, "off"),     # 18:08:26 trip 192 closes
+        _s(18, 34, "on"),     # 18:18:34 drive A starts
+        _s(22, 25, "off"),    # 18:22:25 drive A ends
+        _s(66, 44, "on"),     # 19:06:44 drive B starts
+        _s(69, 26, "off"),    # 19:09:26 drive B ends
+    ]
+    odometer_states = [
+        _s(8, 0, "26824"),    # last known just before window
+        _s(20, 17, "26825"),  # +1 km after drive A
+        _s(67, 50, "26826"),  # +1 km after drive B
+    ]
+
+    async def _fake_executor(func, *args, **kwargs):
+        # state_changes_during_period(hass, start, end, entity_id)
+        eid = args[3]
+        if eid == VOK:
+            states = [s for s in vehicle_on_states
+                      if args[1] <= s.last_updated <= args[2]]
+            return {VOK: states}
+        if eid == ODO:
+            states = [s for s in odometer_states
+                      if args[1] <= s.last_updated <= args[2]]
+            return {ODO: states}
+        return {eid: []}
+
+    # Recorder access uses get_instance(hass).async_add_executor_job.
+    # Patch the returned instance.
+    fake_recorder = SimpleNamespace(async_add_executor_job=_fake_executor)
+    segments = await coordinator._recover_segments_via_vehicle_on(
+        since=base,
+        until=base + timedelta(hours=2),
+        recorder=fake_recorder,
+    )
+    # Both drives recovered, each ≥ min_distance.
+    assert len(segments) == 2
+    s1, s2 = segments
+    assert s1[0] == base + timedelta(minutes=18, seconds=34)
+    assert s1[1] == base + timedelta(minutes=22, seconds=25)
+    assert s1[2] == pytest.approx(26824.0)
+    assert s1[3] == pytest.approx(26825.0)
+    assert s2[0] == base + timedelta(minutes=66, seconds=44)
+    assert s2[1] == base + timedelta(minutes=69, seconds=26)
+    assert s2[2] == pytest.approx(26825.0)
+    assert s2[3] == pytest.approx(26826.0)
+
+
 async def test_orphan_yields_to_recovered_live_trips(hass: HomeAssistant) -> None:
     """v0.5.98 — when the recorder still has the precise vehicle_on
     edges of a missed drive, the orphan_odo_only synthetic window

@@ -4849,15 +4849,21 @@ class EvTripLoggerCoordinator:
     async def async_recover_missing_trips_service(
         self, *, since: datetime, until: datetime | None = None,
     ) -> int:
-        """Scan recorder history for odometer growth not covered by any
-        existing trip, and INSERT synth records with confidence
+        """Scan recorder history for trips not covered by any existing
+        row, and INSERT synth records with confidence
         'reconstructed_recovery'. Existing rows are never modified.
 
-        Algorithm:
-          1. Pull odometer history in [since, until]. Drop unparseable.
-          2. Walk samples. A "segment" starts when odo grows from the
-             prior sample and ends after _SYNTH_COALESCE_WINDOW_S of
-             no further growth (or until the window ends).
+        Algorithm (v0.5.99):
+          1. If `vehicle_on` is configured, walk its history first.
+             Each on→off pair is a candidate segment with precise
+             timestamps — the recorder kept the edges even when the
+             live capture missed them. This is the primary path: it
+             handles sparse cloud-polled odometers (BYD ~8 min
+             cadence) that the odometer-walker can't segment
+             correctly.
+          2. Fall back to the legacy odometer-growth walker for the
+             entries where vehicle_on isn't wired, or when the
+             vehicle_on history has no on→off pair in the window.
           3. For each segment, query storage: skip if any trip already
              overlaps [seg_start, seg_end].
           4. For surviving segments, pull battery + location at the
@@ -4880,6 +4886,23 @@ class EvTripLoggerCoordinator:
         except Exception:
             return 0
         recorder = get_instance(self.hass)
+        # v0.5.99 — vehicle_on-driven segmentation is more reliable
+        # than the odometer-plateau walker on sparse cloud-polled
+        # sources. Try it first.
+        segments: list[tuple[datetime, datetime, float, float]] = []
+        if self._vehicle_on is not None:
+            segments = await self._recover_segments_via_vehicle_on(
+                since=since, until=until, recorder=recorder,
+            )
+            if segments:
+                _LOGGER.info(
+                    "recover_missing_trips: vehicle_on path produced %d "
+                    "segment(s)",
+                    len(segments),
+                )
+                return await self._async_insert_recovered_segments(
+                    segments, recorder=recorder,
+                )
         try:
             result = await recorder.async_add_executor_job(
                 state_changes_during_period,
@@ -4946,17 +4969,156 @@ class EvTripLoggerCoordinator:
             )
 
         _LOGGER.info(
-            "recover_missing_trips: %d candidate segment(s) in [%s, %s]",
+            "recover_missing_trips: %d odometer-walker segment(s) in [%s, %s]",
             len(segments), since.isoformat(), until.isoformat(),
         )
+        return await self._async_insert_recovered_segments(
+            segments, recorder=recorder,
+        )
+
+    async def _recover_segments_via_vehicle_on(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        recorder,
+    ) -> list[tuple[datetime, datetime, float, float]]:
+        """v0.5.99 — derive recovery segments from vehicle_on edges.
+
+        Each on→off pair becomes one segment. Odometer at the
+        endpoints is pulled from the recorder (last reading ≤ ts) so
+        sparse cloud-polled odometers (BYD ~8 min cadence) don't lose
+        the trip even when no odometer sample falls inside the
+        on-window. A segment is kept only when end_odo − start_odo
+        ≥ `_min_distance` (= the discard floor used everywhere else).
+
+        Returns [] when vehicle_on history is empty or no usable
+        segment passes the distance gate — the caller then falls
+        back to the legacy odometer-walker.
+        """
+        try:
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+        except Exception:  # pragma: no cover — recorder optional
+            return []
+        if not self._vehicle_on or not self._odometer:
+            return []
+        try:
+            r = await recorder.async_add_executor_job(
+                state_changes_during_period,
+                self.hass, since, until, self._vehicle_on,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug(
+                "recover_missing_trips: vehicle_on query failed: %s", exc,
+            )
+            return []
+        sts = r.get(self._vehicle_on, []) if isinstance(r, dict) else []
+        if not sts:
+            return []
+        # Build the on/off timeline. The recorder returns transitions
+        # only; the state already-active at window-open is captured by
+        # the first sample (HA includes a synthetic initial change).
+        toggles = sorted(
+            ((x.last_updated, str(getattr(x, "state", "")).strip().lower())
+             for x in sts),
+            key=lambda y: y[0],
+        )
+        pairs: list[tuple[datetime, datetime]] = []
+        on_ts: datetime | None = None
+        for ts, st in toggles:
+            if st == "on":
+                if on_ts is None:
+                    on_ts = ts
+            else:
+                if on_ts is not None:
+                    pairs.append((on_ts, ts))
+                    on_ts = None
+        # Trailing on with no off in window — clamp to `until` so the
+        # segment isn't lost. The integration's idle/stuck watchdog
+        # would have closed it eventually; for recovery, until is fine.
+        if on_ts is not None:
+            pairs.append((on_ts, until))
+        if not pairs:
+            return []
+
+        # Pre-fetch the entire odometer timeline for [since-30min,
+        # until+5min] in ONE query. Per-segment lookups then bisect
+        # the cached list — this is what made the per-segment 30-min
+        # window approach miss samples on sparse cloud-polled data,
+        # where the start anchor for a 19:06 trip lives at 18:20 and
+        # the 30-min lookback didn't reach it.
+        try:
+            rr = await recorder.async_add_executor_job(
+                state_changes_during_period,
+                self.hass,
+                since - timedelta(minutes=30),
+                until + timedelta(minutes=5),
+                self._odometer,
+            )
+        except Exception:  # pragma: no cover — defensive
+            return []
+        odo_states = rr.get(self._odometer, []) if isinstance(rr, dict) else []
+        odo_pairs: list[tuple[datetime, float]] = []
+        for x in odo_states:
+            try:
+                odo_pairs.append((x.last_updated, float(x.state)))
+            except (TypeError, ValueError):
+                continue
+        odo_pairs.sort(key=lambda y: y[0])
+
+        def _odo_le(when: datetime) -> float | None:
+            cand = [v for t, v in odo_pairs if t <= when]
+            return cand[-1] if cand else None
+
+        def _odo_ge(when: datetime) -> float | None:
+            cand = [v for t, v in odo_pairs if t >= when]
+            return cand[0] if cand else None
+
+        segments: list[tuple[datetime, datetime, float, float]] = []
+        for s_ts, e_ts in pairs:
+            # Start anchor = last sample ≤ s_ts (state just before
+            # ignition). End anchor = last sample ≤ e_ts; fall back
+            # to first sample ≥ e_ts if no sample landed before the
+            # off-edge (common when the BYD odo cadence is ~8 min and
+            # the trip was very short).
+            s_odo = _odo_le(s_ts)
+            e_odo = _odo_le(e_ts) or _odo_ge(e_ts)
+            if s_odo is None or e_odo is None:
+                continue
+            if e_odo - s_odo < self._min_distance:
+                # Sub-threshold drive — same gate the live close
+                # path uses. Skip rather than fabricate a phantom row.
+                continue
+            segments.append((s_ts, e_ts, s_odo, e_odo))
+        return segments
+
+    async def _async_insert_recovered_segments(
+        self,
+        segments: list[tuple[datetime, datetime, float, float]],
+        *,
+        recorder,
+    ) -> int:
+        """Per-segment persistence — shared by the v0.5.99 vehicle_on
+        path and the legacy odometer-walker. Skips segments overlapping
+        an existing trip; pulls SoC + location at the boundaries from
+        the recorder; inserts a TripRecord with confidence
+        'reconstructed_recovery'. Returns the count inserted.
+        """
+        try:
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+        except Exception:  # pragma: no cover
+            return 0
         inserted = 0
         for s_ts, e_ts, s_odo, e_odo in segments:
-            # Skip if any existing trip covers this window.
             if await self.storage.async_trip_overlaps(s_ts, e_ts):
                 continue
-            # Pull SoC + location at the endpoints (best-effort).
             soc_start = None
             soc_end = None
+
             async def _scalar(eid: str, when: datetime) -> float | None:
                 try:
                     r = await recorder.async_add_executor_job(
@@ -4975,6 +5137,7 @@ class EvTripLoggerCoordinator:
                     return float(cand[-1])
                 except Exception:
                     return None
+
             if self._battery:
                 soc_start = await _scalar(self._battery, s_ts)
                 soc_end = await _scalar(self._battery, e_ts)
@@ -4989,7 +5152,6 @@ class EvTripLoggerCoordinator:
                     )
                     sts = r.get(self._location, []) if isinstance(r, dict) else []
                     sorted_states = sorted(sts, key=lambda x: x.last_updated)
-                    # Pick nearest <= start for origin, last for end.
                     pre = [x for x in sorted_states if x.last_updated <= s_ts]
                     post = [x for x in sorted_states if x.last_updated <= e_ts]
                     if pre:
@@ -5048,7 +5210,6 @@ class EvTripLoggerCoordinator:
                 trip_id, s_ts.isoformat(), e_ts.isoformat(), distance,
             )
         if inserted:
-            # v0.5.76 — heal cost basis for the freshly-inserted batch.
             await self.storage.async_recompute_trip_costs_from_charges(
                 self._energy_price,
             )
