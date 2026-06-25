@@ -7,7 +7,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from collections.abc import Sequence
-from typing import Any, Callable
+from typing import Any, Callable, Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -476,6 +476,25 @@ _MAX_POWER_TRAPEZOID_DT_H = 20.0 / 60.0
 # tick — at ~5 kWh per trapezoid we're already at "highway cruise full
 # throttle for 10 min" territory, beyond which the sample is junk.
 _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH = 5.0
+
+# v0.5.97 — driver-sensor pre/post window used by `_async_driver_during`
+# and the live-close fallback. Wide enough to catch BT/AA flickers that
+# pair briefly *before* ignition (the trip-191 case: AA went on at
+# 15:20:19 and off at 15:20:39, four minutes before vehicle_on=on at
+# 15:25:09). 5 min covers the typical "driver opens car, AA pre-pairs,
+# user fumbles with the screen, then turns the key" sequence; 2 min on
+# the post side covers AA holding for a moment after the off-edge.
+# Recorder queries widen by these values; the time-overlap picker
+# weights segments against the same widened window so a single brief
+# pre-trip AA toggle is still enough to identify the driver.
+_DRIVER_PRE_WINDOW_MIN: Final = 5.0
+_DRIVER_POST_WINDOW_MIN: Final = 2.0
+# Bound the startup heal sweep so a freshly-installed integration on a
+# car with many existing trips can't spawn hundreds of recorder queries
+# at boot. Recorder retention is typically ~10 days anyway — older
+# trips will return no samples regardless.
+_DRIVER_HEAL_LOOKBACK_DAYS: Final = 10
+_DRIVER_HEAL_MAX_TRIPS: Final = 50
 
 # v0.5.43 — hard caps on the per-trip in-memory accumulators. A trip
 # whose vehicle_on gets stuck "on" for days (the known BYD cloud failure
@@ -992,6 +1011,53 @@ class EvTripLoggerCoordinator:
         except (TypeError, ValueError):
             return None
         return (lat, lon)
+
+    async def _async_heal_missing_drivers(self) -> None:
+        """v0.5.97 — recompute `driver` for recent trips where the
+        live-close logic persisted None.
+
+        Recovery walks the configured driver sensor's recorder history
+        with the same wider pre/post window as the live fallback. Trips
+        whose recorder history is too old (default retention ~10 d) or
+        whose sensor still has no usable value remain NULL — this is
+        idempotent and safe to re-run.
+        """
+        if not self._driver_sensor:
+            return
+        try:
+            todo = await self.storage.async_trips_missing_driver(
+                days=_DRIVER_HEAL_LOOKBACK_DAYS,
+                limit=_DRIVER_HEAL_MAX_TRIPS,
+            )
+        except Exception:  # pragma: no cover — storage call defensive
+            return
+        if not todo:
+            return
+        healed = 0
+        for trip_id, started_at, ended_at in todo:
+            try:
+                driver = await self._async_driver_during(started_at, ended_at)
+            except Exception:  # pragma: no cover — best-effort
+                continue
+            if driver is None:
+                continue
+            try:
+                patched = await self.storage.async_update_trip(
+                    trip_id, {"driver": driver},
+                )
+            except Exception:  # pragma: no cover — best-effort
+                continue
+            if patched is not None:
+                healed += 1
+        if healed:
+            _LOGGER.info(
+                "Driver heal: filled driver on %d trip(s) from recorder "
+                "history (sensor=%s, window=%d d, cap=%d)",
+                healed, self._driver_sensor,
+                _DRIVER_HEAL_LOOKBACK_DAYS, _DRIVER_HEAL_MAX_TRIPS,
+            )
+            self._notify_listeners()
+            self._notify_trip_log_listeners()
 
     async def _async_backfill_gps(self) -> None:
         """One-shot: fill in start_lat/lon and end_lat/lon for trips with
@@ -1587,6 +1653,12 @@ class EvTripLoggerCoordinator:
             self.hass.async_create_task(self._async_backfill_gps())
         else:
             self.hass.async_create_task(self._async_backfill_geocodes())
+
+        # v0.5.97 — re-evaluate recent trips whose driver was never
+        # captured (sensor unknown during the live window). Bounded by
+        # _DRIVER_HEAL_MAX_TRIPS and recorder retention; idempotent.
+        if self._driver_sensor:
+            self.hass.async_create_task(self._async_heal_missing_drivers())
 
         self._unsub_state = async_track_state_change_event(
             self.hass, [self._vehicle_on], self._async_vehicle_on_changed
@@ -4059,9 +4131,13 @@ class EvTripLoggerCoordinator:
             # times + full metrics). v0.5.79 — the stuck-trip watchdog
             # (and similar reconstructed-close callers) override this.
             confidence=confidence_override or "live",
-            # v0.5.43 — last-chance read in case the live tick never
-            # caught the BT connection (very short trips).
-            driver=self._resolve_dominant_driver(active),
+            # v0.5.97 — dominant in-memory driver, falling back to a
+            # recorder lookup with a small pre/post window when the
+            # in-memory capture missed (e.g. AA paired briefly BEFORE
+            # ignition and dropped before the trip opened).
+            driver=await self._async_resolve_trip_driver(
+                active, active.started_at, now,
+            ),
             # v0.5.68 — weather fields stay as their dataclass defaults
             # (None). They survive in the schema for backwards compat;
             # nothing new fills them.
@@ -5524,7 +5600,12 @@ class EvTripLoggerCoordinator:
         return not any(x.state == STATE_OFF for x in sts)
 
     async def _async_driver_during(
-        self, start: datetime, end: datetime
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        pre_window_min: float = _DRIVER_PRE_WINDOW_MIN,
+        post_window_min: float = _DRIVER_POST_WINDOW_MIN,
     ) -> str | None:
         """Resolve who drove during [start, end] from recorder history.
 
@@ -5532,6 +5613,14 @@ class EvTripLoggerCoordinator:
         reconstruct trips after the fact: the live capture in _open_trip
         and the live tick never ran for them. Best-effort: any recorder
         hiccup returns None (same posture as the other recovery lookups).
+
+        v0.5.97 — pre/post window made configurable + the post-window
+        defaults to a few minutes after the trip end. Real-world driver
+        sensors (Android Auto / BT connections) can drop a moment before
+        ignition or fire a moment after the off-edge; the picker
+        weights overlap with [start, end] so extending the recorder
+        query window doesn't bias the result, it just gives the picker
+        more samples to weigh.
         """
         if not self._driver_sensor:
             return None
@@ -5543,8 +5632,8 @@ class EvTripLoggerCoordinator:
             r = await get_instance(self.hass).async_add_executor_job(
                 state_changes_during_period,
                 self.hass,
-                start - timedelta(minutes=10),
-                end,
+                start - timedelta(minutes=pre_window_min),
+                end + timedelta(minutes=post_window_min),
                 self._driver_sensor,
             )
             sts = r.get(self._driver_sensor, []) if isinstance(r, dict) else []
@@ -5553,7 +5642,39 @@ class EvTripLoggerCoordinator:
         timeline = sorted(
             ((x.last_updated, x.state) for x in sts), key=lambda y: y[0]
         )
-        return _pick_driver_for_window(timeline, start, end)
+        # v0.5.97 — also widen the picker window so a sensor that only
+        # toggled BEFORE the trip (BT pre-pair flicker that drops before
+        # ignition) still counts. Without this, the in-window overlap
+        # would be 0 and the picker returns None even though we know
+        # who was about to drive.
+        pick_start = start - timedelta(minutes=pre_window_min)
+        pick_end = end + timedelta(minutes=post_window_min)
+        return _pick_driver_for_window(timeline, pick_start, pick_end)
+
+    async def _async_resolve_trip_driver(
+        self,
+        active: "TripInProgress",
+        start: datetime,
+        end: datetime,
+    ) -> str | None:
+        """v0.5.97 — pick the driver for an in-memory trip with a
+        recorder fallback.
+
+        Order:
+          1. In-memory dominant from live samples (the v0.5.82 logic).
+          2. Recorder query over [start − pre, end + post] using the
+             same time-overlap picker — covers the trip-191 pattern
+             where AA paired briefly before ignition and dropped
+             before the trip opened, so the live capture saw nothing.
+          3. None — the integration MUST persist None rather than
+             fabricate a driver (per-driver stats correctness).
+        """
+        dominant = self._resolve_dominant_driver(active)
+        if dominant is not None:
+            return dominant
+        if not self._driver_sensor:
+            return None
+        return await self._async_driver_during(start, end)
 
     def _read_bool(self, entity_id: str | None) -> bool | None:
         raw = self._read_state(entity_id)

@@ -1,0 +1,104 @@
+# BYD Sealion 7 — Auto pause/resume cloud polling.
+#
+# Why: the BYD cloud integration keeps polling for ~21 min after a
+# trip ends, wasting API calls + draining the 12 V battery. We pause
+# polling once the car is parked AND idle (power≈0, speed=0) AND not
+# charging, then resume the moment the wallbox detects a plug-in or
+# something else outside the BYD cloud signals activity.
+#
+# Paste into HA → Settings → Automations → (3-dot menu) → Edit in YAML
+# Or append to /config/automations.yaml.
+
+- id: byd_auto_disable_polling
+  alias: "BYD — Pause polling when parked & idle"
+  description: >-
+    2 min after vehicle_on flips off — and only if power ≈ 0, speed = 0,
+    and charging = off — flip disable_polling on. Also re-arms whenever
+    disable_polling itself goes off (e.g. someone toggled it manually
+    or the resume automation just fired) so the pause kicks in again
+    after the next idle window.
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # Primary: car turned off and stayed off for 2 min.
+    - platform: state
+      entity_id: binary_sensor.byd_sealion_7_vehicle_on
+      to: "off"
+      for: "00:02:00"
+      id: vehicle_off
+    # Charging just stopped (plug may still be in for hours of
+    # idle-with-cable like the user's overnight pattern).
+    - platform: state
+      entity_id: binary_sensor.byd_sealion_7_charging
+      to: "off"
+      for: "00:02:00"
+      id: charging_off
+    # Re-arm: someone toggled polling back on (manual refresh, or the
+    # resume automation fired and the trigger event passed). Check
+    # again 2 min later.
+    - platform: state
+      entity_id: switch.byd_sealion_7_disable_polling
+      to: "off"
+      for: "00:02:00"
+      id: rearm
+  condition:
+    - condition: state
+      entity_id: binary_sensor.byd_sealion_7_vehicle_on
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.byd_sealion_7_charging
+      state: "off"
+    # Power must be ≈ 0. BYD cloud reports a few W of sensor noise even
+    # parked, so use a 50 W tolerance (0.05 kW). The unit is kW.
+    - condition: template
+      value_template: >-
+        {{ states('sensor.byd_sealion_7_power') | float(0) | abs < 0.05 }}
+    - condition: numeric_state
+      entity_id: sensor.byd_sealion_7_speed
+      below: 0.5
+    # Don't fire if already paused.
+    - condition: state
+      entity_id: switch.byd_sealion_7_disable_polling
+      state: "off"
+  action:
+    - service: switch.turn_on
+      target:
+        entity_id: switch.byd_sealion_7_disable_polling
+    - service: logbook.log
+      data:
+        name: "BYD polling"
+        message: "Paused — parked, power=0, no charging"
+        entity_id: switch.byd_sealion_7_disable_polling
+
+- id: byd_auto_enable_polling
+  alias: "BYD — Resume polling on plug-in or external activity"
+  description: >-
+    The BYD cloud sensors are frozen while polling is paused, so we
+    cannot use any byd_sealion_7_* binary_sensor to wake. The wallbox
+    (LAN-local) IS independent — when current flows, the user plugged
+    in. That's our reliable wake-up signal. The vehicle_on trigger is
+    included as a safety net for cases where BYD's integration still
+    pushes an event via fcm or similar out-of-band path.
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.evse_192_168_0_229_charge_power
+      above: 100   # 100 W is comfortably above wallbox standby noise
+      id: wallbox_active
+    - platform: state
+      entity_id: binary_sensor.byd_sealion_7_vehicle_on
+      to: "on"
+      id: vehicle_on_event
+  condition:
+    - condition: state
+      entity_id: switch.byd_sealion_7_disable_polling
+      state: "on"
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.byd_sealion_7_disable_polling
+    - service: logbook.log
+      data:
+        name: "BYD polling"
+        message: "Resumed — {{ trigger.id }}"
+        entity_id: switch.byd_sealion_7_disable_polling

@@ -230,6 +230,42 @@ def test_pick_driver_state_active_at_window_start() -> None:
     assert _pick_driver_for_window(timeline, _dt(6, 0), _dt(6, 30)) == "Rafa"
 
 
+def test_pick_driver_catches_pre_trip_flicker_with_widened_window() -> None:
+    """v0.5.97 — when AA/BT pairs briefly BEFORE the trip starts and
+    drops before ignition, the in-trip overlap is 0 but the wider
+    pre-window the recorder fallback uses still picks up the identity.
+
+    Trip window: 17:25–17:45 (the trip-191 case). Sensor sequence:
+    Rafa on at 17:20:19, off at 17:20:39 — entirely BEFORE the trip.
+    With the narrow [trip-start, trip-end] window the picker returns
+    None. With the widened [start-5min, end+2min] used by v0.5.97,
+    Rafa wins because his only valid segment overlaps the widened
+    window.
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        _pick_driver_for_window,
+    )
+    from datetime import timedelta as _td
+    trip_start = _dt(17, 25)
+    trip_end = _dt(17, 45)
+    # Single connect-then-disconnect 5 min before trip start.
+    timeline = [
+        (_dt(17, 0), "none"),
+        (_dt(17, 20), "Rafa"),
+        (trip_start - _td(minutes=4, seconds=30), "none"),
+    ]
+    # Narrow window — what the old code did. Misses Rafa entirely.
+    assert _pick_driver_for_window(timeline, trip_start, trip_end) is None
+    # Widened window — what _async_driver_during now passes after
+    # extending the recorder query by 5 / 2 min on each side. Rafa
+    # held the sensor for ~5 min inside the widened window.
+    assert _pick_driver_for_window(
+        timeline,
+        trip_start - _td(minutes=5),
+        trip_end + _td(minutes=2),
+    ) == "Rafa"
+
+
 def test_pick_driver_ignores_none_and_invalid_states() -> None:
     from custom_components.ev_trip_logger.coordinator import _pick_driver_for_window
     timeline = [

@@ -694,6 +694,46 @@ class TripStorage:
             ).fetchall()
         return [int(r[0]) for r in rows]
 
+    async def async_trips_missing_driver(
+        self, *, days: int, limit: int,
+    ) -> list[tuple[int, datetime, datetime]]:
+        """v0.5.97 — IDs + start/end of recent trips with driver=NULL.
+
+        Bounded by `days` (recorder retention is ~10 days, no point
+        looking further back) and `limit` (avoid hundreds of recorder
+        queries at boot on a fresh-install with a big history).
+        Returns rows newest-first so a partial sweep still covers the
+        user's most-recent activity.
+        """
+        return await self._hass.async_add_executor_job(
+            self._trips_missing_driver, days, limit,
+        )
+
+    def _trips_missing_driver(
+        self, days: int, limit: int,
+    ) -> list[tuple[int, datetime, datetime]]:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).isoformat()
+        rows: list[tuple[int, datetime, datetime]] = []
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT id, started_at, ended_at FROM trips "
+                "WHERE driver IS NULL "
+                "  AND started_at IS NOT NULL "
+                "  AND ended_at >= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (cutoff, limit),
+            )
+            for r in cur.fetchall():
+                try:
+                    s = datetime.fromisoformat(r[1])
+                    e = datetime.fromisoformat(r[2])
+                except (TypeError, ValueError):
+                    continue
+                rows.append((int(r[0]), s, e))
+        return rows
+
     def _get_trip_by_id(self, trip_id: int) -> "TripRecord | None":
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
