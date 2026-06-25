@@ -370,6 +370,32 @@ def test_period_start_unknown_raises() -> None:
         period_start(dt_util.now(), "decade")
 
 
+async def test_patch_charge_evse_recomputes_efficiency(
+    storage: TripStorage,
+) -> None:
+    """v0.5.95 — patching evse_energy_kwh writes efficiency.
+
+    The backfill_charge_evse service writes the integrated AC energy
+    onto a historical charge via async_patch_charge. The patch must
+    auto-compute charging_efficiency_pct = kwh / evse × 100 so the
+    dashboard can render both numbers without a separate write.
+    """
+    cid = await storage.async_insert_charge(_charge(kwh=10.0))
+    patched = await storage.async_patch_charge(
+        cid, {"evse_energy_kwh": 11.5},
+    )
+    assert patched is not None
+    assert patched.evse_energy_kwh == pytest.approx(11.5)
+    # kwh 10 / evse 11.5 ≈ 86.96 → rounded to 87.0
+    assert patched.charging_efficiency_pct == pytest.approx(87.0, abs=0.1)
+    # Patching kwh later updates total_cost AND re-derives efficiency
+    # from the stored evse value, so a corrected kwh stays consistent.
+    patched2 = await storage.async_patch_charge(cid, {"kwh": 9.2})
+    assert patched2 is not None
+    assert patched2.kwh == pytest.approx(9.2)
+    assert patched2.charging_efficiency_pct == pytest.approx(80.0, abs=0.1)
+
+
 async def test_extend_last_charge_uses_absolute_soc_end(
     storage: TripStorage,
 ) -> None:

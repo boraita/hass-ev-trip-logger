@@ -1465,6 +1465,21 @@ class TripStorage:
             ).fetchone()
         return _row_to_charge(row) if row else None
 
+    async def async_get_charge_by_id(
+        self, charge_id: int
+    ) -> ChargeRecord | None:
+        return await self._hass.async_add_executor_job(
+            self._get_charge_by_id, charge_id,
+        )
+
+    def _get_charge_by_id(self, charge_id: int) -> ChargeRecord | None:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM charges WHERE id = ?", (charge_id,),
+            ).fetchone()
+        return _row_to_charge(row) if row else None
+
     async def async_update_charge_by_id(
         self,
         charge_id: int,
@@ -1486,9 +1501,13 @@ class TripStorage:
         )
 
     # Columns the user can correct via the extended set_charge service.
+    # v0.5.95 — evse_energy_kwh added so the backfill_charge_evse service
+    # (and manual corrections) can write the AC-side integral. Patching
+    # this field auto-recomputes charging_efficiency_pct = kwh / evse × 100.
     _CHARGE_USER_EDITABLE = frozenset({
         "started_at", "ended_at", "kwh", "soc_start", "soc_end",
         "location", "notes", "is_dcfc", "currency",
+        "evse_energy_kwh",
     })
 
     async def async_patch_charge(
@@ -1538,6 +1557,31 @@ class TripStorage:
                     conn.execute(
                         "UPDATE charges SET total_cost = ? WHERE id = ?",
                         (float(row["kwh"]) * float(row["price_per_kwh"]), charge_id),
+                    )
+            # v0.5.95 — if evse_energy_kwh was patched, recompute the
+            # AC→DC efficiency from current kwh on row. Skip when evse is
+            # zero / missing (efficiency undefined). When kwh was also
+            # patched in the same call the SELECT above already reflects
+            # both new values.
+            if "evse_energy_kwh" in clean or "kwh" in clean:
+                row = conn.execute(
+                    "SELECT kwh, evse_energy_kwh FROM charges WHERE id = ?",
+                    (charge_id,),
+                ).fetchone()
+                if (
+                    row is not None
+                    and row["evse_energy_kwh"] is not None
+                    and float(row["evse_energy_kwh"]) > 0
+                    and row["kwh"] is not None
+                ):
+                    eff = round(
+                        float(row["kwh"]) / float(row["evse_energy_kwh"]) * 100.0,
+                        1,
+                    )
+                    conn.execute(
+                        "UPDATE charges SET charging_efficiency_pct = ? "
+                        "WHERE id = ?",
+                        (eff, charge_id),
                     )
             row = conn.execute(
                 "SELECT * FROM charges WHERE id = ?", (charge_id,),

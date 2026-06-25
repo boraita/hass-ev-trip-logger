@@ -463,3 +463,38 @@ recover_missing_trips:
       name: Entry ID
       selector:
         text:
+
+backfill_charge_evse:
+  name: Backfill EVSE energy on a historical charge
+  description: >-
+    Walk the recorder for the configured (or supplied) EVSE power
+    sensor over the charge's started_at..ended_at, trapezoidal-
+    integrate to kWh, and write `evse_energy_kwh` +
+    `charging_efficiency_pct` onto the row. Use this when the EVSE
+    sensor was added to options AFTER the charge ran (so the in-memory
+    integral was zero at close time). Recorder retention applies —
+    older charges may have no surviving wallbox samples.
+  fields:
+    charge_id:
+      name: Charge ID
+      description: Existing charge row to backfill. Find it in the recent_charges attribute.
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+    evse_power_sensor:
+      name: EVSE power sensor (optional)
+      description: Override the entry's configured CONF_EVSE_POWER_SENSOR. Useful when the entity has been renamed since the charge.
+      selector:
+        entity:
+          domain: sensor
+    mask_by_charge_sensor:
+      name: Mask by charge sensor
+      description: Only integrate samples while CONF_CHARGE_SENSOR was on — excludes idle EVSE standby draw between pulses. Defaults to true.
+      selector:
+        boolean:
+    entry_id:
+      name: Entry ID
+      selector:
+        text:

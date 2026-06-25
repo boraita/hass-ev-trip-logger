@@ -153,5 +153,10 @@ SERVICE_PURGE_TRIPS: Final = "purge_trips"
 SERVICE_SET_TRIP: Final = "set_trip"
 SERVICE_SET_CHARGE: Final = "set_charge"
 SERVICE_RECOVER_MISSING_TRIPS: Final = "recover_missing_trips"
+# v0.5.95 — backfill evse_energy_kwh + charging_efficiency_pct on a
+# historical charge by trapezoidal-integrating the configured EVSE
+# power sensor's recorder history within [started_at, ended_at],
+# optionally masked by the charge_sensor=on windows.
+SERVICE_BACKFILL_CHARGE_EVSE: Final = "backfill_charge_evse"
 
 STORAGE_FILENAME_TEMPLATE: Final = "ev_trip_logger.{entry_id}.db"

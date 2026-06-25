@@ -1,7 +1,7 @@
 """Tests for the trip detection state machine and storage integration."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNKNOWN
@@ -2224,3 +2224,62 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     after = await c.storage.async_get_trip_by_id(trip_id)
     assert after.energy_kwh == pytest.approx(2.60)
     assert after.energy_source == "power_integration"
+
+
+def test_integrate_evse_from_recorder_masks_idle_windows() -> None:
+    """v0.5.95 — backfill integrator masks samples to charge_sensor=on
+    windows and converts W → kW transparently.
+
+    Setup: a 2-hour charge window with the wallbox reporting 7000 W
+    flat. The car says charging=on for the first hour, charging=off
+    for the second. Integrated energy should be ≈ 7 kWh (the masked
+    second hour drops out) — not 14 kWh (no mask) and not 0 (wrong
+    unit handling).
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        EvTripLoggerCoordinator,
+    )
+
+    class _S:
+        def __init__(self, state, when, unit=None):
+            self.state = state
+            self.last_updated = when
+            self.last_changed = when
+            self.attributes = (
+                {"unit_of_measurement": unit} if unit else {}
+            )
+
+    t0 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+    evse = [
+        _S("7000", t0 + timedelta(minutes=m), unit="W")
+        for m in range(0, 121, 10)
+    ]
+    charge_states = [
+        _S("on", t0),
+        _S("off", t0 + timedelta(hours=1)),
+    ]
+    kwh = EvTripLoggerCoordinator._integrate_evse_from_recorder(
+        evse_states=evse,
+        charge_states=charge_states,
+        window_start=t0,
+        window_end=t0 + timedelta(hours=2),
+    )
+    # 7 kW × 1 h, masked to first hour only.
+    assert kwh == pytest.approx(7.0, abs=0.05)
+
+    # Same samples, NO mask → 7 kW × 2 h ≈ 14 kWh.
+    full = EvTripLoggerCoordinator._integrate_evse_from_recorder(
+        evse_states=evse,
+        charge_states=[],
+        window_start=t0,
+        window_end=t0 + timedelta(hours=2),
+    )
+    assert full == pytest.approx(14.0, abs=0.05)
+
+    # Empty → None (don't write a phantom zero onto the charge row).
+    assert EvTripLoggerCoordinator._integrate_evse_from_recorder(
+        evse_states=[],
+        charge_states=charge_states,
+        window_start=t0,
+        window_end=t0 + timedelta(hours=2),
+    ) is None

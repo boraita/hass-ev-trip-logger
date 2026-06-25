@@ -4437,6 +4437,253 @@ class EvTripLoggerCoordinator:
         )
         return updated
 
+    async def async_backfill_charge_evse_service(
+        self,
+        *,
+        charge_id: int,
+        evse_power_sensor: str | None = None,
+        mask_by_charge_sensor: bool = True,
+    ) -> ChargeRecord | None:
+        """Backfill `evse_energy_kwh` on a historical charge from recorder
+        history of the EVSE power sensor.
+
+        Why: when the user adds `CONF_EVSE_POWER_SENSOR` to options
+        AFTER charges have started (or upgrades to a version that
+        introduced EVSE integration), the in-memory integral was zero
+        when those charges closed, so the row's `evse_energy_kwh` ended
+        up NULL even though the wallbox sensor was reporting fine.
+
+        Walks the recorder for the EVSE power sensor between the
+        charge's `started_at` and `ended_at`, integrates trapezoidally,
+        and (when `mask_by_charge_sensor` is True) zeros out windows
+        where `CONF_CHARGE_SENSOR` was not in a charging state — so the
+        idle gaps between pulses don't accumulate the EVSE's tiny
+        standby draw into the total.
+
+        Auto-detects unit (W → /1000) per state-attribute. Patches the
+        row via `async_patch_charge` which recomputes
+        `charging_efficiency_pct = kwh / evse_energy_kwh × 100`.
+        """
+        existing = await self.storage.async_get_charge_by_id(charge_id)
+        if existing is None:
+            _LOGGER.warning(
+                "backfill_charge_evse: charge_id=%s not found", charge_id,
+            )
+            return None
+        if existing.started_at is None or existing.ended_at is None:
+            _LOGGER.warning(
+                "backfill_charge_evse: charge %s missing started_at/ended_at",
+                charge_id,
+            )
+            return None
+        sensor = evse_power_sensor or self._evse_power_sensor
+        if not sensor:
+            _LOGGER.warning(
+                "backfill_charge_evse: no EVSE power sensor configured "
+                "for entry %s and none provided in the service call",
+                self.entry_id,
+            )
+            return None
+        try:
+            from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+        except Exception:  # pragma: no cover — recorder always present
+            _LOGGER.warning(
+                "backfill_charge_evse: recorder integration unavailable",
+            )
+            return None
+        recorder = get_instance(self.hass)
+        ents: list[str] = [sensor]
+        if mask_by_charge_sensor and self._charge_sensor:
+            ents.append(self._charge_sensor)
+        try:
+            result = await recorder.async_add_executor_job(
+                state_changes_during_period,
+                self.hass,
+                existing.started_at,
+                existing.ended_at,
+                ents[0] if len(ents) == 1 else None,
+            )
+            # state_changes_during_period accepts a single entity_id; for
+            # multi-entity, query each separately.
+            if len(ents) > 1:
+                result = {}
+                for e in ents:
+                    sub = await recorder.async_add_executor_job(
+                        state_changes_during_period,
+                        self.hass,
+                        existing.started_at,
+                        existing.ended_at,
+                        e,
+                    )
+                    if isinstance(sub, dict):
+                        result.update(sub)
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.warning(
+                "backfill_charge_evse: recorder query failed for "
+                "charge %s: %s", charge_id, exc,
+            )
+            return None
+        evse_states = result.get(sensor, []) if isinstance(result, dict) else []
+        if not evse_states:
+            _LOGGER.warning(
+                "backfill_charge_evse: no recorder samples for %s in "
+                "[%s, %s] — recorder retention may have purged them",
+                sensor,
+                existing.started_at.isoformat(),
+                existing.ended_at.isoformat(),
+            )
+            return None
+        charge_states = (
+            result.get(self._charge_sensor, [])
+            if (mask_by_charge_sensor and self._charge_sensor)
+            else []
+        )
+        evse_kwh = self._integrate_evse_from_recorder(
+            evse_states=evse_states,
+            charge_states=charge_states,
+            window_start=existing.started_at,
+            window_end=existing.ended_at,
+        )
+        if evse_kwh is None or evse_kwh <= 0:
+            _LOGGER.warning(
+                "backfill_charge_evse: integrated energy was zero for "
+                "charge %s (no power samples > 0 inside charging windows)",
+                charge_id,
+            )
+            return None
+        patched = await self.storage.async_patch_charge(
+            charge_id, {"evse_energy_kwh": round(evse_kwh, 3)},
+        )
+        if patched is None:
+            return None
+        if self.last_charge is not None and self.last_charge.charge_id == charge_id:
+            self.last_charge = patched
+        self.hass.bus.async_fire(
+            EVENT_CHARGE_LOGGED,
+            {"entry_id": self.entry_id, **patched.to_dict()},
+        )
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
+        _LOGGER.info(
+            "backfill_charge_evse: charge %s patched — evse=%.3f kWh, "
+            "eff=%s %%",
+            charge_id, evse_kwh, patched.charging_efficiency_pct,
+        )
+        return patched
+
+    @staticmethod
+    def _integrate_evse_from_recorder(
+        *,
+        evse_states: list,
+        charge_states: list,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> float | None:
+        """Trapezoidal integral of EVSE power across a charge window,
+        masked by charge_sensor on/off intervals when supplied.
+
+        Returns the integrated energy in kWh, or None when no usable
+        samples were found.
+        """
+        def _to_kw(state_obj) -> float | None:
+            try:
+                v = float(state_obj.state)
+            except (TypeError, ValueError):
+                return None
+            unit = (state_obj.attributes or {}).get("unit_of_measurement") or ""
+            if str(unit).strip().lower() in ("w", "watt", "watts"):
+                v = v / 1000.0
+            return max(0.0, v)
+
+        # Build sorted (ts, kw) samples within the window.
+        samples: list[tuple[datetime, float]] = []
+        for s in evse_states:
+            kw = _to_kw(s)
+            if kw is None:
+                continue
+            ts = getattr(s, "last_updated", None) or getattr(
+                s, "last_changed", None,
+            )
+            if ts is None:
+                continue
+            if ts < window_start or ts > window_end:
+                continue
+            samples.append((ts, kw))
+        if len(samples) < 2:
+            return None
+        samples.sort(key=lambda x: x[0])
+
+        # Build charging=on intervals (or [window_start, window_end] when
+        # masking is disabled / no charge sensor states available).
+        def _is_on(s) -> bool:
+            return str(getattr(s, "state", "")).lower() in (
+                "on", "true", "charging",
+            )
+        intervals: list[tuple[datetime, datetime]] = []
+        if charge_states:
+            cs_sorted = sorted(
+                charge_states,
+                key=lambda x: (
+                    getattr(x, "last_updated", None)
+                    or getattr(x, "last_changed", None)
+                ),
+            )
+            # Determine state at window_start by looking at the first
+            # sample: if it's already "on" at >= window_start, treat the
+            # window_start as the opening edge.
+            cur_open: datetime | None = (
+                window_start if _is_on(cs_sorted[0]) else None
+            )
+            for s in cs_sorted:
+                ts = getattr(s, "last_updated", None) or getattr(
+                    s, "last_changed", None,
+                )
+                if ts is None:
+                    continue
+                if _is_on(s) and cur_open is None:
+                    cur_open = ts
+                elif (not _is_on(s)) and cur_open is not None:
+                    intervals.append((cur_open, ts))
+                    cur_open = None
+            if cur_open is not None:
+                intervals.append((cur_open, window_end))
+        else:
+            intervals.append((window_start, window_end))
+
+        if not intervals:
+            return None
+
+        # Trapezoidal integration over the on-intervals only. For each
+        # consecutive sample pair, only count the portion that intersects
+        # an on-interval.
+        max_dt_h = _MAX_POWER_TRAPEZOID_DT_H
+        total_kwh = 0.0
+        for (t0, kw0), (t1, kw1) in zip(samples, samples[1:]):
+            if t1 <= t0:
+                continue
+            dt_full_s = (t1 - t0).total_seconds()
+            if dt_full_s <= 0 or dt_full_s / 3600.0 > max_dt_h:
+                continue
+            # Intersect [t0,t1] with each on-interval and accumulate
+            # area proportional to the intersected slice.
+            for iv_a, iv_b in intervals:
+                a = t0 if t0 > iv_a else iv_a
+                b = t1 if t1 < iv_b else iv_b
+                if b <= a:
+                    continue
+                slice_h = (b - a).total_seconds() / 3600.0
+                # Trapezoid over the slice — use linear interpolation
+                # for the kw at slice endpoints, then average.
+                frac_a = (a - t0).total_seconds() / dt_full_s
+                frac_b = (b - t0).total_seconds() / dt_full_s
+                kwa = kw0 + (kw1 - kw0) * frac_a
+                kwb = kw0 + (kw1 - kw0) * frac_b
+                total_kwh += (kwa + kwb) / 2.0 * slice_h
+        return total_kwh if total_kwh > 0 else None
+
     async def async_delete_last_trip_service(self) -> bool:
         deleted = await self.storage.async_delete_last()
         if deleted:
