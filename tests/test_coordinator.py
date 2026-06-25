@@ -2226,6 +2226,92 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     assert after.energy_source == "power_integration"
 
 
+async def test_orphan_yields_to_recovered_live_trips(hass: HomeAssistant) -> None:
+    """v0.5.98 — when the recorder still has the precise vehicle_on
+    edges of a missed drive, the orphan_odo_only synthetic window
+    must NOT be inserted. The user's trip-193 case: a real 4-min /
+    1-km re-park happened between trip 192 (closed) and trip 193's
+    detection at the next ignition. The pre-v0.5.98 path produced a
+    30-min orphan_odo_only row; recovery has the real timestamps so
+    it inserts a proper live row and the orphan must yield.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    # Pre-seed a closed last_trip so _detect_orphan_gap has something
+    # to anchor against.
+    now = dt_util.now()
+    last = TripRecord(
+        started_at=now - timedelta(hours=2),
+        ended_at=now - timedelta(minutes=45),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+        soc_start=64.0, soc_end=61.0, soc_used_pct=3.0,
+        energy_kwh=2.48, consumption_kwh_100km=41.2,
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    # Force recover_missing_trips_service to claim it inserted 1 row.
+    recovery_calls: list[tuple[datetime, datetime]] = []
+    inserts_before = (await coordinator.storage.async_recent_trips(50))
+
+    async def _fake_recover(*, since, until):
+        recovery_calls.append((since, until))
+        return 1
+
+    coordinator.async_recover_missing_trips_service = _fake_recover  # type: ignore[assignment]
+
+    # Drive the wrapper directly — bypasses _open_trip plumbing so the
+    # test asserts only on the orphan/recovery decision.
+    await coordinator._async_insert_orphan_with_recovery(
+        last, now, 26825.0, 61.0, 1.0,
+    )
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0][0] == last.ended_at
+    inserts_after = (await coordinator.storage.async_recent_trips(50))
+    # No new row beyond `last` — the orphan was suppressed because
+    # recovery claimed to have covered the gap.
+    assert len(inserts_after) == len(inserts_before)
+
+
+async def test_orphan_falls_back_when_recovery_empty(hass: HomeAssistant) -> None:
+    """v0.5.98 — when recovery returns 0 (no recorder evidence of a
+    real drive) the orphan_odo_only insert still fires as the
+    residual catch for true odo-drift / catch-up snapshots.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    last = TripRecord(
+        started_at=now - timedelta(hours=2),
+        ended_at=now - timedelta(minutes=10),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+        soc_start=64.0, soc_end=61.0, soc_used_pct=3.0,
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    async def _empty_recover(*, since, until):
+        return 0
+
+    coordinator.async_recover_missing_trips_service = _empty_recover  # type: ignore[assignment]
+    inserts_before = (await coordinator.storage.async_recent_trips(50))
+
+    await coordinator._async_insert_orphan_with_recovery(
+        last, now, 26825.0, 61.0, 1.0,
+    )
+    inserts_after = (await coordinator.storage.async_recent_trips(50))
+    assert len(inserts_after) == len(inserts_before) + 1
+    new_row = inserts_after[0]
+    assert new_row.confidence == "orphan_odo_only"
+    assert new_row.odometer_end == pytest.approx(26825.0)
+
+
 def test_integrate_evse_from_recorder_masks_idle_windows() -> None:
     """v0.5.95 — backfill integrator masks samples to charge_sensor=on
     windows and converts W → kW transparently.

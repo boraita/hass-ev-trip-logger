@@ -3288,6 +3288,59 @@ class EvTripLoggerCoordinator:
             return None
         return lt, km_gap
 
+    async def _async_insert_orphan_with_recovery(
+        self,
+        last_trip: TripRecord,
+        now: datetime,
+        new_odo: float | None,
+        new_soc: float | None,
+        km_gap: float,
+    ) -> None:
+        """v0.5.98 — try recorder-based recovery before inserting an
+        orphan_odo_only row.
+
+        The orphan path was created for two distinct failure modes:
+          1. Cloud reported odometer growth with no vehicle_on edges
+             we could observe (true silence, recorder is just as
+             blind as the live capture).
+          2. A live trip happened but the live capture missed the
+             vehicle_on transitions (BT race / brief polling pause /
+             integration startup window). Recorder DOES have the
+             evidence — odometer growth + vehicle_on toggles — but
+             the orphan path doesn't look at them and produces a
+             single bogus 30-min window with `orphan_odo_only`
+             confidence.
+
+        Run `async_recover_missing_trips_service` over the silence
+        window first. If it produces ≥1 trip the gap is covered with
+        proper timestamps + SoC + GPS — no orphan needed. Only when
+        recovery finds nothing do we fall back to the orphan row, as
+        a residual catch for true catch-up snapshots.
+        """
+        if last_trip.ended_at is None:
+            return
+        try:
+            recovered = await self.async_recover_missing_trips_service(
+                since=last_trip.ended_at, until=now,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug(
+                "Orphan recovery attempt raised: %s — falling back "
+                "to orphan_odo_only insert", exc,
+            )
+            recovered = 0
+        if recovered > 0:
+            _LOGGER.info(
+                "Orphan replaced by %d recovered live trip(s) — recorder "
+                "had the precise vehicle_on edges, no synthetic window "
+                "needed (km_gap=%.2f)",
+                recovered, km_gap,
+            )
+            return
+        await self._async_insert_orphan_trip(
+            last_trip, now, new_odo, new_soc, km_gap,
+        )
+
     async def _async_insert_orphan_trip(
         self,
         last_trip: TripRecord,
@@ -3526,8 +3579,17 @@ class EvTripLoggerCoordinator:
         )
         if orphan_payload is not None:
             last_trip, km_gap = orphan_payload
+            # v0.5.98 — prefer recorder-based reconstruction over the
+            # orphan_odo_only synthetic window. If the recorder still
+            # has the precise vehicle_on edges + odometer growth from
+            # the missed drive, recover_missing_trips will insert
+            # proper rows with real timestamps; only fall back to the
+            # orphan row when recovery comes up empty (true odo drift
+            # or cloud catch-up without any underlying drive).
             self.hass.async_create_task(
-                self._async_insert_orphan_trip(last_trip, now, odometer, soc, km_gap)
+                self._async_insert_orphan_with_recovery(
+                    last_trip, now, odometer, soc, km_gap,
+                )
             )
         location = self._read_str(self._location) if self._location else None
         temp = self._read_float(self._temp) if self._temp else None
