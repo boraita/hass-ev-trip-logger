@@ -2226,6 +2226,42 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     assert after.energy_source == "power_integration"
 
 
+async def test_orphan_gap_honors_user_min_distance(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.100 — _detect_orphan_gap respects CONF_MIN_TRIP_DISTANCE.
+
+    User sets min=2.0 in options because a 1-km re-park maneuver
+    shouldn't count as a trip. Before v0.5.100 the orphan path used
+    its own hardcoded floor of 0.3 km and would still fire on the
+    1-km gap, producing a phantom orphan_odo_only row. Now the floor
+    is max(0.3, user_min), so the orphan path skips gaps below the
+    user's threshold.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass, **{
+        CONF_MIN_TRIP_DISTANCE: 2.0,
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    base = dt_util.now()
+    last = TripRecord(
+        started_at=base - timedelta(hours=2),
+        ended_at=base - timedelta(minutes=30),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    # 1-km gap (re-park) — below user threshold, must NOT trigger orphan.
+    assert coordinator._detect_orphan_gap(base, 26825.0) is None
+    # 2.5-km gap — above threshold, orphan still detected.
+    payload = coordinator._detect_orphan_gap(base, 26826.5)
+    assert payload is not None
+    assert payload[1] == pytest.approx(2.5)
+
+
 async def test_recover_segments_via_vehicle_on_handles_sparse_odo(
     hass: HomeAssistant,
 ) -> None:

@@ -3269,11 +3269,20 @@ class EvTripLoggerCoordinator:
         Conditions:
           - last_trip exists with ended_at + odometer_end
           - elapsed since prev close ≤ _ORPHAN_MAX_DURATION_S
-          - km_gap ∈ (_ORPHAN_MIN_KM_GAP, _ORPHAN_MAX_KM_GAP]
+          - km_gap ∈ (threshold, _ORPHAN_MAX_KM_GAP] where
+            threshold = max(_ORPHAN_MIN_KM_GAP, self._min_distance)
 
         Anything outside these guards is either pure noise (snap_short_park
         territory) or implausible (odometer glitch) and should not produce
         a synthetic record.
+
+        v0.5.100 — `_ORPHAN_MIN_KM_GAP` (0.3 km, the quantization noise
+        floor) used to be the only lower bound. The user-configured
+        `min_trip_distance_km` was ignored on the orphan path, so
+        re-park maneuvers (1 km on a setting of 2 km) still produced
+        rows. Now the orphan path also respects the user's threshold;
+        the 0.3 floor stays as a noise gate so a setting < 0.3 doesn't
+        re-open the quantization door.
         """
         lt = self.last_trip
         if lt is None or lt.ended_at is None or lt.odometer_end is None:
@@ -3284,7 +3293,8 @@ class EvTripLoggerCoordinator:
         if elapsed_s <= 0 or elapsed_s > _ORPHAN_MAX_DURATION_S:
             return None
         km_gap = float(odometer) - float(lt.odometer_end)
-        if not (_ORPHAN_MIN_KM_GAP < km_gap <= _ORPHAN_MAX_KM_GAP):
+        threshold = max(_ORPHAN_MIN_KM_GAP, float(self._min_distance))
+        if not (threshold < km_gap <= _ORPHAN_MAX_KM_GAP):
             return None
         return lt, km_gap
 
