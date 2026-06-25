@@ -4498,28 +4498,20 @@ class EvTripLoggerCoordinator:
         ents: list[str] = [sensor]
         if mask_by_charge_sensor and self._charge_sensor:
             ents.append(self._charge_sensor)
+        # state_changes_during_period requires a non-None entity_id, so
+        # query each entity separately and merge.
+        result: dict = {}
         try:
-            result = await recorder.async_add_executor_job(
-                state_changes_during_period,
-                self.hass,
-                existing.started_at,
-                existing.ended_at,
-                ents[0] if len(ents) == 1 else None,
-            )
-            # state_changes_during_period accepts a single entity_id; for
-            # multi-entity, query each separately.
-            if len(ents) > 1:
-                result = {}
-                for e in ents:
-                    sub = await recorder.async_add_executor_job(
-                        state_changes_during_period,
-                        self.hass,
-                        existing.started_at,
-                        existing.ended_at,
-                        e,
-                    )
-                    if isinstance(sub, dict):
-                        result.update(sub)
+            for e in ents:
+                sub = await recorder.async_add_executor_job(
+                    state_changes_during_period,
+                    self.hass,
+                    existing.started_at,
+                    existing.ended_at,
+                    e,
+                )
+                if isinstance(sub, dict):
+                    result.update(sub)
         except Exception as exc:  # pragma: no cover — defensive
             _LOGGER.warning(
                 "backfill_charge_evse: recorder query failed for "
