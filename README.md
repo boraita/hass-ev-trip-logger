@@ -86,14 +86,14 @@ This integration solves all of that with explicit state machines, **per-car self
 - **Regen tracking** via negative-power trapezoidal integration. Aggregated to today / week / month / 30d / year / lifetime sensors.
 
 ### Score (per-car calibrated, v0.5.50/52)
-- The 10/10 anchor (the kWh/100 km that maps to a perfect score) is no longer hardcoded to 14.5 (the BYD app curve). It's the P5 of YOUR consumption over trips ≥ 5 km, once 10+ such trips exist.
+- The 10/10 anchor (the kWh/100 km that maps to a perfect score) is no longer hardcoded to a vendor's marketing curve (the original 14.5 came from the BYD app, but Tesla's, Hyundai's, Ford's would all give different defaults). It's the P5 of YOUR consumption over trips ≥ 5 km, once 10+ such trips exist.
 - Clamped to `[14.5, 20.0]` — the calibration can only **raise the bar** (a Tesla needing 18 kWh/100 km for 10/10 is realistic) but never **lower it** (a freak downhill trip at 5 kWh/100 km can't pin the curve unfairly).
 - Live, last-trip and best-ever scores all use the per-car anchor.
 - `score_baseline_kwh_100km` and `score_baseline_trip_count` exposed as attributes of `recent_trips` for dashboards.
 
 ### Battery health & degradation tracking (v0.5.54 / v0.5.57)
 - **`sensor.<device>_battery_soh`** — observed state of health (calibrated capacity / declared × 100). Stays at 100 until 5+ valid charges build the calibration.
-- **`sensor.<device>_expected_battery_soh`** — modelled SoH from your km, age, chemistry, climate and habits. Floor at 70 % (BYD warranty floor).
+- **`sensor.<device>_expected_battery_soh`** — modelled SoH from your km, age, chemistry, climate and habits. Floor at 70 % (most manufacturers' battery warranty floor — BYD, Tesla, Hyundai/Kia, VW all guarantee ≥ 70 % at the warranty horizon).
 - **`sensor.<device>_battery_health_vs_expected`** — enum: `calibrating` / `ahead` (> +2 pp) / `on_track` (±2 pp) / `behind` (< −2 pp).
 - **`capacity_history`** table: every shift ≥ 0.5 kWh in calibrated capacity gets a row. Lets the dashboard plot the degradation curve.
 - Three chemistry profiles supported with constants derived from real research:

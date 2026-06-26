@@ -2843,9 +2843,13 @@ class EvTripLoggerCoordinator:
 
         Sign note: our power sensor is in kW with the standard EV
         convention **+discharge / -charge**. ABRP wants kW with the
-        SAME convention. `build_tlm` historically negated for byd-
-        vehicle's raw cloud reading, so we pre-negate the W value here
-        to cancel that negation and pass through the correct sign.
+        SAME convention. `build_tlm` negates the watts it receives so
+        the round-trip matches ABRP's sign expectation; we pre-negate
+        the W value here to cancel that, regardless of which vendor
+        produced the original sensor. `CONF_POWER_SIGN_INVERTED` is
+        the user-facing knob for sources that report discharge as
+        negative (e.g. some BYD cloud entities); ABRP push picks up
+        the already-corrected power without re-knowing about it.
         """
         if self._abrp is None or not self.abrp_push_enabled:
             return
@@ -5610,8 +5614,10 @@ class EvTripLoggerCoordinator:
         """v0.5.69 — look for `sensor.<prefix>_exterior_temperature`
         (or common synonyms) when the user hasn't configured CONF_TEMP.
 
-        Prefix is derived from `CONF_ODOMETER`: for
-        `sensor.byd_sealion_7_odometer` the prefix is `byd_sealion_7`.
+        Prefix is derived from `CONF_ODOMETER`. Examples:
+          `sensor.my_car_odometer`     → prefix `my_car`
+          `sensor.byd_sealion_7_odometer` → prefix `byd_sealion_7`
+          `sensor.tesla_model3_odometer`  → prefix `tesla_model3`
         Tries `_exterior_temperature`, `_outside_temperature`,
         `_ambient_temperature`. Returns the first entity that exists
         in the HA state machine. The runtime override is in-memory only
@@ -5620,7 +5626,9 @@ class EvTripLoggerCoordinator:
         """
         if not self._odometer or not self._odometer.startswith("sensor."):
             return None
-        # `sensor.byd_sealion_7_odometer` → `byd_sealion_7`
+        # Strip the platform prefix + the `_odometer` suffix to get the
+        # vehicle-specific stem (works for any integration that follows
+        # the `sensor.<vehicle>_<metric>` HA convention).
         prefix = self._odometer[len("sensor."):].rsplit("_", 1)[0]
         for suffix in (
             "_exterior_temperature",

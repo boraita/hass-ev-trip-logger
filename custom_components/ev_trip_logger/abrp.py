@@ -3,8 +3,10 @@
 Optional and credential-gated: only active when the user supplies an ABRP
 generic *user token* (and an *api_key*). Telemetry is pushed off the existing
 coordinator updates — we never start an independent timer that would force
-extra BYD polls (the shared BYD account is sensitive to aggressive polling;
-ABRP gets whatever the coordinator already fetched).
+extra upstream polls. Most cloud-polled EV integrations (BYD's shared account,
+Tesla Fleet, OVMS) have rate limits or shared quotas; piggybacking on the
+coordinator's existing fetches keeps this integration a passive consumer of
+whatever the user's upstream source already produces.
 
 The next-charge target SoC is read from ``/tlm/get_next_charge``, which only
 returns data while an ABRP route is active.
@@ -57,9 +59,14 @@ def build_tlm(
 ) -> dict[str, Any]:
     """Build the ABRP ``tlm`` payload from primitives; ``None`` values dropped.
 
-    Sign note: BYD ``realtime.gl`` is **+charging / -discharging** (watts),
-    whereas ABRP ``power`` is **+discharge / -charge** (kW), so we negate.
-    Verify the sign once against a live drive/charge on first deploy.
+    Sign note: ABRP ``power`` is **+discharge / -charge** (kW). We negate
+    the watts we receive so the caller can pass in the standard EV
+    convention (+charging / -discharging) regardless of vendor — that
+    matches what some cloud sources emit natively (e.g. BYD's
+    ``realtime.gl``). For sensors that report the opposite sign, the
+    user enables ``CONF_POWER_SIGN_INVERTED`` upstream so this function
+    keeps a single negation rule. Verify the sign once against a live
+    drive/charge on first deploy.
     """
     tlm: dict[str, Any] = {"utc": int(time.time())}
     if soc is not None:
