@@ -370,6 +370,56 @@ def test_period_start_unknown_raises() -> None:
         period_start(dt_util.now(), "decade")
 
 
+async def test_charges_aggregates_pairs_kwh_with_evse(
+    storage: TripStorage,
+) -> None:
+    """v0.5.101 — period aggregates expose a paired kwh_with_evse +
+    evse_kwh so dashboards can compute charging efficiency as a
+    proper ratio.
+
+    The dashboard's pre-fix template divided `energy_charged_this_month`
+    (all charges, including ones with NULL evse) by sum(evse_energy_kwh)
+    over only the rows that had EVSE — five charges of 15 kWh each
+    against one EVSE-bearing 16 kWh row produced 75/16 × 100 = 469 %.
+    The fixed aggregate pairs both sides so the ratio is always
+    0-100 %.
+    """
+    now = dt_util.now()
+    # 3 charges WITHOUT evse, 1 WITH.
+    for kwh in (15.0, 15.0, 15.0):
+        await storage.async_insert_charge(_charge(kwh=kwh, ended_at=now))
+    await storage.async_insert_charge(
+        _charge(kwh=16.0, ended_at=now,
+                evse_energy_kwh=18.0, charging_efficiency_pct=88.9),
+    )
+    agg = await storage.async_charges_aggregates_since(
+        now - timedelta(days=30),
+    )
+    # Total kwh includes all 4 charges. Paired sums only the row with
+    # EVSE: 16 kwh / 18 evse × 100 ≈ 88.9 %.
+    assert agg["kwh"] == pytest.approx(61.0)
+    assert agg["kwh_with_evse"] == pytest.approx(16.0)
+    assert agg["evse_kwh"] == pytest.approx(18.0)
+    assert agg["evse_count"] == 1
+    assert agg["charging_efficiency_pct"] == pytest.approx(88.9, abs=0.2)
+
+
+async def test_charges_aggregates_efficiency_none_without_evse(
+    storage: TripStorage,
+) -> None:
+    """When no charge in the period has EVSE data, charging_efficiency_pct
+    is None (state 'unknown' on the sensor) — never 0, which would look
+    like a 100 % loss."""
+    now = dt_util.now()
+    for kwh in (15.0, 15.0):
+        await storage.async_insert_charge(_charge(kwh=kwh, ended_at=now))
+    agg = await storage.async_charges_aggregates_since(
+        now - timedelta(days=30),
+    )
+    assert agg["charging_efficiency_pct"] is None
+    assert agg["evse_count"] == 0
+
+
 async def test_patch_charge_evse_recomputes_efficiency(
     storage: TripStorage,
 ) -> None:

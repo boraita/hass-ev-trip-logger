@@ -2170,7 +2170,14 @@ class TripStorage:
             self._charges_aggregates_since, since
         )
 
-    def _charges_aggregates_since(self, since: datetime) -> dict[str, float | int]:
+    def _charges_aggregates_since(self, since: datetime) -> dict[str, float | int | None]:
+        # v0.5.101 — also pair-sum kwh + evse_energy_kwh over rows that
+        # actually have EVSE data, so the dashboard can compute charging
+        # efficiency as a properly weighted ratio. Previously the
+        # dashboard would divide `energy_charged_this_month` (sum of
+        # ALL charges' kwh) by `sum(evse_energy_kwh)` (sum over the
+        # SUBSET that had EVSE wired) — a 5x-7x mismatch that produced
+        # impossible 700-800 % efficiency numbers.
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -2181,13 +2188,36 @@ class TripStorage:
                     COALESCE(SUM(CASE WHEN is_dcfc = 1 THEN kwh ELSE 0 END), 0) AS dc_kwh,
                     COALESCE(SUM(CASE WHEN is_dcfc = 1 THEN total_cost ELSE 0 END), 0) AS dc_cost,
                     COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN kwh ELSE 0 END), 0) AS ac_kwh,
-                    COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN total_cost ELSE 0 END), 0) AS ac_cost
+                    COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN total_cost ELSE 0 END), 0) AS ac_cost,
+                    COALESCE(SUM(
+                        CASE WHEN evse_energy_kwh IS NOT NULL
+                                  AND evse_energy_kwh > 0
+                             THEN kwh ELSE 0 END
+                    ), 0) AS kwh_with_evse,
+                    COALESCE(SUM(
+                        CASE WHEN evse_energy_kwh IS NOT NULL
+                                  AND evse_energy_kwh > 0
+                             THEN evse_energy_kwh ELSE 0 END
+                    ), 0) AS evse_kwh,
+                    SUM(CASE WHEN evse_energy_kwh IS NOT NULL
+                                  AND evse_energy_kwh > 0
+                             THEN 1 ELSE 0 END
+                    ) AS evse_count
                 FROM charges WHERE ended_at >= ?
                 """,
                 (since.isoformat(),),
             ).fetchone()
-        kwh, cost, count, dc_kwh, dc_cost, ac_kwh, ac_cost = row
+        (kwh, cost, count, dc_kwh, dc_cost, ac_kwh, ac_cost,
+         kwh_with_evse, evse_kwh, evse_count) = row
         avg_price = (cost / kwh) if kwh else 0.0
+        # Efficiency is only meaningful when ≥1 charge in the period had
+        # EVSE data. Below that, return None so the UI shows "unknown"
+        # rather than 0 % (which would read as "100 % losses" — wrong).
+        charging_eff: float | None
+        if evse_count and evse_kwh > 0:
+            charging_eff = round(float(kwh_with_evse) / float(evse_kwh) * 100.0, 1)
+        else:
+            charging_eff = None
         return {
             "kwh": float(kwh),
             "total_cost": float(cost),
@@ -2199,6 +2229,11 @@ class TripStorage:
             "dc_kwh": float(dc_kwh),
             "dc_total_cost": float(dc_cost),
             "avg_dc_price_per_kwh": float(dc_cost / dc_kwh) if dc_kwh else 0.0,
+            # v0.5.101
+            "kwh_with_evse": float(kwh_with_evse),
+            "evse_kwh": float(evse_kwh),
+            "evse_count": int(evse_count or 0),
+            "charging_efficiency_pct": charging_eff,
         }
 
     async def async_consumption_by_temp_bucket(

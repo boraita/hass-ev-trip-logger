@@ -301,6 +301,18 @@ async def async_setup_entry(
             ChargesAggregateSensor(coordinator, period="30d", key="avg_price_per_kwh"),
             ChargesAggregateSensor(coordinator, period="30d", key="avg_ac_price_per_kwh"),
             ChargesAggregateSensor(coordinator, period="30d", key="avg_dc_price_per_kwh"),
+            # v0.5.101 — period-bound charging efficiency. Uses the
+            # paired SUM(kwh)/SUM(evse) over rows with EVSE data, so
+            # the result is always 0-100 %. Replaces the dashboard
+            # template that mixed `energy_charged_this_month`
+            # (all charges) with `sum(evse)` (only EVSE charges) and
+            # produced 700-800 % numbers.
+            ChargesAggregateSensor(
+                coordinator, period="month", key="charging_efficiency_pct",
+            ),
+            ChargesAggregateSensor(
+                coordinator, period="year", key="charging_efficiency_pct",
+            ),
         ]
     )
 
@@ -1881,6 +1893,19 @@ class ChargesAggregateSensor(_BaseTripSensor):
             "precision": 4,
             "slug": "avg_dc_charge_price",
         },
+        # v0.5.101 — kWh-weighted AC→DC efficiency over the period:
+        # SUM(kwh) / SUM(evse_energy_kwh) × 100 across the charges
+        # that actually had EVSE data. State is None when no charge
+        # in the period had EVSE, so the UI reads "unknown" instead
+        # of 0 (which would look like total loss).
+        "charging_efficiency_pct": {
+            "device_class": None,
+            "state_class": SensorStateClass.MEASUREMENT,
+            "unit": PERCENTAGE,
+            "icon": "mdi:battery-charging-high",
+            "precision": 1,
+            "slug": "avg_charging_efficiency",
+        },
     }
 
     _PERIOD_SUFFIX = {
@@ -1907,16 +1932,21 @@ class ChargesAggregateSensor(_BaseTripSensor):
             "avg_ac_price_per_kwh",
             "avg_dc_price_per_kwh",
         )
+        # v0.5.101 — unit precedence: explicit cfg["unit"] (kwh,
+        # percentage, etc) > per-kWh derived (price sensors) > raw
+        # currency (totals) > no unit (counts).
+        if cfg.get("unit"):
+            unit = cfg["unit"]
+        elif cfg.get("per_kwh_unit"):
+            unit = f"{coordinator.currency}/kWh"
+        elif key == "count":
+            unit = None
+        else:
+            unit = coordinator.currency
         self.entity_description = SensorEntityDescription(
             key=slug,
             translation_key=slug,
-            native_unit_of_measurement=(
-                cfg.get("unit")
-                if key == "kwh"
-                else f"{coordinator.currency}/kWh"
-                if cfg.get("per_kwh_unit")
-                else (coordinator.currency if key != "count" else None)
-            ),
+            native_unit_of_measurement=unit,
             device_class=cfg.get("device_class"),
             state_class=cfg.get("state_class"),
             icon=cfg.get("icon"),

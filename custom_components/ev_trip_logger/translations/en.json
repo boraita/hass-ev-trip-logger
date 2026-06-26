@@ -162,6 +162,8 @@
       "current_charge_evse_kwh": { "name": "Current charge EVSE energy" },
       "current_charge_efficiency": { "name": "Current charge efficiency" },
       "avg_charging_efficiency_30d": { "name": "Avg. charging efficiency (30 days)" },
+      "avg_charging_efficiency_this_month": { "name": "Avg. charging efficiency this month" },
+      "avg_charging_efficiency_this_year": { "name": "Avg. charging efficiency this year" },
       "charged_energy_this_month": { "name": "Energy charged this month" },
       "spent_charging_this_month": { "name": "Spent on charging this month" },
       "charges_this_month": { "name": "Charges this month" },

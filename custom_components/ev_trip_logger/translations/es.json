@@ -195,6 +195,8 @@
       "current_charge_evse_kwh": { "name": "Energía entregada por wallbox (carga actual)" },
       "current_charge_efficiency": { "name": "Eficiencia carga AC→DC (actual)" },
       "avg_charging_efficiency_30d": { "name": "Eficiencia carga media (30d)" },
+      "avg_charging_efficiency_this_month": { "name": "Eficiencia de carga media este mes" },
+      "avg_charging_efficiency_this_year": { "name": "Eficiencia de carga media este año" },
       "expected_battery_soh": { "name": "SoH esperado de la batería" },
       "battery_health_vs_expected": {
         "name": "Salud vs esperado",
