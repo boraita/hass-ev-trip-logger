@@ -122,6 +122,8 @@ async def test_aggregates_when_empty(storage: TripStorage) -> None:
         "distance_km": 0.0,
         "energy_kwh": 0.0,
         "regen_kwh": 0.0,
+        "discharge_kwh": 0.0,
+        "regen_ratio": 0.0,
         "cost": 0.0,
         "count": 0,
         "avg_consumption_kwh_100km": 0.0,
@@ -368,6 +370,67 @@ def test_period_start_month_year_30d() -> None:
 def test_period_start_unknown_raises() -> None:
     with pytest.raises(ValueError):
         period_start(dt_util.now(), "decade")
+
+
+async def test_discharge_kwh_round_trip_and_regen_ratio(
+    storage: TripStorage,
+) -> None:
+    """v0.6.0 — discharge_kwh is persisted and the period aggregate
+    derives regen_ratio = sum(regen)/sum(discharge), letting dashboards
+    render 'you got X % back from braking' without bespoke templates.
+    """
+    now = dt_util.now()
+    # Trip with regen 1.0 / discharge 5.0 → ratio 0.20
+    await storage.async_insert(_trip(
+        ended_at=now, energy_kwh=4.0, regen_kwh=1.0, discharge_kwh=5.0,
+    ))
+    # Trip with regen 0.5 / discharge 5.0 → second trip contributes
+    # 5.5/10.0 = 0.55 ratio when summed: regen=1.5, discharge=10.0
+    await storage.async_insert(_trip(
+        ended_at=now, energy_kwh=4.5, regen_kwh=0.5, discharge_kwh=5.0,
+    ))
+    aggs = await storage.async_aggregates_since(now - timedelta(days=1))
+    assert aggs["regen_kwh"] == pytest.approx(1.5)
+    assert aggs["discharge_kwh"] == pytest.approx(10.0)
+    assert aggs["regen_ratio"] == pytest.approx(0.15)
+    # Round-trip: reading the latest trip back picks up discharge_kwh.
+    last = await storage.async_get_last()
+    assert last is not None
+    assert last.discharge_kwh == pytest.approx(5.0)
+
+
+async def test_peak_charge_power_persists_and_aggregates_high_power(
+    storage: TripStorage,
+) -> None:
+    """v0.6.0 — peak_charge_power_kw is persisted on insert AND on
+    extend (max-merge), and the period aggregate flags the >=100 kW
+    cohort separately so the SoH model can score high-stress sessions
+    (Geotab fleet study).
+    """
+    now = dt_util.now()
+    # AC home charge — peak ~7 kW.
+    await storage.async_insert_charge(_charge(
+        kwh=15.0, ended_at=now, peak_charge_power_kw=7.2,
+    ))
+    # DCFC session — peak 150 kW.
+    await storage.async_insert_charge(_charge(
+        kwh=40.0, ended_at=now, peak_charge_power_kw=150.0,
+    ))
+    # Merge an extra pulse onto the most recent charge with a lower
+    # peak (50 kW). The session's peak must STAY at 150 kW — i.e. the
+    # merge does a max, not a replace.
+    merged = await storage.async_extend_last_charge(
+        extra_kwh=2.0,
+        ended_at=now + timedelta(minutes=5),
+        new_peak_power_kw=50.0,
+    )
+    assert merged is not None
+    assert merged.peak_charge_power_kw == pytest.approx(150.0)
+    # Period aggregate: only the DCFC counts toward high_power.
+    agg = await storage.async_charges_aggregates_since(now - timedelta(days=1))
+    assert agg["high_power_kwh"] == pytest.approx(42.0)
+    assert agg["high_power_count"] == 1
+    assert agg["peak_power_max_kw"] == pytest.approx(150.0)
 
 
 async def test_charges_aggregates_pairs_kwh_with_evse(

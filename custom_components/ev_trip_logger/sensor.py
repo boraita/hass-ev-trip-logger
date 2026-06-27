@@ -219,6 +219,16 @@ async def async_setup_entry(
             AggregateSensor(coordinator, period="month", key="regen_kwh"),
             AggregateSensor(coordinator, period="30d", key="regen_kwh"),
             AggregateSensor(coordinator, period="year", key="regen_kwh"),
+            # v0.6.0 — gross discharge as a first-class metric (OVMS
+            # pattern). Pairs with regen_kwh so dashboards can render
+            # "energy out vs energy back" without losing the net number
+            # in `energy_kwh`. Plus a derived regen_ratio so the
+            # dashboard doesn't have to do the division client-side.
+            AggregateSensor(coordinator, period="month", key="discharge_kwh"),
+            AggregateSensor(coordinator, period="30d", key="discharge_kwh"),
+            AggregateSensor(coordinator, period="year", key="discharge_kwh"),
+            AggregateSensor(coordinator, period="month", key="regen_ratio"),
+            AggregateSensor(coordinator, period="30d", key="regen_ratio"),
         ]
     )
 
@@ -286,6 +296,9 @@ async def async_setup_entry(
             # v0.5.90 — AC-side energy + AC→DC efficiency.
             LastChargeSensor(coordinator, key="evse_energy_kwh"),
             LastChargeSensor(coordinator, key="charging_efficiency_pct"),
+            # v0.6.0 — peak charging power per session, drives DCFC
+            # stress accounting.
+            LastChargeSensor(coordinator, key="peak_charge_power_kw"),
             CurrentChargeSensor(coordinator, key="kwh"),
             CurrentChargeSensor(coordinator, key="total_cost"),
             CurrentChargeSensor(coordinator, key="price_per_kwh"),
@@ -544,6 +557,11 @@ class AggregateSensor(_BaseTripSensor):
         "distance_km": (UnitOfLength.KILOMETERS, SensorDeviceClass.DISTANCE, None),
         "energy_kwh": (UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, None),
         "regen_kwh": (UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, "mdi:battery-charging"),
+        # v0.6.0 — gross discharge alongside regen, OVMS-style split.
+        "discharge_kwh": (UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, "mdi:battery-arrow-down"),
+        # v0.6.0 — recovered / discharged ratio, 0-1. MEASUREMENT
+        # state-class (it's a ratio, not a cumulative).
+        "regen_ratio": (PERCENTAGE, None, "mdi:recycle"),
         "cost": (None, SensorDeviceClass.MONETARY, "mdi:currency-eur"),
         "count": (None, None, "mdi:counter"),
         "avg_consumption_kwh_100km": ("kWh/100km", None, "mdi:car-electric"),
@@ -553,6 +571,8 @@ class AggregateSensor(_BaseTripSensor):
         "distance_km": "distance",
         "energy_kwh": "energy",
         "regen_kwh": "regen",
+        "discharge_kwh": "discharge",
+        "regen_ratio": "regen_ratio",
         "cost": "cost",
         "count": "count",
         "avg_consumption_kwh_100km": "avg_consumption",
@@ -565,6 +585,8 @@ class AggregateSensor(_BaseTripSensor):
         "distance_km": SensorStateClass.TOTAL_INCREASING,
         "energy_kwh": SensorStateClass.TOTAL_INCREASING,
         "regen_kwh": SensorStateClass.TOTAL_INCREASING,
+        "discharge_kwh": SensorStateClass.TOTAL_INCREASING,
+        "regen_ratio": SensorStateClass.MEASUREMENT,
         "cost": SensorStateClass.TOTAL,
         # v0.5.43 — TOTAL_INCREASING (was MEASUREMENT): the count climbs
         # within the period and resets at the boundary, which is exactly
@@ -620,7 +642,13 @@ class AggregateSensor(_BaseTripSensor):
     async def _async_refresh(self, *_: Any) -> None:
         since = period_start(dt_util.now(), self._period)
         aggregates = await self._coordinator.storage.async_aggregates_since(since)
-        self._value = aggregates.get(self._key)
+        raw = aggregates.get(self._key)
+        # v0.6.0 — regen_ratio comes back as 0-1 from storage; surface
+        # as a 0-100 percentage to match PERCENTAGE unit + the way the
+        # dashboard wants to render it.
+        if self._key == "regen_ratio" and isinstance(raw, (int, float)):
+            raw = round(float(raw) * 100.0, 1)
+        self._value = raw
         self.async_write_ha_state()
 
     @property
@@ -687,6 +715,11 @@ def _trip_to_attr(
         "max_speed_kmh": _r(trip.max_speed_kmh, 0),
         "max_power_kw": _r(trip.max_power_kw, 1),
         "regen_kwh": _r(trip.regen_kwh, 2),
+        # v0.6.0 — paired with regen_kwh: gross energy out of the
+        # battery before regen recovery. Dashboards can compute
+        # `regen_kwh / discharge_kwh` for a per-trip "energy recovered"
+        # ratio.
+        "discharge_kwh": _r(getattr(trip, "discharge_kwh", None), 2),
         "avg_temp_c": _r(trip.avg_temp_c, 1),
         "cost": _r(trip.cost, 2),
         "currency": trip.currency,
@@ -1725,6 +1758,19 @@ _CHARGE_FIELD_CONFIG: dict[str, dict[str, Any]] = {
         "icon": "mdi:percent",
         "slug_last": "last_charge_efficiency",
         "slug_current": "current_charge_efficiency",
+    },
+    # v0.6.0 — peak instantaneous charging power during the session.
+    # Surfaces the DCFC-stress signal at the row scope; the
+    # >=100 kW threshold drives the SoH model and the lifetime/period
+    # high-power aggregates.
+    "peak_charge_power_kw": {
+        "unit": UnitOfPower.KILO_WATT,
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "icon": "mdi:lightning-bolt",
+        "slug_last": "last_charge_peak_power",
+        "slug_current": "current_charge_peak_power",
     },
 }
 

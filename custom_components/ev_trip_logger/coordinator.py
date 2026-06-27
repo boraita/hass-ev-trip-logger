@@ -605,6 +605,13 @@ class ChargeInProgress:
     evse_energy_kwh: float = 0.0
     _last_evse_kw: float | None = None
     _last_evse_ts: datetime | None = None
+    # v0.6.0 — peak instantaneous |power_kw| seen during this session,
+    # used to flag high-stress (>=100 kW) DCFC events for the SoH
+    # accumulator (Geotab fleet study). Tracks the vehicle's own power
+    # sensor; falls back to the EVSE sensor's max when only the
+    # wallbox is wired. Persisted to charges.peak_charge_power_kw at
+    # close (and propagated through merge updates).
+    peak_charge_power_kw: float = 0.0
 
 
 class EvTripLoggerCoordinator:
@@ -2578,7 +2585,14 @@ class EvTripLoggerCoordinator:
         # Charge tracking: capture live power so current_charge sensors can
         # display "charging at X kW right now". Runs even with no trip open.
         if self.current_charge is not None:
-            self.current_charge.last_power_kw = abs(value)
+            abs_val = abs(value)
+            self.current_charge.last_power_kw = abs_val
+            # v0.6.0 — track per-session peak |P|. Used at close to
+            # flag high-stress DCFC sessions (>=100 kW) for the SoH
+            # accumulator; survives merges via storage.async_extend_
+            # last_charge's peak-max logic.
+            if abs_val > self.current_charge.peak_charge_power_kw:
+                self.current_charge.peak_charge_power_kw = abs_val
             # v0.5.89 — integrate the car-side power into the charge
             # session so we have an independent measurement of kWh
             # delivered to the battery (cross-checks the SoC-derived
@@ -2750,6 +2764,13 @@ class EvTripLoggerCoordinator:
                 self.current_charge.evse_energy_kwh += (a + b) / 2.0 * dt_h
         self.current_charge._last_evse_kw = value
         self.current_charge._last_evse_ts = now
+        # v0.6.0 — EVSE-derived peak power as a fallback when the
+        # vehicle's own power sensor isn't wired (common AC-home
+        # setups). The car-power tracker, when present, already
+        # supplies a tighter `peak_charge_power_kw`; take the max so
+        # whichever source saw the spike wins.
+        if value > self.current_charge.peak_charge_power_kw:
+            self.current_charge.peak_charge_power_kw = value
         self._notify_listeners()
 
     @callback
@@ -3100,9 +3121,17 @@ class EvTripLoggerCoordinator:
                 active.evse_energy_kwh
                 if active.evse_energy_kwh > 0 else None
             )
+            # v0.6.0 — also propagate the new pulse's peak |P| so the
+            # merged row keeps the session's lifetime peak (storage
+            # takes the max of the existing row and this value).
+            new_peak = (
+                active.peak_charge_power_kw
+                if active.peak_charge_power_kw > 0 else None
+            )
             merged = await self.storage.async_extend_last_charge(
                 extra_kwh=kwh, ended_at=now, soc_end=soc_end,
                 extra_evse_kwh=extra_evse,
+                new_peak_power_kw=new_peak,
             )
             if merged is not None:
                 self.last_charge = merged
@@ -3129,6 +3158,10 @@ class EvTripLoggerCoordinator:
             soc_start=active.soc_start,
             evse_energy_kwh=(
                 active.evse_energy_kwh if active.evse_energy_kwh > 0 else None
+            ),
+            peak_charge_power_kw=(
+                active.peak_charge_power_kw
+                if active.peak_charge_power_kw > 0 else None
             ),
         )
 
@@ -4179,6 +4212,18 @@ class EvTripLoggerCoordinator:
             max_power_kw=active.max_power or None,
             max_speed_kmh=active.max_speed_kmh or None,
             regen_kwh=active.regen_kwh or None,
+            # v0.6.0 — gross discharge = ∫P·dt over P>0 segments.
+            # Derived as energy_from_power_kwh (gross throughput) minus
+            # regen_kwh; floor at 0 to guard against sampling artefacts
+            # where regen briefly out-counts discharge in a single tick.
+            # None when no power samples were captured.
+            discharge_kwh=(
+                round(max(
+                    0.0,
+                    active.energy_from_power_kwh - (active.regen_kwh or 0.0),
+                ), 4)
+                if active.energy_from_power_kwh > 0 else None
+            ),
             avg_temp_c=avg_temp,
             origin=active.location_start,
             destination=location_end,
@@ -4367,6 +4412,7 @@ class EvTripLoggerCoordinator:
         soc_start: float | None = None,
         is_dcfc: bool | None = None,
         evse_energy_kwh: float | None = None,
+        peak_charge_power_kw: float | None = None,
     ) -> ChargeRecord:
         """Persist a charge session.
 
@@ -4426,6 +4472,11 @@ class EvTripLoggerCoordinator:
                 else None
             ),
             charging_efficiency_pct=charging_eff_pct,
+            peak_charge_power_kw=(
+                round(peak_charge_power_kw, 2)
+                if peak_charge_power_kw is not None and peak_charge_power_kw > 0
+                else None
+            ),
         )
         charge_id = await self.storage.async_insert_charge(record)
         record.charge_id = charge_id
