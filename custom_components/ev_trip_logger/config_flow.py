@@ -18,6 +18,7 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -56,6 +57,7 @@ from .const import (
     CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
     CONF_VEHICLE_FIRST_REGISTERED,
+    CONF_VEHICLE_MODEL,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CHEMISTRY,
     DEFAULT_BATTERY_CAPACITY,
@@ -90,6 +92,15 @@ def _required_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
         }
     )
+
+
+def _cohort_options() -> list[tuple[str, str]]:
+    """Lazy import so the config_flow module load doesn't pull in
+    coordinator + its dependencies for trivial cases (HA imports
+    config_flow eagerly during entry restore)."""
+    from .coordinator import cohort_baseline_options  # noqa: PLC0415
+
+    return cohort_baseline_options()
 
 
 def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
@@ -254,6 +265,36 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_VEHICLE_FIRST_REGISTERED,
                 DateSelector(),
             ): DateSelector(),
+            # v0.6.3 — optional cohort baseline pick. Lookup keys come
+            # from `cohort_baselines.json`; selecting one anchors the
+            # SoH 100 % point against the observed-new capacity for
+            # that model (Tessie pattern). Leave blank to keep the
+            # nameplate behaviour. Local import keeps the JSON load
+            # off the module-import path of config_flow at HA boot.
+            _optional(
+                CONF_VEHICLE_MODEL,
+                SelectSelector(
+                    SelectSelectorConfig(
+                        options=[
+                            SelectOptionDict(value=k, label=lbl)
+                            for k, lbl in _cohort_options()
+                        ],
+                        mode=SelectSelectorMode.DROPDOWN,
+                        translation_key="vehicle_model_key",
+                        custom_value=True,
+                    )
+                ),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(value=k, label=lbl)
+                        for k, lbl in _cohort_options()
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key="vehicle_model_key",
+                    custom_value=True,
+                )
+            ),
             vol.Required(
                 CONF_MIN_TRIP_DISTANCE,
                 default=defaults.get(CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE),

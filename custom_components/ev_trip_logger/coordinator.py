@@ -1,9 +1,11 @@
 """Trip detection state machine."""
 from __future__ import annotations
 
+import json
 import logging
 import asyncio
 from collections import deque
+from pathlib import Path
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from collections.abc import Sequence
@@ -44,6 +46,7 @@ from .const import (
     DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
+    CONF_VEHICLE_MODEL,
     CONF_CHARGE_SENSOR,
     CONF_CURRENCY,
     CONF_ENERGY_PRICE,
@@ -88,6 +91,41 @@ from .const import (
 from .storage import ChargeRecord, TripRecord, TripStorage
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _load_cohort_baselines() -> dict[str, dict[str, Any]]:
+    """v0.6.3 — read the seeded `cohort_baselines.json` once at import.
+
+    Returns the {model_key: {label, chemistry, nameplate_kwh,
+    cohort_new_kwh, source}} mapping. The "_meta" key is filtered out
+    so callers can iterate values as model rows. Any read/parse error
+    degrades gracefully to an empty dict — the SoH model then keeps
+    its v0.5.x nameplate behaviour, no warnings spamming the log.
+    """
+    path = Path(__file__).with_name("cohort_baselines.json")
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:  # pragma: no cover — defensive
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if not k.startswith("_") and isinstance(v, dict)}
+
+
+_COHORT_BASELINES: Final = _load_cohort_baselines()
+
+
+def cohort_baseline_options() -> list[tuple[str, str]]:
+    """[(model_key, human_label), …] — used by the config flow to
+    populate the optional `CONF_VEHICLE_MODEL` dropdown."""
+    rows = [
+        (k, str(v.get("label") or k))
+        for k, v in _COHORT_BASELINES.items()
+    ]
+    rows.sort(key=lambda kv: kv[1])
+    return rows
+
 
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""}
 
@@ -757,6 +795,25 @@ class EvTripLoggerCoordinator:
         self._battery_capacity_declared = float(
             merged.get(CONF_BATTERY_CAPACITY, DEFAULT_BATTERY_CAPACITY)
         )
+        # v0.6.3 — optional cohort baseline (Tessie pattern). When the
+        # user picks a model from `cohort_baselines.json`, the SoH
+        # 100 % anchor uses that cohort's observed "new" capacity
+        # instead of nameplate. SoC-math still uses
+        # `_battery_capacity_declared` / `_battery_capacity_calibrated`,
+        # because that's what reproduces the dashboard's "X kWh used"
+        # reading; only the SoH percentage's denominator changes.
+        self._vehicle_model_key: str | None = (
+            merged.get(CONF_VEHICLE_MODEL) or None
+        )
+        self._cohort_baseline_kwh: float | None = None
+        self._cohort_baseline_source: str | None = None
+        if self._vehicle_model_key:
+            cohort = _COHORT_BASELINES.get(self._vehicle_model_key)
+            if cohort is not None:
+                new_kwh = cohort.get("cohort_new_kwh")
+                if isinstance(new_kwh, (int, float)) and new_kwh > 0:
+                    self._cohort_baseline_kwh = float(new_kwh)
+                    self._cohort_baseline_source = self._vehicle_model_key
         # v0.5.51 — capacity DERIVED from real charges (kwh / ΔSoC × 100).
         # The declared capacity in config can be optimistic for several
         # reasons: manufacturer-spec "useable kWh" lies on the high side
@@ -882,6 +939,26 @@ class EvTripLoggerCoordinator:
             if self._battery_capacity_calibrated is not None
             else self._battery_capacity_declared
         )
+
+    @property
+    def battery_capacity_baseline(self) -> float:
+        """v0.6.3 — the kWh value that maps to 100 % SoH.
+
+        Precedence: `cohort_new_kwh` from the picked vehicle model (if
+        set + present in the seeded JSON) > nameplate `CONF_BATTERY_CAPACITY`.
+        Independent of `battery_capacity` (which prefers the live
+        calibration); only the SoH denominator routes through here so
+        the dashboard can show a "below cohort mean" reading even when
+        the live calibration is still catching up.
+        """
+        if self._cohort_baseline_kwh is not None and self._cohort_baseline_kwh > 0:
+            return self._cohort_baseline_kwh
+        return self._battery_capacity_declared
+
+    @property
+    def vehicle_model_key(self) -> str | None:
+        """Picked cohort key, or None when the user hasn't selected one."""
+        return self._vehicle_model_key
 
     @property
     def recent_limit(self) -> int:

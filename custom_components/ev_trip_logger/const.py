@@ -112,6 +112,13 @@ DEFAULT_ABRP_PUSH_INTERVAL_S: Final = 30
 ABRP_NEXT_CHARGE_REFRESH_S: Final = 120
 
 CONF_BATTERY_CAPACITY: Final = "battery_capacity_kwh"
+# v0.6.3 — optional pick from `cohort_baselines.json`. When set, the
+# SoH model uses the cohort's observed "new" capacity as its 100 %
+# anchor (Tessie pattern) instead of nameplate. The file ships with a
+# seed list (BYD / Tesla / Hyundai / Kia / VW / Renault / MG /
+# Nissan / Polestar / Škoda); a blank value falls back to nameplate
+# so the integration stays usable for vehicles not in the seed.
+CONF_VEHICLE_MODEL: Final = "vehicle_model_key"
 CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"
 CONF_IDLE_TRIP_TIMEOUT_MIN: Final = "idle_trip_timeout_minutes"
 DEFAULT_IDLE_TRIP_TIMEOUT_MIN: Final = 10

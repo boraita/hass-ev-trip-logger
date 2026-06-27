@@ -2929,11 +2929,16 @@ class BatterySohSensor(_BaseTripSensor):
 
     @property
     def native_value(self) -> float | None:
-        declared = self._coordinator._battery_capacity_declared
+        # v0.6.3 — anchor SoH against the cohort baseline ("observed
+        # new capacity for vehicles like yours") when the user has
+        # picked a model from `cohort_baselines.json`, else nameplate.
+        # Tessie pattern: this reduces the per-user calibration period
+        # before SoH stabilises.
+        baseline = self._coordinator.battery_capacity_baseline
         calibrated = self._coordinator._battery_capacity_calibrated
-        if calibrated is None or declared <= 0:
+        if calibrated is None or baseline <= 0:
             return 100.0  # no data yet → assume healthy
-        return round(calibrated / declared * 100.0, 2)
+        return round(calibrated / baseline * 100.0, 2)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -2980,6 +2985,16 @@ class BatterySohSensor(_BaseTripSensor):
                 age_years = None
         return {
             "declared_capacity_kwh": declared,
+            # v0.6.3 — surface which baseline drives the SoH %, so a
+            # dashboard can show "94 % (vs cohort)" vs "94 % (vs
+            # nameplate)" and the user understands the anchor.
+            "baseline_capacity_kwh": coord.battery_capacity_baseline,
+            "baseline_source": (
+                f"cohort:{coord._cohort_baseline_source}"
+                if coord._cohort_baseline_source
+                else "nameplate"
+            ),
+            "vehicle_model_key": coord.vehicle_model_key,
             "calibrated_capacity_kwh": (
                 round(calibrated, 2) if calibrated is not None else None
             ),

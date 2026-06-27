@@ -2226,6 +2226,75 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     assert after.energy_source == "power_integration"
 
 
+async def test_cohort_baseline_anchors_soh_against_observed_new(
+    hass: HomeAssistant,
+) -> None:
+    """v0.6.3 — when CONF_VEHICLE_MODEL picks a model from the seeded
+    cohort JSON, the SoH 100 % anchor uses that cohort's observed
+    "new" capacity instead of nameplate. Independent of
+    `battery_capacity` (which still routes through nameplate /
+    live-calibration). Tessie pattern: lets the dashboard tell the
+    user "you're at 99 % vs cohort" even when their car's nameplate
+    is optimistic.
+    """
+    from custom_components.ev_trip_logger.const import CONF_VEHICLE_MODEL
+
+    entry = await _setup(hass, **{
+        CONF_BATTERY_CAPACITY: 82.5,  # nameplate
+        CONF_VEHICLE_MODEL: "byd_sealion_7_premium",
+    })
+    coord = hass.data[DOMAIN][entry.entry_id]
+    # Cohort `cohort_new_kwh` for this model is 80.6 (from the shipped
+    # JSON). Picking it shifts the baseline AWAY from nameplate.
+    assert coord.battery_capacity_baseline == pytest.approx(80.6)
+    assert coord.vehicle_model_key == "byd_sealion_7_premium"
+    # Sanity: `battery_capacity` (for SoC math) stays at nameplate
+    # until live-calibration lands. The cohort baseline only routes
+    # through SoH.
+    assert coord.battery_capacity == pytest.approx(82.5)
+
+    # No cohort picked → falls back to nameplate.
+    entry2 = await _setup(hass, **{
+        CONF_BATTERY_CAPACITY: 82.5,
+    })
+    coord2 = hass.data[DOMAIN][entry2.entry_id]
+    assert coord2.battery_capacity_baseline == pytest.approx(82.5)
+    assert coord2.vehicle_model_key is None
+
+    # Unknown key → silently falls back to nameplate (no crash, no
+    # warning spam — keeps the integration usable for vehicles the
+    # seed list doesn't cover yet).
+    entry3 = await _setup(hass, **{
+        CONF_BATTERY_CAPACITY: 82.5,
+        CONF_VEHICLE_MODEL: "made_up_model_xyz",
+    })
+    coord3 = hass.data[DOMAIN][entry3.entry_id]
+    assert coord3.battery_capacity_baseline == pytest.approx(82.5)
+
+
+def test_cohort_baseline_options_returns_seeded_models() -> None:
+    """v0.6.3 — the helper used by the config-flow dropdown returns
+    the same seeded model list every call, sorted by human label.
+    Used as a smoke test: a typo in the JSON or a missing seed key
+    fails loud here before the config-flow renders a broken form.
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        cohort_baseline_options,
+    )
+
+    options = cohort_baseline_options()
+    keys = {k for k, _ in options}
+    # Multi-vendor coverage — never hard-pin to one make.
+    assert "byd_sealion_7_premium" in keys
+    assert "tesla_model_3_lr" in keys
+    assert "hyundai_ioniq_5_lr" in keys
+    assert "vw_id4_pro" in keys
+    # Sorted alphabetically by label (deterministic for diff-friendly
+    # config-flow UI).
+    labels = [lbl for _, lbl in options]
+    assert labels == sorted(labels)
+
+
 async def test_orphan_gap_honors_user_min_distance(
     hass: HomeAssistant,
 ) -> None:
