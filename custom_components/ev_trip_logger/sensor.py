@@ -2042,11 +2042,18 @@ class ChargesAggregateSensor(_BaseTripSensor):
         # v0.5.101 — unit precedence: explicit cfg["unit"] (kwh,
         # percentage, etc) > per-kWh derived (price sensors) > raw
         # currency (totals) > no unit (counts).
+        # v0.6.1 — generalised the count exception. Any key whose
+        # name ends in "_count" is unit-less (and any key with no
+        # device_class + no unit + no per_kwh_unit also is — a
+        # session count or a peak-max integer shouldn't inherit a
+        # currency unit from the cost-sensor fallback).
         if cfg.get("unit"):
             unit = cfg["unit"]
         elif cfg.get("per_kwh_unit"):
             unit = f"{coordinator.currency}/kWh"
-        elif key == "count":
+        elif key == "count" or key.endswith("_count"):
+            unit = None
+        elif cfg.get("device_class") is None:
             unit = None
         else:
             unit = coordinator.currency
