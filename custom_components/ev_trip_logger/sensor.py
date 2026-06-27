@@ -326,6 +326,21 @@ async def async_setup_entry(
             ChargesAggregateSensor(
                 coordinator, period="year", key="charging_efficiency_pct",
             ),
+            # v0.6.1 — grid-side energy (OVMS-style first-class pair).
+            ChargesAggregateSensor(coordinator, period="month", key="evse_kwh"),
+            ChargesAggregateSensor(coordinator, period="year", key="evse_kwh"),
+            ChargesAggregateSensor(coordinator, period="lifetime", key="evse_kwh"),
+            # v0.6.1 — lifetime battery-side accumulator (HA Energy
+            # dashboard contribution; TOTAL_INCREASING + energy
+            # device_class).
+            ChargesAggregateSensor(coordinator, period="lifetime", key="kwh"),
+            # v0.6.1 — DCFC stress signals at period + lifetime scope.
+            ChargesAggregateSensor(coordinator, period="month", key="high_power_kwh"),
+            ChargesAggregateSensor(coordinator, period="year", key="high_power_kwh"),
+            ChargesAggregateSensor(coordinator, period="lifetime", key="high_power_kwh"),
+            ChargesAggregateSensor(coordinator, period="month", key="high_power_count"),
+            ChargesAggregateSensor(coordinator, period="lifetime", key="high_power_count"),
+            ChargesAggregateSensor(coordinator, period="lifetime", key="peak_power_max_kw"),
         ]
     )
 
@@ -1952,6 +1967,48 @@ class ChargesAggregateSensor(_BaseTripSensor):
             "precision": 1,
             "slug": "avg_charging_efficiency",
         },
+        # v0.6.1 — grid-side energy delivered by the EVSE / wallbox
+        # over the period. `kwh` (battery-side) tracks what landed in
+        # the pack; `evse_kwh` tracks what came out of the wall. The
+        # paired exposure mirrors OVMS' v.c.kwh vs v.c.kwh.grid and
+        # lets the HA Energy dashboard track grid consumption (the
+        # battery-side value would under-count by the AC→DC losses).
+        "evse_kwh": {
+            "unit": UnitOfEnergy.KILO_WATT_HOUR,
+            "device_class": SensorDeviceClass.ENERGY,
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "icon": "mdi:transmission-tower-export",
+            "precision": 2,
+            "slug": "grid_energy_charged",
+        },
+        # v0.6.1 — DCFC-stress signals at period scope, sourced from
+        # the v0.6.0 high-power cohort (peak_charge_power_kw >= 100).
+        # `high_power_kwh` totals the kWh delivered in high-stress
+        # sessions; `high_power_count` is just the session count;
+        # `peak_power_max_kw` is informational ("best ever peak").
+        "high_power_kwh": {
+            "unit": UnitOfEnergy.KILO_WATT_HOUR,
+            "device_class": SensorDeviceClass.ENERGY,
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "icon": "mdi:flash-alert",
+            "precision": 2,
+            "slug": "high_power_charged",
+        },
+        "high_power_count": {
+            "device_class": None,
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "icon": "mdi:flash-alert-outline",
+            "precision": 0,
+            "slug": "high_power_sessions",
+        },
+        "peak_power_max_kw": {
+            "unit": UnitOfPower.KILO_WATT,
+            "device_class": SensorDeviceClass.POWER,
+            "state_class": SensorStateClass.MEASUREMENT,
+            "icon": "mdi:lightning-bolt",
+            "precision": 1,
+            "slug": "peak_charge_power_max",
+        },
     }
 
     _PERIOD_SUFFIX = {
@@ -1960,6 +2017,10 @@ class ChargesAggregateSensor(_BaseTripSensor):
         "month": "this_month",
         "year": "this_year",
         "30d": "30d",
+        # v0.6.1 — monotonically-growing accumulator since first-ever
+        # logged row. Pairs with the TOTAL_INCREASING state-class so HA
+        # picks the right LTS aggregation (sum-over-cycles, not mean).
+        "lifetime": "lifetime",
     }
 
     def __init__(

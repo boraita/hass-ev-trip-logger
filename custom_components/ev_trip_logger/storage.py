@@ -3239,4 +3239,11 @@ def period_start(now: datetime, period: str) -> datetime:
         return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     if period == "30d":
         return now - timedelta(days=30)
+    if period == "lifetime":
+        # v0.6.1 — monotonically-growing accumulator anchor. Returning
+        # `datetime.min` lets the existing aggregate queries sum over
+        # every row without a special-case branch. The resulting
+        # sensors are TOTAL_INCREASING and qualify for the HA Energy
+        # dashboard (device_class=energy + total_increasing).
+        return datetime.min.replace(tzinfo=now.tzinfo)
     raise ValueError(f"unknown period {period!r}")

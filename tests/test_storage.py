@@ -467,6 +467,46 @@ async def test_charges_aggregates_pairs_kwh_with_evse(
     assert agg["charging_efficiency_pct"] == pytest.approx(88.9, abs=0.2)
 
 
+async def test_period_start_lifetime_anchors_at_datetime_min(
+    storage: TripStorage,
+) -> None:
+    """v0.6.1 — `period_start(now, 'lifetime')` returns a sentinel
+    early enough that every persisted row falls inside, so a
+    lifetime-period ChargesAggregateSensor sums the entire history
+    without a special-case branch in the query path.
+    """
+    from custom_components.ev_trip_logger.storage import period_start
+
+    now = dt_util.now()
+    sentinel = period_start(now, "lifetime")
+    # 50 years before "now" still has to fall after the sentinel —
+    # otherwise rows older than a couple of years wouldn't be counted
+    # in the lifetime accumulator.
+    very_old = now - timedelta(days=365 * 50)
+    assert sentinel < very_old
+    # Tz-aware (so the SQL `>= ?` comparison against ISO strings
+    # doesn't blow up on a tz-naive sentinel vs tz-aware row).
+    assert sentinel.tzinfo is not None
+
+    # Round-trip: a row inserted with an ancient `ended_at` is summed
+    # by `_charges_aggregates_since(period_start(now, 'lifetime'))`.
+    await storage.async_insert_charge(_charge(
+        kwh=10.0, ended_at=very_old, evse_energy_kwh=11.0,
+        charging_efficiency_pct=90.9,
+    ))
+    await storage.async_insert_charge(_charge(
+        kwh=20.0, ended_at=now, evse_energy_kwh=22.0,
+        charging_efficiency_pct=90.9, peak_charge_power_kw=120.0,
+    ))
+    agg = await storage.async_charges_aggregates_since(sentinel)
+    # Both charges counted.
+    assert agg["kwh"] == pytest.approx(30.0)
+    assert agg["evse_kwh"] == pytest.approx(33.0)
+    # Only the 120 kW one falls in the high-power cohort.
+    assert agg["high_power_kwh"] == pytest.approx(20.0)
+    assert agg["high_power_count"] == 1
+
+
 async def test_charges_aggregates_efficiency_none_without_evse(
     storage: TripStorage,
 ) -> None:
