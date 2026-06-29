@@ -294,6 +294,61 @@ async def test_charges_aggregates_avg_price(storage: TripStorage) -> None:
     assert aggs["avg_price_per_kwh"] == pytest.approx(8.0 / 30.0)
 
 
+def _at(y: int, m: int, d: int, h: int = 10) -> datetime:
+    """A timezone-aware local datetime (matches dt_util.now() used at insert)."""
+    return datetime(y, m, d, h, 0, tzinfo=dt_util.DEFAULT_TIME_ZONE)
+
+
+async def test_weekly_history_buckets_by_iso_monday(storage: TripStorage) -> None:
+    # Mon 2026-06-22 and Sun 2026-06-28 are the same ISO week (2026-W26);
+    # Mon 2026-06-29 starts the next week (2026-W27).
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 22), ended_at=_at(2026, 6, 22, 11),
+              distance_km=100.0, energy_kwh=20.0, cost=3.0)
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 28), ended_at=_at(2026, 6, 28, 11),
+              distance_km=117.0, energy_kwh=22.2, cost=0.1)
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 29), ended_at=_at(2026, 6, 29, 11),
+              distance_km=40.0, energy_kwh=8.0, cost=1.0)
+    )
+
+    weeks = await storage.async_weekly_history(26)
+    assert len(weeks) == 2
+    # Chronological order.
+    w26, w27 = weeks
+    assert w26["week"] == "2026-W26"
+    assert w26["week_start"] == "2026-06-22"
+    assert w26["distance_km"] == pytest.approx(217.0)
+    assert w26["energy_kwh"] == pytest.approx(42.2)
+    assert w26["cost"] == pytest.approx(3.1)
+    assert w26["trips"] == 2
+    # 42.2 / 217.0 * 100 = 19.4
+    assert w26["avg_consumption_kwh_100km"] == pytest.approx(19.4, abs=0.05)
+
+    assert w27["week"] == "2026-W27"
+    assert w27["week_start"] == "2026-06-29"
+    assert w27["trips"] == 1
+
+
+async def test_weekly_history_labels_year_boundary_week(storage: TripStorage) -> None:
+    # Mon 2025-12-29's week contains Thu 2026-01-01 → ISO week 2026-W01.
+    await storage.async_insert(
+        _trip(started_at=_at(2025, 12, 29), ended_at=_at(2025, 12, 29, 11),
+              distance_km=12.0, energy_kwh=2.0, cost=0.3)
+    )
+    weeks = await storage.async_weekly_history(26)
+    assert len(weeks) == 1
+    assert weeks[0]["week"] == "2026-W01"
+    assert weeks[0]["week_start"] == "2025-12-29"
+
+
+async def test_weekly_history_empty_is_empty_list(storage: TripStorage) -> None:
+    assert await storage.async_weekly_history(26) == []
+
+
 @pytest.mark.parametrize(
     "consumption, expected",
     [

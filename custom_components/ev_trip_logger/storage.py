@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -2541,6 +2541,66 @@ class TripStorage:
             }
             for r in rows
         ]))
+
+    async def async_weekly_history(self, weeks: int = 26) -> list[dict[str, Any]]:
+        """Per-week rollup (km, kWh, cost, trips) for the last N ISO weeks."""
+        return await self._hass.async_add_executor_job(
+            self._weekly_history, weeks
+        )
+
+    def _weekly_history(self, weeks: int) -> list[dict[str, Any]]:
+        # Bucket by the *Monday* of each trip's week, matching the
+        # `distance_this_week` aggregate (`_period_start` uses
+        # ``midnight - weekday()``) and the dashboard's Monday-start
+        # grouping. SQLite's ``%W`` is avoided: it is Monday-based but
+        # off-by-one against true ISO weeks at year boundaries. strftime
+        # ``%w`` is Sunday=0, so Monday is ``(%w + 6) % 7`` days back.
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    date(
+                        substr(started_at, 1, 10),
+                        '-' || ((CAST(strftime('%w', substr(started_at, 1, 10))
+                                 AS INTEGER) + 6) % 7) || ' days'
+                    ) AS week_start,
+                    COALESCE(SUM(distance_km), 0) AS distance_km,
+                    COALESCE(SUM(energy_kwh), 0) AS energy_kwh,
+                    COALESCE(SUM(cost), 0) AS cost,
+                    COUNT(*) AS trips
+                FROM trips
+                GROUP BY week_start
+                ORDER BY week_start DESC
+                LIMIT ?
+                """,
+                (weeks,),
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        # Reverse to chronological order for chart consumers.
+        for r in reversed(rows):
+            week_start = r[0]
+            distance_km = round(float(r[1]), 1)
+            energy_kwh = round(float(r[2]), 2)
+            # week_start is a Monday, so isocalendar() yields the correct
+            # ISO year/week even when it straddles a calendar-year change.
+            iso_year, iso_week, _ = date.fromisoformat(week_start).isocalendar()
+            out.append(
+                {
+                    "week": f"{iso_year}-W{iso_week:02d}",
+                    "week_start": week_start,
+                    "distance_km": distance_km,
+                    "energy_kwh": energy_kwh,
+                    "cost": round(float(r[3]), 2),
+                    "trips": int(r[4]),
+                    "avg_consumption_kwh_100km": (
+                        round(energy_kwh / distance_km * 100, 1)
+                        if distance_km > 0
+                        else None
+                    ),
+                }
+            )
+        return out
 
     async def async_daily_km_window(self, days: int = 60) -> list[dict[str, Any]]:
         """Per-day km totals for the last N days (zero-filled)."""

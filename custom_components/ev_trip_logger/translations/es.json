@@ -229,6 +229,7 @@
         }
       },
       "monthly_history": { "name": "Histórico mensual" },
+      "weekly_history": { "name": "Histórico semanal" },
       "daily_km_60d": { "name": "Km diarios 60d" },
       "trip_patterns": { "name": "Patrones de viaje" },
       "tops": { "name": "Tops" },
