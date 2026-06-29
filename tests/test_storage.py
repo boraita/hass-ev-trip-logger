@@ -349,6 +349,54 @@ async def test_weekly_history_empty_is_empty_list(storage: TripStorage) -> None:
     assert await storage.async_weekly_history(26) == []
 
 
+async def test_weekly_history_charged_kwh_buckets_on_ended_at(
+    storage: TripStorage,
+) -> None:
+    # Trips anchor the week rows; charges are bucketed by ended_at into the
+    # same Monday-of-week. A charge closing late Sunday (2026-06-28 23:00)
+    # still lands in week 2026-W26 (Monday 2026-06-22).
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 22), ended_at=_at(2026, 6, 22, 11))
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 29), ended_at=_at(2026, 6, 29, 11))
+    )
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 6, 23), kwh=30.0))
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 6, 28, 23), kwh=5.0))
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 6, 29), kwh=12.0))
+
+    weeks = {w["week"]: w for w in await storage.async_weekly_history(26)}
+    assert weeks["2026-W26"]["charged_kwh"] == pytest.approx(35.0)
+    assert weeks["2026-W27"]["charged_kwh"] == pytest.approx(12.0)
+
+
+async def test_weekly_history_charged_kwh_zero_when_no_charges(
+    storage: TripStorage,
+) -> None:
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 22), ended_at=_at(2026, 6, 22, 11))
+    )
+    weeks = await storage.async_weekly_history(26)
+    assert weeks[0]["charged_kwh"] == 0.0
+
+
+async def test_monthly_history_charged_kwh_buckets_on_ended_at(
+    storage: TripStorage,
+) -> None:
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 5, 15), ended_at=_at(2026, 5, 15, 11))
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 10), ended_at=_at(2026, 6, 10, 11))
+    )
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 5, 20), kwh=40.0))
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 6, 1), kwh=8.0))
+
+    months = {m["month"]: m for m in await storage.async_monthly_history(12)}
+    assert months["2026-05"]["charged_kwh"] == pytest.approx(40.0)
+    assert months["2026-06"]["charged_kwh"] == pytest.approx(8.0)
+
+
 @pytest.mark.parametrize(
     "consumption, expected",
     [
