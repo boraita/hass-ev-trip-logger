@@ -2226,6 +2226,55 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     assert after.energy_source == "power_integration"
 
 
+async def test_recent_avg_tariff_falls_back_to_home_price_when_no_charges(
+    hass: HomeAssistant,
+) -> None:
+    """v0.6.4 — `recent_avg_tariff_per_kwh` returns the configured
+    home tariff when the storage aggregate has no recent charges
+    (empty cache → fallback). Prevents the dashboard `cost_at_avg_
+    tariff` from rendering 0 € on a fresh install just because no
+    charges are logged yet.
+    """
+    from custom_components.ev_trip_logger.const import CONF_ENERGY_PRICE
+
+    entry = await _setup(hass, **{CONF_ENERGY_PRICE: 0.07})
+    coord = hass.data[DOMAIN][entry.entry_id]
+    # No charges in storage → refresh sets cache to None → property
+    # falls back to home tariff.
+    await coord._async_refresh_avg_tariff_cache()
+    assert coord._avg_tariff_cache_per_kwh is None
+    assert coord.recent_avg_tariff_per_kwh == pytest.approx(0.07)
+
+
+async def test_recent_avg_tariff_uses_weighted_avg_over_recent_charges(
+    hass: HomeAssistant,
+) -> None:
+    """v0.6.4 — when recent charges exist, the cache holds the
+    kWh-weighted average. Verifies that the FIFO "free charge" case
+    that triggered this feature (charge 22 at €0.00 mixed with home
+    charges at €0.07) returns a sensible blended number, not zero.
+    """
+    from custom_components.ev_trip_logger.const import CONF_ENERGY_PRICE
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_ENERGY_PRICE: 0.07})
+    coord = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    # Two charges: 10 kWh @ 0.07 + 5 kWh @ 0.00 → weighted avg
+    # = 0.70 / 15 = 0.0467 €/kWh.
+    await coord.storage.async_insert_charge(ChargeRecord(
+        ended_at=now - timedelta(days=2),
+        kwh=10.0, price_per_kwh=0.07, total_cost=0.70, currency="EUR",
+    ))
+    await coord.storage.async_insert_charge(ChargeRecord(
+        ended_at=now - timedelta(days=1),
+        kwh=5.0, price_per_kwh=0.00, total_cost=0.00, currency="EUR",
+    ))
+    await coord._async_refresh_avg_tariff_cache()
+    assert coord._avg_tariff_cache_per_kwh == pytest.approx(0.0467, abs=0.001)
+    assert coord.recent_avg_tariff_per_kwh == pytest.approx(0.0467, abs=0.001)
+
+
 async def test_cohort_baseline_anchors_soh_against_observed_new(
     hass: HomeAssistant,
 ) -> None:

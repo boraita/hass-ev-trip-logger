@@ -75,6 +75,17 @@ _TRIP_FIELDS_EXTRA_LAST: dict[str, dict[str, Any]] = {
         "precision": 2,
         "slug": "cost",
     },
+    # v0.6.4 — `kwh × recent_avg_tariff_per_kwh`. Companion to `cost`
+    # that is always monotonic with kWh (the FIFO `cost` reads weirdly
+    # when a trip eats a free / off-peak inventory slice). The
+    # underlying value is computed by LastTripExtraSensor against the
+    # coordinator's cached avg tariff; precision matches `cost`.
+    "cost_at_avg_tariff": {
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": None,
+        "precision": 2,
+        "slug": "cost_at_avg_tariff",
+    },
     "score": {
         "icon": "mdi:speedometer",
         "state_class": SensorStateClass.MEASUREMENT,
@@ -509,6 +520,17 @@ class LastTripExtraSensor(_BaseTripSensor):
             return trip.score_with_baseline(
                 self._coordinator.score_baseline_kwh_100km
             )
+        if self._key == "cost_at_avg_tariff":
+            # v0.6.4 — computed (not persisted): kWh × the trailing-30d
+            # weighted avg €/kWh (falls back to home tariff via the
+            # `recent_avg_tariff_per_kwh` property when no cache yet).
+            if trip.energy_kwh is None or trip.energy_kwh <= 0:
+                return None
+            return round(
+                trip.energy_kwh
+                * self._coordinator.recent_avg_tariff_per_kwh,
+                2,
+            )
         return getattr(trip, self._key, None)
 
 
@@ -562,6 +584,14 @@ class CurrentTripExtraSensor(_BaseTripSensor):
                     return round(last.score, 1)
                 return None
             return self._IDLE_DEFAULTS.get(self._key)
+        if self._key == "cost_at_avg_tariff":
+            # v0.6.4 — kWh-projected cost at the recent avg tariff.
+            energy = snapshot.get("energy_kwh")
+            if energy is None or energy <= 0:
+                return 0.0
+            return round(
+                energy * self._coordinator.recent_avg_tariff_per_kwh, 2,
+            )
         return snapshot.get(self._key)
 
 
@@ -695,7 +725,10 @@ def _humanize_location(
 
 
 def _trip_to_attr(
-    trip: Any, *, score_baseline: float = 14.5
+    trip: Any,
+    *,
+    score_baseline: float = 14.5,
+    avg_tariff_per_kwh: float | None = None,
 ) -> dict[str, Any]:
     """Serialise a TripRecord for sensor attributes.
 
@@ -708,6 +741,16 @@ def _trip_to_attr(
     `coordinator.score_baseline_kwh_100km` for the per-car-calibrated
     value; falls back to the historical 14.5 default to keep this
     function callable without a coordinator (e.g. tests).
+
+    v0.6.4 — `avg_tariff_per_kwh` is the weighted-avg €/kWh across the
+    user's recent charges (typically `coordinator.recent_avg_tariff_per_kwh`,
+    fallback to the home tariff). Used to compute a companion
+    `cost_at_avg_tariff` value alongside the FIFO-correct `cost`: the
+    FIFO number reflects which inventory slice the trip ate (so it's
+    very low when the trip happened to consume a free / off-peak
+    slice) and is mathematically honest, while `cost_at_avg_tariff`
+    is always monotonic with kWh — useful for side-by-side trip
+    comparisons. Dashboards pick whichever fits the card.
     """
     start_addr = getattr(trip, "start_address", None)
     end_addr = getattr(trip, "end_address", None)
@@ -737,6 +780,22 @@ def _trip_to_attr(
         "discharge_kwh": _r(getattr(trip, "discharge_kwh", None), 2),
         "avg_temp_c": _r(trip.avg_temp_c, 1),
         "cost": _r(trip.cost, 2),
+        # v0.6.4 — companion to `cost` that's always monotonic with
+        # kWh. Computed as kwh × the trailing-30d weighted-avg €/kWh
+        # (or home tariff when no recent charges exist). Useful when
+        # the FIFO `cost` shows counter-intuitive jumps because a
+        # trip ate a free / off-peak inventory slice.
+        "cost_at_avg_tariff": (
+            _r(trip.energy_kwh * avg_tariff_per_kwh, 2)
+            if (
+                trip.energy_kwh is not None
+                and trip.energy_kwh > 0
+                and avg_tariff_per_kwh is not None
+                and avg_tariff_per_kwh > 0
+            )
+            else None
+        ),
+        "avg_tariff_per_kwh": _r(avg_tariff_per_kwh, 4),
         "currency": trip.currency,
         "score": _r(trip.score_with_baseline(score_baseline), 1),
         # v0.5.19 — origin/destination now show the geocoded address
@@ -1201,8 +1260,16 @@ class RecentTripsSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         baseline = self._coordinator.score_baseline_kwh_100km
+        avg_tariff = self._coordinator.recent_avg_tariff_per_kwh
         return {
-            "trips": [_trip_to_attr(t, score_baseline=baseline) for t in self._trips],
+            "trips": [
+                _trip_to_attr(
+                    t,
+                    score_baseline=baseline,
+                    avg_tariff_per_kwh=avg_tariff,
+                )
+                for t in self._trips
+            ],
             # v0.5.50 — expose the active calibration so dashboards can
             # show a "calibrated for THIS car" caption next to the score.
             "score_baseline_kwh_100km": round(baseline, 2),

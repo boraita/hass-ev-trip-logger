@@ -88,7 +88,7 @@ from .const import (
     EVENT_TRIP_ENDED,
     EVENT_TRIP_STARTED,
 )
-from .storage import ChargeRecord, TripRecord, TripStorage
+from .storage import ChargeRecord, TripRecord, TripStorage, period_start
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -292,6 +292,11 @@ _VEHICLE_OFF_GRACE_S = 180.0
 _STUCK_TRIP_NO_MOVEMENT_MIN = 60.0
 _STUCK_TRIP_MAX_AGE_H = 4.0
 _STUCK_TRIP_TIMER_INTERVAL = timedelta(minutes=5)
+# v0.6.4 — how often the trailing-30d weighted-avg tariff cache is
+# refreshed. Trips render `cost_at_avg_tariff` from this cache (sync
+# attribute reader, can't await), so a 10-min cadence keeps it
+# fresh-enough without hammering storage.
+_AVG_TARIFF_REFRESH: Final = timedelta(minutes=10)
 # v0.5.53 — telemetry silence watchdog. If no odometer/battery sample
 # arrives for this long while a trip is "open", we assume the upstream
 # polling has died and the car was actually parked. Close retroactively
@@ -824,6 +829,12 @@ class EvTripLoggerCoordinator:
         # property below prefers it.
         self._battery_capacity_calibrated: float | None = None
         self._battery_capacity_calibration_n: int = 0
+        # v0.6.4 — kWh-weighted avg €/kWh over the trailing 30d.
+        # Cached so `_trip_to_attr` (a sync-context attribute builder)
+        # can compute `cost_at_avg_tariff` without an async storage
+        # call per render. Refreshed periodically by
+        # `_async_refresh_avg_tariff_cache`.
+        self._avg_tariff_cache_per_kwh: float | None = None
         self._dcfc_threshold_kw = float(
             merged.get(CONF_DCFC_THRESHOLD_KW, DEFAULT_DCFC_THRESHOLD_KW)
         )
@@ -866,6 +877,8 @@ class EvTripLoggerCoordinator:
         # v0.5.79 — periodic stuck-trip watchdog (always-on; runs even
         # when no live tick is active).
         self._unsub_stuck_watchdog: CALLBACK_TYPE | None = None
+        # v0.6.4 — periodic refresh of `_avg_tariff_cache_per_kwh`.
+        self._unsub_avg_tariff: CALLBACK_TYPE | None = None
         # Pending synthetic-trip finalize timer + baseline (start_t, start_odo,
         # start_soc) of the in-progress synth trip being coalesced. When the
         # underlying integration (e.g. BYD cloud) reports odo updates in many
@@ -1095,6 +1108,28 @@ class EvTripLoggerCoordinator:
         except (TypeError, ValueError):
             return None
         return (lat, lon)
+
+    async def _async_refresh_avg_tariff_cache(self, *_: Any) -> None:
+        """v0.6.4 — refresh `_avg_tariff_cache_per_kwh` from the
+        trailing-30d charge aggregates. Best-effort: any storage
+        error keeps the previous cached value (falling back to
+        `_energy_price` via the `recent_avg_tariff_per_kwh` property
+        if cache is still None). Called periodically and after every
+        trip-log notification (a new charge can move the avg).
+        """
+        try:
+            since = period_start(dt_util.now(), "30d")
+            agg = await self.storage.async_charges_aggregates_since(since)
+        except Exception:  # pragma: no cover — defensive
+            return
+        avg = agg.get("avg_price_per_kwh")
+        # Storage returns 0.0 when no charges in the window — keep
+        # the cache at None in that case so the property falls back
+        # to the home tariff instead of pretending charges were free.
+        if isinstance(avg, (int, float)) and avg > 0:
+            self._avg_tariff_cache_per_kwh = float(avg)
+        else:
+            self._avg_tariff_cache_per_kwh = None
 
     async def _async_heal_missing_drivers(self) -> None:
         """v0.5.97 — recompute `driver` for recent trips where the
@@ -1326,6 +1361,26 @@ class EvTripLoggerCoordinator:
             was logged (typical at fresh install) or when the
             inventory queue runs dry mid-trip.
         """
+        return float(self._energy_price)
+
+    @property
+    def recent_avg_tariff_per_kwh(self) -> float:
+        """v0.6.4 — kWh-weighted average price paid across recent
+        charges, fallback to the home tariff (`_energy_price`) when
+        nothing is cached or the average is zero.
+
+        Powers the dashboard-friendly `cost_at_avg_tariff` attribute
+        on trips. The default `cost` stays FIFO-correct (reflects
+        which inventory slice the trip actually ate); this property
+        gives a second view that is always monotonic with kWh so
+        side-by-side comparisons make sense.
+
+        Refreshed by `_async_refresh_avg_tariff_cache`, which runs
+        every _AVG_TARIFF_REFRESH and on every trip-log notification.
+        """
+        cached = self._avg_tariff_cache_per_kwh
+        if cached is not None and cached > 0:
+            return cached
         return float(self._energy_price)
 
     @property
@@ -1783,6 +1838,15 @@ class EvTripLoggerCoordinator:
             self.hass, self._async_check_stuck_trip, _STUCK_TRIP_TIMER_INTERVAL
         )
 
+        # v0.6.4 — keep the trailing-30d avg-tariff cache fresh so the
+        # `cost_at_avg_tariff` attribute on trips is current.
+        self._unsub_avg_tariff = async_track_time_interval(
+            self.hass,
+            self._async_refresh_avg_tariff_cache,
+            _AVG_TARIFF_REFRESH,
+        )
+        self.hass.async_create_task(self._async_refresh_avg_tariff_cache())
+
         if self.hass.state == CoreState.running:
             self._maybe_resume_trip()
             self._maybe_resume_charge()
@@ -1883,6 +1947,7 @@ class EvTripLoggerCoordinator:
             self._unsub_synth_finalize,
             self._unsub_location,
             self._unsub_stuck_watchdog,
+            getattr(self, "_unsub_avg_tariff", None),
         ):
             if unsub:
                 unsub()
@@ -1893,6 +1958,7 @@ class EvTripLoggerCoordinator:
         self._unsub_synth_finalize = None
         self._unsub_location = None
         self._unsub_stuck_watchdog = None
+        self._unsub_avg_tariff = None
         self._synth_baseline = None
         # v0.5.49 — make sure a deferred live-open retry doesn't fire
         # after async_stop (would touch a stopped coordinator).

@@ -129,6 +129,8 @@
       "last_avg_temperature": { "name": "Temperatura media del último viaje" },
       "last_max_power": { "name": "Potencia máxima del último viaje" },
       "last_trip_cost": { "name": "Coste del último viaje" },
+      "last_trip_cost_at_avg_tariff": { "name": "Coste del último viaje (a tarifa media)" },
+      "current_trip_cost_at_avg_tariff": { "name": "Coste del viaje actual (a tarifa media)" },
       "last_trip_score": { "name": "Score del último viaje" },
       "current_trip_cost": { "name": "Coste del viaje actual" },
       "current_trip_score": { "name": "Score del viaje actual" },
