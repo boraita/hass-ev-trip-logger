@@ -181,7 +181,14 @@ CREATE TABLE IF NOT EXISTS charges (
     -- (https://www.geotab.com/blog/ev-battery-health/) reports
     -- ~3.0 %/yr degradation for heavy DCFC users (>100 kW peaks)
     -- vs ~1.5 %/yr for AC-only, the largest operational stressor.
-    peak_charge_power_kw REAL
+    peak_charge_power_kw REAL,
+    -- v0.6.5: ambient temperature at charge close (read from
+    -- CONF_TEMP if wired). Feeds the SoH sample-gate: charges at
+    -- extreme temperatures (<5 °C or >35 °C) produce noisier
+    -- ΔSoC↔ΔkWh samples (BMS reserves a bigger buffer when cold,
+    -- fast-charging derates when hot) so they're excluded from the
+    -- capacity median. NULL when no temperature sensor is wired.
+    temperature_c REAL
 );
 CREATE INDEX IF NOT EXISTS idx_charges_ended_at ON charges(ended_at);
 
@@ -361,6 +368,9 @@ class ChargeRecord:
     # high-stress (Geotab fleet study). None when no power signal
     # was available during the session.
     peak_charge_power_kw: float | None = None
+    # v0.6.5: ambient temperature at close, drives the SoH sample-gate.
+    # None when no exterior-temp sensor is wired.
+    temperature_c: float | None = None
     charge_id: int | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -556,6 +566,9 @@ class TripStorage:
         # v0.6.0: peak charge power (drives DCFC-stress accounting).
         if "peak_charge_power_kw" not in charge_cols:
             conn.execute("ALTER TABLE charges ADD COLUMN peak_charge_power_kw REAL")
+        # v0.6.5: ambient temperature at charge close (SoH sample gate).
+        if "temperature_c" not in charge_cols:
+            conn.execute("ALTER TABLE charges ADD COLUMN temperature_c REAL")
         # v0.5.0: trip_positions table for route-map drilldown.
         conn.execute(
             """
@@ -1283,30 +1296,54 @@ class TripStorage:
         min_delta_pct: float = 30.0,
         min_charges: int = 5,
         window: int = 30,
-    ) -> tuple[float | None, int]:
+        min_kwh: float = 5.0,
+        temp_min_c: float | None = 5.0,
+        temp_max_c: float | None = 35.0,
+    ) -> tuple[float | None, int, dict[str, int]]:
         """v0.5.51 — derive effective pack capacity from real charges.
 
-        Returns `(median_kwh, n)`. Each eligible charge yields a sample
-        `kwh / (soc_end - soc_start) × 100`. Eligibility:
+        Returns `(median_kwh, n_used, reject_counts)`. Each eligible
+        charge yields a sample `kwh / (soc_end - soc_start) × 100`.
+
+        Gates:
           * `soc_start`, `soc_end`, `kwh` all populated
           * `(soc_end - soc_start) >= min_delta_pct` — keeps SoC
             quantization noise (±1 %) from dominating
-          * `kwh > 0`
+          * `kwh >= min_kwh` — Tessie threshold (>5 kWh by default);
+            BMS-derived measurements jitter wildly on tiny top-ups.
+          * `temperature_c` in `[temp_min_c, temp_max_c]` when present
+            — packs reserve a bigger buffer at <5 °C and derate at
+            >35 °C, both noise sources for capacity samples. Rows
+            without a temperature reading bypass the gate (we don't
+            penalise users without an exterior-temp sensor wired).
+
         Aggregates the median of the last `window` eligible charges
         (median is more robust than mean when one charge had a partially
-        depleted state-of-charge reading). Returns `(None, n)` when n <
-        min_charges and the caller should keep the declared capacity.
+        depleted state-of-charge reading). Returns `(None, n_used, …)`
+        when n_used < min_charges and the caller should keep the
+        declared capacity. `reject_counts` exposes per-gate drop
+        reasons for the SoH sensor's `extra_state_attributes` so the
+        UI can show "9 charges considered, 4 used, 5 rejected (3 too
+        small, 2 cold)".
         """
         return await self._hass.async_add_executor_job(
-            self._effective_capacity_kwh, min_delta_pct, min_charges, window
+            self._effective_capacity_kwh,
+            min_delta_pct, min_charges, window,
+            min_kwh, temp_min_c, temp_max_c,
         )
 
     def _effective_capacity_kwh(
-        self, min_delta_pct: float, min_charges: int, window: int
-    ) -> tuple[float | None, int]:
+        self,
+        min_delta_pct: float,
+        min_charges: int,
+        window: int,
+        min_kwh: float,
+        temp_min_c: float | None,
+        temp_max_c: float | None,
+    ) -> tuple[float | None, int, dict[str, int]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT kwh, soc_start, soc_end FROM charges "
+                "SELECT kwh, soc_start, soc_end, temperature_c FROM charges "
                 "WHERE kwh IS NOT NULL AND kwh > 0 "
                 "  AND soc_start IS NOT NULL AND soc_end IS NOT NULL "
                 "  AND (soc_end - soc_start) >= ? "
@@ -1314,24 +1351,49 @@ class TripStorage:
                 (min_delta_pct, window),
             ).fetchall()
         samples: list[float] = []
-        for kwh, s0, s1 in rows:
+        rejects = {
+            "kwh_too_small": 0,
+            "temp_cold": 0,
+            "temp_hot": 0,
+            "bad_soc_delta": 0,
+        }
+        for kwh, s0, s1, temp in rows:
             try:
+                kwh_f = float(kwh)
                 delta = float(s1) - float(s0)
-                if delta <= 0:
-                    continue
-                samples.append(float(kwh) / delta * 100.0)
             except (TypeError, ValueError):
                 continue
+            if delta <= 0:
+                rejects["bad_soc_delta"] += 1
+                continue
+            # v0.6.5 — Tessie threshold: tiny top-ups are noise.
+            if kwh_f < min_kwh:
+                rejects["kwh_too_small"] += 1
+                continue
+            # v0.6.5 — temperature window. Rows without a reading
+            # bypass the gate (treat as "unknown, assume normal").
+            if temp is not None:
+                try:
+                    t_f = float(temp)
+                    if temp_min_c is not None and t_f < temp_min_c:
+                        rejects["temp_cold"] += 1
+                        continue
+                    if temp_max_c is not None and t_f > temp_max_c:
+                        rejects["temp_hot"] += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            samples.append(kwh_f / delta * 100.0)
         n = len(samples)
         if n < min_charges:
-            return (None, n)
+            return (None, n, rejects)
         samples.sort()
         mid = n // 2
         median = (
             samples[mid] if n % 2 == 1
             else (samples[mid - 1] + samples[mid]) / 2.0
         )
-        return (median, n)
+        return (median, n, rejects)
 
     async def async_avg_charging_efficiency_pct(
         self,
@@ -1517,8 +1579,8 @@ class TripStorage:
                     started_at, ended_at, kwh, price_per_kwh, total_cost,
                     currency, soc_start, soc_end, location, notes, is_dcfc,
                     evse_energy_kwh, charging_efficiency_pct,
-                    peak_charge_power_kw
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    peak_charge_power_kw, temperature_c
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat() if record.started_at else None,
@@ -1535,6 +1597,7 @@ class TripStorage:
                     record.evse_energy_kwh,
                     record.charging_efficiency_pct,
                     record.peak_charge_power_kw,
+                    record.temperature_c,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -1596,7 +1659,7 @@ class TripStorage:
     _CHARGE_USER_EDITABLE = frozenset({
         "started_at", "ended_at", "kwh", "soc_start", "soc_end",
         "location", "notes", "is_dcfc", "currency",
-        "evse_energy_kwh", "peak_charge_power_kw",
+        "evse_energy_kwh", "peak_charge_power_kw", "temperature_c",
     })
 
     async def async_patch_charge(
@@ -3222,6 +3285,10 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
         peak_charge_power_kw=(
             row["peak_charge_power_kw"]
             if "peak_charge_power_kw" in row.keys() else None
+        ),
+        temperature_c=(
+            row["temperature_c"]
+            if "temperature_c" in row.keys() else None
         ),
     )
 

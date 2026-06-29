@@ -3066,6 +3066,14 @@ class BatterySohSensor(_BaseTripSensor):
                 round(calibrated, 2) if calibrated is not None else None
             ),
             "calibration_charges": coord._battery_capacity_calibration_n,
+            # v0.6.5 — per-gate reject counts from the last
+            # calibration sweep (Tessie ΔkWh > 5 + temperature
+            # window). Lets the dashboard render "9 considered, 4
+            # used, 3 too-small, 2 cold" instead of just a single
+            # opaque number.
+            "calibration_rejects": dict(
+                coord._battery_capacity_calibration_rejects
+            ),
             "degradation_kwh_per_year": rate_kwh_per_year,
             # v0.5.66 — TWO km figures. `logger_km` drives the model
             # (what the integration has actually observed). `odometer_km`

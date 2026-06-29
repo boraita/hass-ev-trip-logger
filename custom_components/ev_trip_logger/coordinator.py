@@ -829,6 +829,10 @@ class EvTripLoggerCoordinator:
         # property below prefers it.
         self._battery_capacity_calibrated: float | None = None
         self._battery_capacity_calibration_n: int = 0
+        # v0.6.5 — per-gate reject counts from the last calibration run.
+        # Surfaced in the BatterySohSensor attributes so a user can see
+        # "9 charges considered, 4 used, 3 too-small, 2 cold".
+        self._battery_capacity_calibration_rejects: dict[str, int] = {}
         # v0.6.4 — kWh-weighted avg €/kWh over the trailing 30d.
         # Cached so `_trip_to_attr` (a sync-context attribute builder)
         # can compute `cost_at_avg_tariff` without an async storage
@@ -1554,7 +1558,7 @@ class EvTripLoggerCoordinator:
         suggest an impossibly small or large pack.
         """
         try:
-            median, n = await self.storage.async_effective_capacity_kwh(
+            median, n, rejects = await self.storage.async_effective_capacity_kwh(
                 min_delta_pct=_CAPACITY_MIN_DELTA_PCT,
                 min_charges=_CAPACITY_MIN_CHARGES,
                 window=_CAPACITY_CHARGE_WINDOW,
@@ -1563,6 +1567,10 @@ class EvTripLoggerCoordinator:
             _LOGGER.debug("effective capacity query failed: %s", exc)
             return
         self._battery_capacity_calibration_n = n
+        # v0.6.5 — cache the per-gate reject counts so the SoH sensor
+        # can surface them as attributes (transparency: explains why a
+        # given charge didn't contribute to the calibration).
+        self._battery_capacity_calibration_rejects = rejects
         if median is None:
             new_value: float | None = None
         else:
@@ -3306,6 +3314,10 @@ class EvTripLoggerCoordinator:
                 active.peak_charge_power_kw
                 if active.peak_charge_power_kw > 0 else None
             ),
+            # v0.6.5 — auto-detect path doesn't carry a per-session
+            # temperature sample yet, so leave it to the service to
+            # read the current exterior-temp sensor at close.
+            temperature_c=None,
         )
 
     @callback
@@ -4556,6 +4568,7 @@ class EvTripLoggerCoordinator:
         is_dcfc: bool | None = None,
         evse_energy_kwh: float | None = None,
         peak_charge_power_kw: float | None = None,
+        temperature_c: float | None = None,
     ) -> ChargeRecord:
         """Persist a charge session.
 
@@ -4619,6 +4632,20 @@ class EvTripLoggerCoordinator:
                 round(peak_charge_power_kw, 2)
                 if peak_charge_power_kw is not None and peak_charge_power_kw > 0
                 else None
+            ),
+            # v0.6.5 — capture exterior temperature at close from the
+            # configured sensor; falls through to the caller-supplied
+            # value when wired (manual log_charge service can pass it
+            # in). Drives the SoH sample-gate.
+            temperature_c=(
+                round(temperature_c, 1)
+                if temperature_c is not None
+                else (
+                    round(self._read_float(self._temp), 1)
+                    if self._temp is not None
+                    and self._read_float(self._temp) is not None
+                    else None
+                )
             ),
         )
         charge_id = await self.storage.async_insert_charge(record)

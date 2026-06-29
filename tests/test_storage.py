@@ -591,7 +591,7 @@ async def test_effective_capacity_below_threshold(storage: TripStorage) -> None:
             kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
             soc_start=soc_s, soc_end=soc_e,
         ))
-    cap, n = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert cap is None
@@ -619,11 +619,59 @@ async def test_effective_capacity_median_of_eligible_charges(
             kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
             soc_start=s0, soc_end=s1,
         ))
-    cap, n = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert n == 5
     assert cap == pytest.approx(83.0)
+
+
+async def test_effective_capacity_gates_min_kwh_and_temperature(
+    storage: TripStorage,
+) -> None:
+    """v0.6.5 — sample gates: ΔkWh ≥ 5 (Tessie threshold) and
+    temperature in [5, 35] °C. Rows with NULL temperature bypass the
+    temperature gate (we don't penalise users without an exterior
+    temp sensor). Reject counts surface in the third tuple element.
+    """
+    now = dt_util.now()
+    # 6 eligible charges by ΔSoC alone:
+    #   - 1 big at normal temp → SAMPLE (40 kWh / 60 % = 66.67)
+    #   - 1 big at 2 °C → rejected (cold)
+    #   - 1 big at 40 °C → rejected (hot)
+    #   - 1 with NULL temp → SAMPLE (no temp gate)
+    #   - 1 with kwh=3.0 (below Tessie 5) → rejected (kwh_too_small)
+    #   - 1 with kwh=4.5 (below 5) → rejected (kwh_too_small)
+    rows = [
+        (40.0, 20.0, 80.0, 22.0),   # 60 % Δ, 22 °C → used (66.67)
+        (40.0, 20.0, 80.0,  2.0),   # cold
+        (40.0, 20.0, 80.0, 40.0),   # hot
+        (40.0, 20.0, 80.0, None),   # temp NULL → used (66.67)
+        ( 3.0, 70.0, 80.0, 22.0),   # 10 % Δ but kwh<5 — rejected as
+                                    #   kwh_too_small; ΔSoC > 30 ? no:
+                                    #   delta = 10, so rejected pre-gate
+                                    #   (skipped from SELECT). Adjust:
+        ( 4.5, 20.0, 80.0, 22.0),   # 60 % Δ, kwh=4.5 → kwh_too_small
+    ]
+    for kwh, s0, s1, t in rows:
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=now - timedelta(hours=1),
+            ended_at=now,
+            kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
+            soc_start=s0, soc_end=s1,
+            temperature_c=t,
+        ))
+    # Use min_charges=1 so the small N doesn't suppress the result.
+    cap, n, rejects = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=1,
+    )
+    # Two samples survive: the 22 °C row and the temp=NULL row.
+    # Both imply 66.67 kWh → median = 66.67.
+    assert n == 2
+    assert cap == pytest.approx(66.67, abs=0.05)
+    assert rejects["temp_cold"] == 1
+    assert rejects["temp_hot"] == 1
+    assert rejects["kwh_too_small"] == 1
 
 
 async def test_effective_capacity_filters_small_top_ups(
@@ -645,7 +693,7 @@ async def test_effective_capacity_filters_small_top_ups(
             kwh=40.0, price_per_kwh=0.2, total_cost=8.0,
             soc_start=20.0, soc_end=80.0,  # 60 % Δ → 66.67 kWh
         ))
-    cap, n = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert n == 5
