@@ -227,6 +227,7 @@
         }
       },
       "monthly_history": { "name": "Monthly history" },
+      "weekly_history": { "name": "Weekly history" },
       "daily_km_60d": { "name": "Daily km 60d" },
       "trip_patterns": { "name": "Trip patterns" },
       "tops": { "name": "Tops" },

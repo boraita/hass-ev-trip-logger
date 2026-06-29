@@ -284,6 +284,7 @@ async def async_setup_entry(
 
     # v0.5.0 — dashboard-driven additions
     entities.append(MonthlyHistorySensor(coordinator))
+    entities.append(WeeklyHistorySensor(coordinator))
     entities.append(DailyKm60dSensor(coordinator))
     entities.append(TripPatternsSensor(coordinator))
     entities.append(TopsSensor(coordinator))
@@ -2363,6 +2364,54 @@ class MonthlyHistorySensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"months": self._months}
+
+
+class WeeklyHistorySensor(_BaseTripSensor):
+    """Per-week rollups for the last 26 ISO weeks (long, reliable weekly series).
+
+    Mirrors ``MonthlyHistorySensor`` but buckets by the Monday of each ISO
+    week (matching ``distance_this_week`` and the dashboard's Monday-start
+    grouping). Dashboards read ``attributes.weeks`` instead of re-bucketing
+    the short ``recent_trips`` window.
+    """
+
+    _unrecorded_attributes = frozenset({"weeks"})
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="weekly_history",
+            translation_key="weekly_history",
+            icon="mdi:chart-bar-stacked",
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_weekly_history"
+        self._weeks: list[dict[str, Any]] = []
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._weeks = await self._coordinator.storage.async_weekly_history(26)
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return len(self._weeks)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"weeks": self._weeks}
 
 
 class DailyKm60dSensor(_BaseTripSensor):
