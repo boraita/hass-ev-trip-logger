@@ -2530,6 +2530,21 @@ class TripStorage:
                 """,
                 (months,),
             ).fetchall()
+            # charged_kwh is in a separate table keyed by ended_at — bucket it
+            # by the same calendar month so dashboards get a clean per-month
+            # "to battery" figure. Charge-only months (no trips) don't add a
+            # row here; the lifetime accumulator remains the fallback for those.
+            charged = {
+                r[0]: float(r[1])
+                for r in conn.execute(
+                    """
+                    SELECT substr(ended_at, 1, 7) AS month,
+                           COALESCE(SUM(kwh), 0) AS charged_kwh
+                    FROM charges
+                    GROUP BY month
+                    """
+                ).fetchall()
+            }
         # Reverse to chronological order for chart consumers.
         return list(reversed([
             {
@@ -2538,6 +2553,7 @@ class TripStorage:
                 "energy_kwh": round(float(r[2]), 2),
                 "cost": round(float(r[3]), 2),
                 "trips": int(r[4]),
+                "charged_kwh": round(charged.get(r[0], 0.0), 2),
             }
             for r in rows
         ]))
@@ -2575,6 +2591,24 @@ class TripStorage:
                 """,
                 (weeks,),
             ).fetchall()
+            # charged_kwh from the charges table, bucketed by the same
+            # Monday-of-week expression on ended_at. Weeks with charges but
+            # no trips don't add a row; the lifetime accumulator covers those.
+            charged = {
+                r[0]: float(r[1])
+                for r in conn.execute(
+                    """
+                    SELECT date(
+                        substr(ended_at, 1, 10),
+                        '-' || ((CAST(strftime('%w', substr(ended_at, 1, 10))
+                                 AS INTEGER) + 6) % 7) || ' days'
+                    ) AS week_start,
+                    COALESCE(SUM(kwh), 0) AS charged_kwh
+                    FROM charges
+                    GROUP BY week_start
+                    """
+                ).fetchall()
+            }
 
         out: list[dict[str, Any]] = []
         # Reverse to chronological order for chart consumers.
@@ -2593,6 +2627,7 @@ class TripStorage:
                     "energy_kwh": energy_kwh,
                     "cost": round(float(r[3]), 2),
                     "trips": int(r[4]),
+                    "charged_kwh": round(charged.get(week_start, 0.0), 2),
                     "avg_consumption_kwh_100km": (
                         round(energy_kwh / distance_km * 100, 1)
                         if distance_km > 0
