@@ -2565,17 +2565,26 @@ class TripStorage:
                 ).fetchall()
             }
         # Reverse to chronological order for chart consumers.
-        return list(reversed([
-            {
-                "month": r[0],
-                "distance_km": round(float(r[1]), 1),
-                "energy_kwh": round(float(r[2]), 2),
-                "cost": round(float(r[3]), 2),
-                "trips": int(r[4]),
-                "charged_kwh": round(charged.get(r[0], 0.0), 2),
-            }
-            for r in rows
-        ]))
+        out: list[dict[str, Any]] = []
+        for r in reversed(rows):
+            distance_km = round(float(r[1]), 1)
+            energy_kwh = round(float(r[2]), 2)
+            out.append(
+                {
+                    "month": r[0],
+                    "distance_km": distance_km,
+                    "energy_kwh": energy_kwh,
+                    "cost": round(float(r[3]), 2),
+                    "trips": int(r[4]),
+                    "charged_kwh": round(charged.get(r[0], 0.0), 2),
+                    "avg_consumption_kwh_100km": (
+                        round(energy_kwh / distance_km * 100, 1)
+                        if distance_km > 0
+                        else None
+                    ),
+                }
+            )
+        return out
 
     async def async_weekly_history(self, weeks: int = 26) -> list[dict[str, Any]]:
         """Per-week rollup (km, kWh, cost, trips) for the last N ISO weeks."""

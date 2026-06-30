@@ -397,6 +397,23 @@ async def test_monthly_history_charged_kwh_buckets_on_ended_at(
     assert months["2026-06"]["charged_kwh"] == pytest.approx(8.0)
 
 
+async def test_monthly_history_avg_consumption_per_100km(
+    storage: TripStorage,
+) -> None:
+    # Two trips in June: 60 km / 9 kWh and 40 km / 11 kWh → 20 kWh over 100 km
+    # = 20.0 kWh/100km for the month.
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 5), ended_at=_at(2026, 6, 5, 11),
+              distance_km=60.0, energy_kwh=9.0)
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 12), ended_at=_at(2026, 6, 12, 11),
+              distance_km=40.0, energy_kwh=11.0)
+    )
+    months = {m["month"]: m for m in await storage.async_monthly_history(12)}
+    assert months["2026-06"]["avg_consumption_kwh_100km"] == pytest.approx(20.0)
+
+
 @pytest.mark.parametrize(
     "consumption, expected",
     [
