@@ -86,6 +86,34 @@ _TRIP_FIELDS_EXTRA_LAST: dict[str, dict[str, Any]] = {
         "precision": 2,
         "slug": "cost_at_avg_tariff",
     },
+    # v0.6.6 — idle accounting tiles. `idle_minutes` is the raw
+    # accumulator; `moving_consumption_kwh_100km` is the "what would
+    # this trip have cost if you hadn't waited with the AC on"
+    # estimate; `idle_ratio_pct` answers "how much of the trip was
+    # stationary?". Top-level sensors so users can mount them in a
+    # gauge / tile card without writing a template.
+    "idle_minutes": {
+        "unit": UnitOfTime.MINUTES,
+        "device_class": SensorDeviceClass.DURATION,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 0,
+        "icon": "mdi:car-clock",
+        "slug": "idle_minutes",
+    },
+    "moving_consumption_kwh_100km": {
+        "unit": "kWh/100km",
+        "icon": "mdi:car-electric",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "slug": "moving_consumption",
+    },
+    "idle_ratio_pct": {
+        "unit": PERCENTAGE,
+        "icon": "mdi:timer-pause-outline",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "slug": "idle_ratio",
+    },
     "score": {
         "icon": "mdi:speedometer",
         "state_class": SensorStateClass.MEASUREMENT,
@@ -532,6 +560,29 @@ class LastTripExtraSensor(_BaseTripSensor):
                 * self._coordinator.recent_avg_tariff_per_kwh,
                 2,
             )
+        # v0.6.6 — derived idle metrics. Computed at read time from
+        # `idle_minutes` + the configured `idle_power_estimate_kw` so
+        # users can tune the estimate without rewriting history.
+        idle_min = getattr(trip, "idle_minutes", None)
+        if self._key == "moving_consumption_kwh_100km":
+            if (
+                idle_min is None or trip.energy_kwh is None
+                or trip.distance_km is None or trip.distance_km <= 0
+            ):
+                return None
+            idle_kwh = (
+                idle_min / 60.0
+                * self._coordinator._idle_power_estimate_kw
+            )
+            moving_kwh = max(0.0, trip.energy_kwh - idle_kwh)
+            return round(moving_kwh / trip.distance_km * 100.0, 1)
+        if self._key == "idle_ratio_pct":
+            if (
+                idle_min is None or trip.duration_min is None
+                or trip.duration_min <= 0
+            ):
+                return None
+            return round(idle_min / trip.duration_min * 100.0, 1)
         return getattr(trip, self._key, None)
 
 
@@ -593,6 +644,26 @@ class CurrentTripExtraSensor(_BaseTripSensor):
             return round(
                 energy * self._coordinator.recent_avg_tariff_per_kwh, 2,
             )
+        # v0.6.6 — live idle metrics from the active trip snapshot.
+        idle_min = snapshot.get("idle_minutes")
+        if self._key == "moving_consumption_kwh_100km":
+            energy = snapshot.get("energy_kwh")
+            distance = snapshot.get("distance_km")
+            if (
+                idle_min is None or energy is None
+                or distance is None or distance <= 0
+            ):
+                return None
+            idle_kwh = (
+                idle_min / 60.0
+                * self._coordinator._idle_power_estimate_kw
+            )
+            return round(max(0.0, energy - idle_kwh) / distance * 100.0, 1)
+        if self._key == "idle_ratio_pct":
+            duration = snapshot.get("duration_min")
+            if idle_min is None or duration is None or duration <= 0:
+                return None
+            return round(idle_min / duration * 100.0, 1)
         return snapshot.get(self._key)
 
 
@@ -730,6 +801,7 @@ def _trip_to_attr(
     *,
     score_baseline: float = 14.5,
     avg_tariff_per_kwh: float | None = None,
+    idle_power_estimate_kw: float | None = None,
 ) -> dict[str, Any]:
     """Serialise a TripRecord for sensor attributes.
 
@@ -779,6 +851,55 @@ def _trip_to_attr(
         # `regen_kwh / discharge_kwh` for a per-trip "energy recovered"
         # ratio.
         "discharge_kwh": _r(getattr(trip, "discharge_kwh", None), 2),
+        # v0.6.6 — idle accounting. Lets dashboards split "energy used
+        # moving" vs "energy burned waiting with the AC on" — explains
+        # high kWh/100km headlines on trips dominated by stationary
+        # time (drive-throughs, waiting in the parking with motor on).
+        "idle_minutes": _r(getattr(trip, "idle_minutes", None), 1),
+        "idle_ratio_pct": (
+            _r(
+                getattr(trip, "idle_minutes", 0) / trip.duration_min * 100.0,
+                1,
+            )
+            if (
+                getattr(trip, "idle_minutes", None) is not None
+                and trip.duration_min and trip.duration_min > 0
+            )
+            else None
+        ),
+        "idle_energy_kwh_est": (
+            _r(
+                getattr(trip, "idle_minutes", 0) / 60.0
+                * idle_power_estimate_kw,
+                2,
+            )
+            if (
+                getattr(trip, "idle_minutes", None) is not None
+                and idle_power_estimate_kw is not None
+                and idle_power_estimate_kw > 0
+            )
+            else None
+        ),
+        "moving_consumption_kwh_100km": (
+            _r(
+                max(
+                    0.0,
+                    trip.energy_kwh
+                    - (getattr(trip, "idle_minutes", 0) or 0) / 60.0
+                    * idle_power_estimate_kw,
+                )
+                / trip.distance_km * 100.0,
+                1,
+            )
+            if (
+                trip.energy_kwh is not None
+                and trip.distance_km and trip.distance_km > 0
+                and getattr(trip, "idle_minutes", None) is not None
+                and idle_power_estimate_kw is not None
+                and idle_power_estimate_kw > 0
+            )
+            else None
+        ),
         "avg_temp_c": _r(trip.avg_temp_c, 1),
         "cost": _r(trip.cost, 2),
         # v0.6.4 — companion to `cost` that's always monotonic with
@@ -1262,12 +1383,14 @@ class RecentTripsSensor(_BaseTripSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         baseline = self._coordinator.score_baseline_kwh_100km
         avg_tariff = self._coordinator.recent_avg_tariff_per_kwh
+        idle_kw = getattr(self._coordinator, "_idle_power_estimate_kw", None)
         return {
             "trips": [
                 _trip_to_attr(
                     t,
                     score_baseline=baseline,
                     avg_tariff_per_kwh=avg_tariff,
+                    idle_power_estimate_kw=idle_kw,
                 )
                 for t in self._trips
             ],

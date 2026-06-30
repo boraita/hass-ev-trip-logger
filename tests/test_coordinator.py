@@ -2226,6 +2226,75 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     assert after.energy_source == "power_integration"
 
 
+async def test_trip_record_persists_idle_minutes_field(
+    hass: HomeAssistant,
+) -> None:
+    """v0.7.2 (a.k.a. v0.6.6 idle-tracking) — `idle_minutes` is a
+    persisted column on trips; `_trip_to_attr` derives idle_ratio_pct,
+    idle_energy_kwh_est, and moving_consumption_kwh_100km from it
+    plus the coordinator's `_idle_power_estimate_kw`. Verifies the
+    full chain without depending on live-tick timing.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+    from custom_components.ev_trip_logger.sensor import _trip_to_attr
+
+    entry = await _setup(hass)
+    coord = hass.data[DOMAIN][entry.entry_id]
+    coord._idle_power_estimate_kw = 2.5
+    now = dt_util.now()
+    # Trip 205-style: 19 km, 4.95 kWh, 120 min total, 95 min idle.
+    rec = TripRecord(
+        started_at=now - timedelta(minutes=120),
+        ended_at=now,
+        duration_min=120.0,
+        distance_km=19.0,
+        energy_kwh=4.95,
+        consumption_kwh_100km=26.1,
+        idle_minutes=95.0,
+    )
+    trip_id = await coord.storage.async_insert(rec)
+    fetched = await coord.storage.async_get_trip_by_id(trip_id)
+    assert fetched is not None
+    assert fetched.idle_minutes == pytest.approx(95.0)
+
+    attr = _trip_to_attr(
+        fetched, score_baseline=14.5, idle_power_estimate_kw=2.5,
+    )
+    # Idle ratio: 95 / 120 × 100 = 79.2 %
+    assert attr["idle_ratio_pct"] == pytest.approx(79.2, abs=0.05)
+    # Idle energy estimate: 95 / 60 × 2.5 = 3.96 kWh
+    assert attr["idle_energy_kwh_est"] == pytest.approx(3.96, abs=0.02)
+    # Moving consumption: (4.95 - 3.96) / 19 × 100 = 5.2 kWh/100km
+    assert attr["moving_consumption_kwh_100km"] == pytest.approx(5.2, abs=0.2)
+    # Headline consumption stays at 26.1 — `cost_at_avg_tariff`-style
+    # split: the dashboard now has BOTH numbers and the user can see
+    # the moving-only figure.
+    assert attr["consumption_kwh_100km"] == pytest.approx(26.1)
+
+
+async def test_trip_to_attr_handles_missing_idle(hass: HomeAssistant) -> None:
+    """v0.7.2 — synth / recovered trips have idle_minutes=None.
+    The derived metrics must come back as None (not 0, not a crash).
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+    from custom_components.ev_trip_logger.sensor import _trip_to_attr
+
+    rec = TripRecord(
+        started_at=dt_util.now() - timedelta(minutes=30),
+        ended_at=dt_util.now(),
+        duration_min=30.0,
+        distance_km=20.0,
+        energy_kwh=4.0,
+        consumption_kwh_100km=20.0,
+        idle_minutes=None,  # synth path
+    )
+    attr = _trip_to_attr(rec, idle_power_estimate_kw=2.5)
+    assert attr["idle_minutes"] is None
+    assert attr["idle_ratio_pct"] is None
+    assert attr["idle_energy_kwh_est"] is None
+    assert attr["moving_consumption_kwh_100km"] is None
+
+
 async def test_recent_avg_tariff_falls_back_to_home_price_when_no_charges(
     hass: HomeAssistant,
 ) -> None:

@@ -56,11 +56,13 @@ from .const import (
     CONF_SPEED,
     CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
+    CONF_IDLE_POWER_ESTIMATE_KW,
     CONF_VEHICLE_FIRST_REGISTERED,
     CONF_VEHICLE_MODEL,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CHEMISTRY,
     DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_IDLE_POWER_ESTIMATE_KW,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
     DEFAULT_HOME_ZONE,
@@ -293,6 +295,25 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                     mode=SelectSelectorMode.DROPDOWN,
                     translation_key="vehicle_model_key",
                     custom_value=True,
+                )
+            ),
+            # v0.6.6 — kW the vehicle draws while parked with ignition
+            # on (HVAC + electronics). Drives the moving-consumption
+            # estimate so the dashboard can split "energy moving" vs
+            # "energy waiting". 2.5 kW is a reasonable mid-size SUV
+            # summer default; range 0.5-5 covers small EVs to large
+            # luxury cabins.
+            vol.Required(
+                CONF_IDLE_POWER_ESTIMATE_KW,
+                default=defaults.get(
+                    CONF_IDLE_POWER_ESTIMATE_KW,
+                    DEFAULT_IDLE_POWER_ESTIMATE_KW,
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0.5, max=5.0, step=0.1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="kW",
                 )
             ),
             vol.Required(

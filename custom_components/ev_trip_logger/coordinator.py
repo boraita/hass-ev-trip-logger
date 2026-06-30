@@ -46,6 +46,7 @@ from .const import (
     DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
+    CONF_IDLE_POWER_ESTIMATE_KW,
     CONF_VEHICLE_MODEL,
     CONF_CHARGE_SENSOR,
     CONF_CURRENCY,
@@ -75,6 +76,7 @@ from .const import (
     CONF_RECENT_LIMIT,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_IDLE_POWER_ESTIMATE_KW,
     DEFAULT_DCFC_THRESHOLD_KW,
     DEFAULT_IDLE_TRIP_TIMEOUT_MIN,
     DEFAULT_CURRENCY,
@@ -596,6 +598,13 @@ class TripInProgress:
     # update_entity force-refreshes (denser GPS during the drive
     # than the upstream's natural cadence delivers).
     live_tick_count: int = 0
+    # v0.6.6 — seconds the vehicle was on but standing still during
+    # the trip (idling at lights, waiting with the AC on, drive-
+    # through queues, etc). Lets the close path expose a "moving-
+    # only" consumption number that excludes parked-but-on overhead.
+    # Sampled by `_async_live_tick`: speed sensor preferred when
+    # wired, falls back to `last_movement_ts` staleness.
+    idle_seconds: float = 0.0
     # v0.5.43 — driver identity from the configured driver sensor
     # (e.g. the car's bluetooth-connected-device entity). Captured at
     # open; re-checked on every live tick until it resolves, since BT
@@ -841,6 +850,15 @@ class EvTripLoggerCoordinator:
         self._avg_tariff_cache_per_kwh: float | None = None
         self._dcfc_threshold_kw = float(
             merged.get(CONF_DCFC_THRESHOLD_KW, DEFAULT_DCFC_THRESHOLD_KW)
+        )
+        # v0.6.6 — estimated kW the car draws while parked with
+        # ignition on (HVAC + electronics). Feeds the close-time
+        # idle-energy estimate so dashboards can split "energy moving"
+        # vs "energy waiting".
+        self._idle_power_estimate_kw = float(
+            merged.get(
+                CONF_IDLE_POWER_ESTIMATE_KW, DEFAULT_IDLE_POWER_ESTIMATE_KW,
+            )
         )
         # How long to wait without movement (odo change or speed > 0) before
         # force-closing an open trip. Configurable so cloud-polling
@@ -3874,6 +3892,30 @@ class EvTripLoggerCoordinator:
             return
         now = dt_util.now()
 
+        # v0.6.6 — idle accumulator. Count this tick (_LIVE_TICK
+        # seconds, default 30) as "stationary with ignition on" when
+        # either the explicit speed sensor reads < 1 km/h, OR — when
+        # no speed sensor is wired — there's been no movement signal
+        # for longer than 2× the live-tick interval. The threshold of
+        # 2× protects against single-sample blips: a brief 0 km/h on a
+        # cloud-polled source between two motion samples doesn't
+        # falsely accumulate idle time.
+        is_idle: bool | None = None
+        if self._speed:
+            s = self._read_float(self._speed)
+            if s is not None:
+                is_idle = s < 1.0
+        if is_idle is None:
+            # Fallback path — relies on the last_movement_ts updated
+            # by _async_metric_changed (odometer growth) and
+            # _async_speed_changed (speed > 0).
+            last_move = self.current.last_movement_ts
+            if last_move is not None:
+                idle_threshold_s = _LIVE_TICK.total_seconds() * 2
+                is_idle = (now - last_move).total_seconds() > idle_threshold_s
+        if is_idle:
+            self.current.idle_seconds += _LIVE_TICK.total_seconds()
+
         # Idle watchdog — force-close ONLY when vehicle_on is also off,
         # which indicates we missed the off-edge entirely (cloud-poll
         # cycle skipped it). If vehicle_on is still on, the user is
@@ -4378,6 +4420,15 @@ class EvTripLoggerCoordinator:
                     active.energy_from_power_kwh - (active.regen_kwh or 0.0),
                 ), 4)
                 if active.energy_from_power_kwh > 0 else None
+            ),
+            # v0.6.6 — minutes vehicle was on but stationary. Capped at
+            # the trip duration as a sanity guard (the idle counter
+            # advances on every live tick, so a clock glitch can't
+            # push it above duration). NULL when no live-tick ran
+            # (synth / recovered paths).
+            idle_minutes=(
+                round(min(active.idle_seconds / 60.0, duration_min), 2)
+                if active.idle_seconds > 0 else None
             ),
             avg_temp_c=avg_temp,
             origin=active.location_start,
@@ -6248,6 +6299,13 @@ class EvTripLoggerCoordinator:
             "cost": cost,
             "score": score,
             "driver": active.driver,
+            # v0.6.6 — surface live idle accounting so the dashboard
+            # can render moving-only consumption / idle-ratio tiles
+            # while the trip is in progress.
+            "idle_minutes": (
+                round(active.idle_seconds / 60.0, 1)
+                if active.idle_seconds > 0 else None
+            ),
         }
         return self._snapshot_cache
 

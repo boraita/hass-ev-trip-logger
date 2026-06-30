@@ -144,7 +144,14 @@ CREATE TABLE IF NOT EXISTS trips (
     -- effectively burned); discharge_kwh is the gross half useful for
     -- per-driver regen ratio, per-direction K calibration, and SoH
     -- inputs that should exclude regen overhead.
-    discharge_kwh REAL
+    discharge_kwh REAL,
+    -- v0.6.6: minutes the vehicle was on but stationary (waiting with
+    -- AC on, drive-through queues, traffic lights on a hot day).
+    -- Combined with the configured `idle_power_estimate_kw` lets
+    -- dashboards split "energy used moving" vs "energy burned
+    -- waiting" — explains high kWh/100km headlines on trips
+    -- dominated by idle time.
+    idle_minutes REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -278,6 +285,11 @@ class TripRecord:
     # number in `energy_kwh`. Always positive; None when no power
     # samples were captured.
     discharge_kwh: float | None = None
+    # v0.6.6: minutes the vehicle was on but stationary during the trip.
+    # Lets dashboards expose a "moving consumption" metric that excludes
+    # waiting-with-AC overhead. None when no live-tick data was captured
+    # (synth / recovered trips).
+    idle_minutes: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -335,6 +347,7 @@ class TripRecord:
             "energy_from_power": self.energy_from_power,
             "driver": self.driver,
             "discharge_kwh": self.discharge_kwh,
+            "idle_minutes": self.idle_minutes,
         }
 
 
@@ -490,6 +503,9 @@ class TripStorage:
         # v0.6.0: gross discharge energy alongside regen, OVMS-style split.
         if "discharge_kwh" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN discharge_kwh REAL")
+        # v0.6.6: idle_minutes — time spent vehicle_on=on but stationary.
+        if "idle_minutes" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN idle_minutes REAL")
         # v0.5.54: weather snapshot — averages of start/close readings
         # from the configured weather.* entity. All optional (NULL when
         # CONF_WEATHER_ENTITY isn't set).
@@ -612,8 +628,9 @@ class TripStorage:
                     consumption_lower_kwh_100km,
                     consumption_upper_kwh_100km,
                     low_confidence,
-                    discharge_kwh
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    discharge_kwh,
+                    idle_minutes
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -662,6 +679,7 @@ class TripStorage:
                     record.consumption_upper_kwh_100km,
                     int(record.low_confidence) if record.low_confidence is not None else None,
                     record.discharge_kwh,
+                    record.idle_minutes,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -703,6 +721,7 @@ class TripStorage:
         "consumption_lower_kwh_100km", "consumption_upper_kwh_100km",
         "low_confidence",
         "discharge_kwh",
+        "idle_minutes",
         # v0.5.77 — the vehicle-heal path overrides energy_kwh and
         # tags the row as `energy_source='vehicle'` for traceability.
         "energy_source",
@@ -3350,6 +3369,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         consumption_upper_kwh_100km=row["consumption_upper_kwh_100km"] if "consumption_upper_kwh_100km" in row.keys() else None,
         low_confidence=bool(row["low_confidence"]) if ("low_confidence" in row.keys() and row["low_confidence"] is not None) else None,
         discharge_kwh=row["discharge_kwh"] if "discharge_kwh" in row.keys() else None,
+        idle_minutes=row["idle_minutes"] if "idle_minutes" in row.keys() else None,
     )
 
 

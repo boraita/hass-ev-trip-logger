@@ -119,6 +119,14 @@ CONF_BATTERY_CAPACITY: Final = "battery_capacity_kwh"
 # Nissan / Polestar / Škoda); a blank value falls back to nameplate
 # so the integration stays usable for vehicles not in the seed.
 CONF_VEHICLE_MODEL: Final = "vehicle_model_key"
+# v0.6.6 — typical kW the vehicle draws while parked with ignition
+# on (HVAC compressor + electronics + infotainment). Used to estimate
+# how much of a trip's total kWh went to "waiting with the AC on" so
+# the dashboard can surface a "moving-only" consumption number.
+# 2.5 kW covers a mid-size SUV in summer with AC on. Set lower for
+# small EVs or winter, higher for ute / luxury cabin cooling.
+CONF_IDLE_POWER_ESTIMATE_KW: Final = "idle_power_estimate_kw"
+DEFAULT_IDLE_POWER_ESTIMATE_KW: Final = 2.5
 CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"
 CONF_IDLE_TRIP_TIMEOUT_MIN: Final = "idle_trip_timeout_minutes"
 DEFAULT_IDLE_TRIP_TIMEOUT_MIN: Final = 10
