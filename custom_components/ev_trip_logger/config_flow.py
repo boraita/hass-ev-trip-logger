@@ -56,13 +56,17 @@ from .const import (
     CONF_SPEED,
     CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
+    CONF_ELEVATION_PROVIDER,
+    CONF_ELEVATION_PROVIDER_URL,
     CONF_IDLE_POWER_ESTIMATE_KW,
     CONF_VEHICLE_FIRST_REGISTERED,
     CONF_VEHICLE_MODEL,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CHEMISTRY,
     DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_ELEVATION_PROVIDER,
     DEFAULT_IDLE_POWER_ESTIMATE_KW,
+    ELEVATION_PROVIDER_OPTIONS,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
     DEFAULT_HOME_ZONE,
@@ -316,6 +320,26 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                     unit_of_measurement="kW",
                 )
             ),
+            # v0.7.5 — optional elevation provider. Default "none"
+            # keeps the trip's GPS route on-host; users opt in per
+            # deployment. "custom" pairs with the URL field below to
+            # point at a self-hosted OpenTopoData instance.
+            vol.Optional(
+                CONF_ELEVATION_PROVIDER,
+                default=defaults.get(
+                    CONF_ELEVATION_PROVIDER, DEFAULT_ELEVATION_PROVIDER,
+                ),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=list(ELEVATION_PROVIDER_OPTIONS),
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key="elevation_provider",
+                )
+            ),
+            _optional(
+                CONF_ELEVATION_PROVIDER_URL,
+                TextSelector(),
+            ): TextSelector(),
             vol.Required(
                 CONF_MIN_TRIP_DISTANCE,
                 default=defaults.get(CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE),

@@ -161,7 +161,15 @@ CREATE TABLE IF NOT EXISTS trips (
     -- v0.7.3: percentage of live-tick samples where speed ≥ 80 km/h.
     -- Lets dashboards render an "urban vs autopista" split without
     -- re-deriving it from raw samples. NULL when no speed sensor.
-    highway_ratio_pct REAL
+    highway_ratio_pct REAL,
+    -- v0.7.5: elevation profile stats from an external elevation
+    -- provider (open-elevation.com / opentopodata / custom URL).
+    -- Ranked 3rd-strongest feature for consumption prediction in
+    -- Chalmers 2024 QRNN study (ρ ≈ 0.39). All NULL when the
+    -- elevation feature is off (default) or the API call failed.
+    elevation_gain_m REAL,
+    elevation_loss_m REAL,
+    elevation_variance_m2 REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -305,6 +313,12 @@ class TripRecord:
     # was wired.
     v95_speed_kmh: float | None = None
     highway_ratio_pct: float | None = None
+    # v0.7.5: elevation profile stats from the configured provider.
+    # All None when the feature is disabled (default) or the API
+    # call failed (network / non-200 / malformed).
+    elevation_gain_m: float | None = None
+    elevation_loss_m: float | None = None
+    elevation_variance_m2: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -365,6 +379,9 @@ class TripRecord:
             "idle_minutes": self.idle_minutes,
             "v95_speed_kmh": self.v95_speed_kmh,
             "highway_ratio_pct": self.highway_ratio_pct,
+            "elevation_gain_m": self.elevation_gain_m,
+            "elevation_loss_m": self.elevation_loss_m,
+            "elevation_variance_m2": self.elevation_variance_m2,
         }
 
 
@@ -528,6 +545,10 @@ class TripStorage:
             conn.execute("ALTER TABLE trips ADD COLUMN v95_speed_kmh REAL")
         if "highway_ratio_pct" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN highway_ratio_pct REAL")
+        # v0.7.5: elevation profile stats (opt-in feature).
+        for col in ("elevation_gain_m", "elevation_loss_m", "elevation_variance_m2"):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
         # v0.5.54: weather snapshot — averages of start/close readings
         # from the configured weather.* entity. All optional (NULL when
         # CONF_WEATHER_ENTITY isn't set).
@@ -653,8 +674,11 @@ class TripStorage:
                     discharge_kwh,
                     idle_minutes,
                     v95_speed_kmh,
-                    highway_ratio_pct
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    highway_ratio_pct,
+                    elevation_gain_m,
+                    elevation_loss_m,
+                    elevation_variance_m2
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -706,6 +730,9 @@ class TripStorage:
                     record.idle_minutes,
                     record.v95_speed_kmh,
                     record.highway_ratio_pct,
+                    record.elevation_gain_m,
+                    record.elevation_loss_m,
+                    record.elevation_variance_m2,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -750,6 +777,9 @@ class TripStorage:
         "idle_minutes",
         "v95_speed_kmh",
         "highway_ratio_pct",
+        "elevation_gain_m",
+        "elevation_loss_m",
+        "elevation_variance_m2",
         # v0.5.77 — the vehicle-heal path overrides energy_kwh and
         # tags the row as `energy_source='vehicle'` for traceability.
         "energy_source",
@@ -3409,6 +3439,9 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         idle_minutes=row["idle_minutes"] if "idle_minutes" in row.keys() else None,
         v95_speed_kmh=row["v95_speed_kmh"] if "v95_speed_kmh" in row.keys() else None,
         highway_ratio_pct=row["highway_ratio_pct"] if "highway_ratio_pct" in row.keys() else None,
+        elevation_gain_m=row["elevation_gain_m"] if "elevation_gain_m" in row.keys() else None,
+        elevation_loss_m=row["elevation_loss_m"] if "elevation_loss_m" in row.keys() else None,
+        elevation_variance_m2=row["elevation_variance_m2"] if "elevation_variance_m2" in row.keys() else None,
     )
 
 

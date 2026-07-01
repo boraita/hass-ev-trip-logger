@@ -127,6 +127,24 @@ CONF_VEHICLE_MODEL: Final = "vehicle_model_key"
 # small EVs or winter, higher for ute / luxury cabin cooling.
 CONF_IDLE_POWER_ESTIMATE_KW: Final = "idle_power_estimate_kw"
 DEFAULT_IDLE_POWER_ESTIMATE_KW: Final = 2.5
+# v0.7.5 — optional elevation lookup at trip close. When enabled, the
+# integration sends the trip's downsampled GPS polyline to the
+# configured provider (open-elevation.com by default; opentopodata
+# variants + a user-hostable URL also supported) and stores
+# elevation_gain_m / elevation_loss_m / elevation_variance_m2.
+# Feature-flagged off by default because it sends GPS points off-
+# host, so opt-in is explicit. Provider list matches
+# `elevation._PROVIDER_URLS`.
+CONF_ELEVATION_PROVIDER: Final = "elevation_provider"
+CONF_ELEVATION_PROVIDER_URL: Final = "elevation_provider_url"
+DEFAULT_ELEVATION_PROVIDER: Final = "none"
+ELEVATION_PROVIDER_OPTIONS: Final = (
+    "none",
+    "open-elevation",
+    "opentopodata-eudem",
+    "opentopodata-srtm",
+    "custom",
+)
 CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"
 CONF_IDLE_TRIP_TIMEOUT_MIN: Final = "idle_trip_timeout_minutes"
 DEFAULT_IDLE_TRIP_TIMEOUT_MIN: Final = 10

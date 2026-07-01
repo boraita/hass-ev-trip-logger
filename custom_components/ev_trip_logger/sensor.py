@@ -132,6 +132,26 @@ _TRIP_FIELDS_EXTRA_LAST: dict[str, dict[str, Any]] = {
         "precision": 1,
         "slug": "highway_ratio",
     },
+    # v0.7.5 — elevation profile top-level tiles. `gain_m` is the
+    # intuitive "how much did I climb this trip" number; `loss_m`
+    # mirrors it downhill; variance is the ranked-feature-3 signal
+    # from the Chalmers 2024 QRNN study.
+    "elevation_gain_m": {
+        "unit": UnitOfLength.METERS,
+        "device_class": SensorDeviceClass.DISTANCE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 0,
+        "icon": "mdi:elevation-rise",
+        "slug": "elevation_gain",
+    },
+    "elevation_loss_m": {
+        "unit": UnitOfLength.METERS,
+        "device_class": SensorDeviceClass.DISTANCE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 0,
+        "icon": "mdi:elevation-decline",
+        "slug": "elevation_loss",
+    },
     "score": {
         "icon": "mdi:speedometer",
         "state_class": SensorStateClass.MEASUREMENT,
@@ -877,6 +897,16 @@ def _trip_to_attr(
         # separate urban trips from autopista ones.
         "v95_speed_kmh": _r(getattr(trip, "v95_speed_kmh", None), 1),
         "highway_ratio_pct": _r(getattr(trip, "highway_ratio_pct", None), 1),
+        # v0.7.5 — elevation profile stats from the configured
+        # external provider (open-elevation / opentopodata / custom).
+        # All three are None when the feature is off (default) or
+        # the fetch failed. `gain_m` and `loss_m` are the intuitive
+        # numbers; `variance_m2` is the Chalmers-QRNN feature.
+        "elevation_gain_m": _r(getattr(trip, "elevation_gain_m", None), 1),
+        "elevation_loss_m": _r(getattr(trip, "elevation_loss_m", None), 1),
+        "elevation_variance_m2": _r(
+            getattr(trip, "elevation_variance_m2", None), 1,
+        ),
         # v0.6.6 — idle accounting. Lets dashboards split "energy used
         # moving" vs "energy burned waiting with the AC on" — explains
         # high kWh/100km headlines on trips dominated by stationary

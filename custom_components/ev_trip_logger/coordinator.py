@@ -38,6 +38,11 @@ from homeassistant.util import dt as dt_util
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .abrp import AbrpClient, build_tlm
+from .elevation import (
+    compute_elevation_stats,
+    downsample_route,
+    fetch_elevations,
+)
 from .const import (
     ABRP_MIN_SEND_INTERVAL_S,
     CONF_ABRP_API_KEY,
@@ -47,6 +52,8 @@ from .const import (
     DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
+    CONF_ELEVATION_PROVIDER,
+    CONF_ELEVATION_PROVIDER_URL,
     CONF_IDLE_POWER_ESTIMATE_KW,
     CONF_VEHICLE_MODEL,
     CONF_CHARGE_SENSOR,
@@ -77,6 +84,7 @@ from .const import (
     CONF_RECENT_LIMIT,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_ELEVATION_PROVIDER,
     DEFAULT_IDLE_POWER_ESTIMATE_KW,
     DEFAULT_DCFC_THRESHOLD_KW,
     DEFAULT_IDLE_TRIP_TIMEOUT_MIN,
@@ -916,6 +924,16 @@ class EvTripLoggerCoordinator:
                 CONF_IDLE_POWER_ESTIMATE_KW, DEFAULT_IDLE_POWER_ESTIMATE_KW,
             )
         )
+        # v0.7.5 — optional elevation provider ("none" default keeps
+        # GPS points on-host until the user opts in). "custom" lets
+        # a user hostname point at their own OpenTopoData instance
+        # via CONF_ELEVATION_PROVIDER_URL for full privacy.
+        self._elevation_provider = str(
+            merged.get(CONF_ELEVATION_PROVIDER, DEFAULT_ELEVATION_PROVIDER)
+        )
+        self._elevation_provider_url = merged.get(
+            CONF_ELEVATION_PROVIDER_URL,
+        ) or None
         # How long to wait without movement (odo change or speed > 0) before
         # force-closing an open trip. Configurable so cloud-polling
         # integrations with slow odo cadence (e.g. Tesla Fleet ~5 min)
@@ -1186,6 +1204,73 @@ class EvTripLoggerCoordinator:
         except (TypeError, ValueError):
             return None
         return (lat, lon)
+
+    async def _async_populate_elevation(
+        self,
+        trip_id: int,
+        gps_samples: Sequence[tuple[datetime, float, float]],
+    ) -> None:
+        """v0.7.5 — fetch elevation profile for the trip's route and
+        patch the row. Best-effort: any provider error (timeout,
+        HTTP != 200, malformed) leaves the columns as NULL and logs
+        a single info line; the rest of the trip data stays intact.
+        """
+        # Reduce (ts, lat, lon) tuples to (lat, lon) and downsample
+        # to the elevation module's cap. The provider decides its
+        # own point limit; downsample_route respects our default.
+        points = [(lat, lon) for _, lat, lon in gps_samples]
+        sampled = downsample_route(points)
+        if len(sampled) < 2:
+            return
+        try:
+            from homeassistant.helpers.aiohttp_client import (  # noqa: PLC0415
+                async_get_clientsession,
+            )
+        except Exception:  # pragma: no cover — HA always ships this
+            return
+        session = async_get_clientsession(self.hass)
+        elevations = await fetch_elevations(
+            sampled,
+            provider=self._elevation_provider,
+            provider_url=self._elevation_provider_url,
+            session=session,
+        )
+        if not elevations:
+            return
+        gain, loss, variance = compute_elevation_stats(elevations)
+        if gain is None:
+            return
+        # Patch the row. `async_update_trip` writes only whitelisted
+        # columns and returns the fresh record — no need to rewire
+        # last_trip; the sensor's next refresh picks it up.
+        try:
+            await self.storage.async_update_trip(
+                trip_id,
+                {
+                    "elevation_gain_m": gain,
+                    "elevation_loss_m": loss,
+                    "elevation_variance_m2": variance,
+                },
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            _LOGGER.debug(
+                "elevation patch on trip %s failed: %s", trip_id, exc,
+            )
+            return
+        # If this row is the last-trip in memory, refresh so sensors
+        # attached to `last_trip.elevation_*` see the value without
+        # waiting for the next event.
+        if self.last_trip and self.last_trip.trip_id == trip_id:
+            self.last_trip.elevation_gain_m = gain
+            self.last_trip.elevation_loss_m = loss
+            self.last_trip.elevation_variance_m2 = variance
+        _LOGGER.info(
+            "Elevation for trip %s: gain=%.0fm loss=%.0fm var=%.0fm² "
+            "(provider=%s, %d points)",
+            trip_id, gain, loss, variance,
+            self._elevation_provider, len(sampled),
+        )
+        self._notify_trip_log_listeners()
 
     async def _async_refresh_avg_tariff_cache(self, *_: Any) -> None:
         """v0.6.4 — refresh `_avg_tariff_cache_per_kwh` from the
@@ -4626,6 +4711,18 @@ class EvTripLoggerCoordinator:
         # Persist GPS route samples accumulated during the trip.
         if active.gps_samples:
             await self.storage.async_insert_positions(trip_id, active.gps_samples)
+
+        # v0.7.5 — schedule the optional elevation join. Fire-and-
+        # forget so a slow / down provider never blocks the caller.
+        # No-op when provider="none" or no route was captured.
+        if (
+            self._elevation_provider != "none"
+            and active.gps_samples
+            and len(active.gps_samples) >= 5
+        ):
+            self.hass.async_create_task(
+                self._async_populate_elevation(trip_id, active.gps_samples),
+            )
 
         # Reverse-geocode start/end coords for any trip that doesn't end at
         # a named HA zone (zones are already informative on their own).

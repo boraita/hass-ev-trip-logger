@@ -137,6 +137,8 @@
       "current_trip_v95_speed": { "name": "Current trip V95 speed" },
       "last_trip_highway_ratio": { "name": "Last trip highway ratio" },
       "current_trip_highway_ratio": { "name": "Current trip highway ratio" },
+      "last_trip_elevation_gain": { "name": "Last trip elevation gain" },
+      "last_trip_elevation_loss": { "name": "Last trip elevation loss" },
       "last_trip_score": { "name": "Last trip score" },
       "current_trip_cost": { "name": "Current trip cost" },
       "current_trip_score": { "name": "Current trip score" },
