@@ -151,7 +151,17 @@ CREATE TABLE IF NOT EXISTS trips (
     -- dashboards split "energy used moving" vs "energy burned
     -- waiting" — explains high kWh/100km headlines on trips
     -- dominated by idle time.
-    idle_minutes REAL
+    idle_minutes REAL,
+    -- v0.7.3: 95th-percentile of the trip's per-tick speed samples.
+    -- Ranked 4th-strongest feature for trip-level consumption
+    -- prediction in the Chalmers 2024 QRNN study (ρ ≈ 0.29). Robust
+    -- to a single spike (unlike max_speed_kmh). NULL when no speed
+    -- sensor was wired.
+    v95_speed_kmh REAL,
+    -- v0.7.3: percentage of live-tick samples where speed ≥ 80 km/h.
+    -- Lets dashboards render an "urban vs autopista" split without
+    -- re-deriving it from raw samples. NULL when no speed sensor.
+    highway_ratio_pct REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -290,6 +300,11 @@ class TripRecord:
     # waiting-with-AC overhead. None when no live-tick data was captured
     # (synth / recovered trips).
     idle_minutes: float | None = None
+    # v0.7.3: 95th-percentile speed and highway-ratio derived from the
+    # trip's per-tick speed samples. Both None when no speed sensor
+    # was wired.
+    v95_speed_kmh: float | None = None
+    highway_ratio_pct: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -348,6 +363,8 @@ class TripRecord:
             "driver": self.driver,
             "discharge_kwh": self.discharge_kwh,
             "idle_minutes": self.idle_minutes,
+            "v95_speed_kmh": self.v95_speed_kmh,
+            "highway_ratio_pct": self.highway_ratio_pct,
         }
 
 
@@ -506,6 +523,11 @@ class TripStorage:
         # v0.6.6: idle_minutes — time spent vehicle_on=on but stationary.
         if "idle_minutes" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN idle_minutes REAL")
+        # v0.7.3: V95 + highway ratio for speed-distribution metrics.
+        if "v95_speed_kmh" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN v95_speed_kmh REAL")
+        if "highway_ratio_pct" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN highway_ratio_pct REAL")
         # v0.5.54: weather snapshot — averages of start/close readings
         # from the configured weather.* entity. All optional (NULL when
         # CONF_WEATHER_ENTITY isn't set).
@@ -629,8 +651,10 @@ class TripStorage:
                     consumption_upper_kwh_100km,
                     low_confidence,
                     discharge_kwh,
-                    idle_minutes
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    idle_minutes,
+                    v95_speed_kmh,
+                    highway_ratio_pct
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -680,6 +704,8 @@ class TripStorage:
                     int(record.low_confidence) if record.low_confidence is not None else None,
                     record.discharge_kwh,
                     record.idle_minutes,
+                    record.v95_speed_kmh,
+                    record.highway_ratio_pct,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -722,6 +748,8 @@ class TripStorage:
         "low_confidence",
         "discharge_kwh",
         "idle_minutes",
+        "v95_speed_kmh",
+        "highway_ratio_pct",
         # v0.5.77 — the vehicle-heal path overrides energy_kwh and
         # tags the row as `energy_source='vehicle'` for traceability.
         "energy_source",
@@ -3379,6 +3407,8 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         low_confidence=bool(row["low_confidence"]) if ("low_confidence" in row.keys() and row["low_confidence"] is not None) else None,
         discharge_kwh=row["discharge_kwh"] if "discharge_kwh" in row.keys() else None,
         idle_minutes=row["idle_minutes"] if "idle_minutes" in row.keys() else None,
+        v95_speed_kmh=row["v95_speed_kmh"] if "v95_speed_kmh" in row.keys() else None,
+        highway_ratio_pct=row["highway_ratio_pct"] if "highway_ratio_pct" in row.keys() else None,
     )
 
 

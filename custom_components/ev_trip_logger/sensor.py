@@ -114,6 +114,24 @@ _TRIP_FIELDS_EXTRA_LAST: dict[str, dict[str, Any]] = {
         "precision": 1,
         "slug": "idle_ratio",
     },
+    # v0.7.3 — speed distribution top-level sensors so dashboards
+    # can render an "urban vs autopista" pill and a "V95 highway
+    # cruise" number without templating attrs manually.
+    "v95_speed_kmh": {
+        "unit": UnitOfSpeed.KILOMETERS_PER_HOUR,
+        "device_class": SensorDeviceClass.SPEED,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "icon": "mdi:speedometer-medium",
+        "slug": "v95_speed",
+    },
+    "highway_ratio_pct": {
+        "unit": PERCENTAGE,
+        "icon": "mdi:highway",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "slug": "highway_ratio",
+    },
     "score": {
         "icon": "mdi:speedometer",
         "state_class": SensorStateClass.MEASUREMENT,
@@ -851,6 +869,14 @@ def _trip_to_attr(
         # `regen_kwh / discharge_kwh` for a per-trip "energy recovered"
         # ratio.
         "discharge_kwh": _r(getattr(trip, "discharge_kwh", None), 2),
+        # v0.7.3 — speed-distribution metrics from per-tick samples.
+        # `v95_speed_kmh` is a spike-robust "how fast were you really
+        # going most of the time" number (unlike max_speed_kmh which
+        # a single sensor blip can inflate); `highway_ratio_pct` is
+        # the fraction of samples at ≥ 80 km/h and lets dashboards
+        # separate urban trips from autopista ones.
+        "v95_speed_kmh": _r(getattr(trip, "v95_speed_kmh", None), 1),
+        "highway_ratio_pct": _r(getattr(trip, "highway_ratio_pct", None), 1),
         # v0.6.6 — idle accounting. Lets dashboards split "energy used
         # moving" vs "energy burned waiting with the AC on" — explains
         # high kWh/100km headlines on trips dominated by stationary

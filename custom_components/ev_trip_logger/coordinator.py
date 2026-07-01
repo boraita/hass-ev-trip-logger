@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import asyncio
 from collections import deque
 from pathlib import Path
@@ -493,6 +494,39 @@ def _pick_driver_for_window(
     return max(overlap, key=lambda k: overlap[k])
 
 
+def _speed_stats(
+    samples: Sequence[float],
+    *,
+    highway_threshold_kmh: float,
+) -> tuple[float | None, float | None]:
+    """v0.7.3 — return `(v95_speed_kmh, highway_ratio_pct)` from the
+    live-tick speed sample deque.
+
+    * `v95_speed_kmh` — 95th-percentile of samples ≥ 0. Uses the
+      classic linear-interpolation nearest-rank definition: for n
+      samples, idx = ceil(0.95 × n) − 1, clamped to n − 1. Robust
+      to a single sensor spike (max_speed_kmh is already elsewhere).
+    * `highway_ratio_pct` — fraction of samples ≥ `highway_threshold_kmh`
+      × 100. Useful for the dashboard's "urban vs autopista" split.
+
+    Both return None when the deque is empty (no speed sensor wired,
+    or the trip closed before the first live-tick fired).
+    """
+    if not samples:
+        return (None, None)
+    ordered = sorted(s for s in samples if s is not None and s >= 0)
+    if not ordered:
+        return (None, None)
+    n = len(ordered)
+    idx = max(0, min(n - 1, int(0.95 * n) - (1 if 0.95 * n == int(0.95 * n) else 0)))
+    # Simpler & bias-free: nearest-rank on the ceil convention.
+    idx = min(n - 1, max(0, math.ceil(0.95 * n) - 1))
+    v95 = ordered[idx]
+    highway = sum(1 for s in ordered if s >= highway_threshold_kmh)
+    highway_pct = highway / n * 100.0
+    return (round(v95, 1), round(highway_pct, 1))
+
+
 # Minimum time a location zone must persist before we treat it as a real
 # arrival. Cloud-polled device_trackers occasionally bounce (e.g.
 # home→not_home→home in 40 s) when geofence math wobbles near the home
@@ -549,6 +583,15 @@ _DRIVER_HEAL_MAX_TRIPS: Final = 50
 # anyway and we just stop wasting memory (deque evicts oldest).
 _TRIP_GPS_SAMPLES_MAX = 2880
 _TRIP_TEMP_SAMPLES_MAX = 2880
+# v0.7.3 — speed sample deque for V95 / highway-ratio metrics. Same
+# 2880 (24 h at 30 s live-tick) hard cap; a percentile over more
+# samples than that adds no information and just wastes memory.
+_TRIP_SPEED_SAMPLES_MAX = 2880
+# Highway-speed threshold in km/h. Trip time spent ≥ this counts as
+# "highway" in `highway_ratio_pct`. 80 km/h is the classic urban →
+# extra-urban boundary in EU spec sheets and mirrors what ABRP's
+# reference speed (110 km/h) sits comfortably above.
+_HIGHWAY_SPEED_KMH: Final = 80.0
 
 
 @dataclass
@@ -605,6 +648,19 @@ class TripInProgress:
     # Sampled by `_async_live_tick`: speed sensor preferred when
     # wired, falls back to `last_movement_ts` staleness.
     idle_seconds: float = 0.0
+    # v0.7.3 — deterministic per-tick speed samples for V95 percentile
+    # + highway-ratio computation. Requires CONF_SPEED wired (falls
+    # back gracefully to None-metrics when not available). The live-
+    # tick appends the current speed value each cycle so cadence is
+    # deterministic (unlike raw sensor updates which vary by vendor);
+    # this makes the percentile stable across cloud-polled cars that
+    # report speed at wildly different frequencies. Chalmers 2024
+    # QRNN paper ranked V95 as the 4th-strongest feature for trip-
+    # level consumption prediction (Spearman ρ ≈ 0.29 vs distance's
+    # ρ ≈ 0.98) — worth capturing per trip.
+    speed_samples: deque[float] = field(
+        default_factory=lambda: deque(maxlen=_TRIP_SPEED_SAMPLES_MAX)
+    )
     # v0.5.43 — driver identity from the configured driver sensor
     # (e.g. the car's bluetooth-connected-device entity). Captured at
     # open; re-checked on every live tick until it resolves, since BT
@@ -3905,6 +3961,12 @@ class EvTripLoggerCoordinator:
             s = self._read_float(self._speed)
             if s is not None:
                 is_idle = s < 1.0
+                # v0.7.3 — append this tick's speed to the deque used
+                # by close-time V95 / highway-ratio math. Cadence is
+                # bound to _LIVE_TICK (30 s) so the percentile is
+                # deterministic across cloud-polled sources with
+                # wildly different sensor update rates.
+                self.current.speed_samples.append(float(s))
         if is_idle is None:
             # Fallback path — relies on the last_movement_ts updated
             # by _async_metric_changed (odometer growth) and
@@ -4430,6 +4492,16 @@ class EvTripLoggerCoordinator:
                 round(min(active.idle_seconds / 60.0, duration_min), 2)
                 if active.idle_seconds > 0 else None
             ),
+            # v0.7.3 — speed distribution metrics from per-tick samples.
+            # Both None when no speed sensor is wired.
+            v95_speed_kmh=_speed_stats(
+                active.speed_samples,
+                highway_threshold_kmh=_HIGHWAY_SPEED_KMH,
+            )[0],
+            highway_ratio_pct=_speed_stats(
+                active.speed_samples,
+                highway_threshold_kmh=_HIGHWAY_SPEED_KMH,
+            )[1],
             avg_temp_c=avg_temp,
             origin=active.location_start,
             destination=location_end,
@@ -6306,6 +6378,17 @@ class EvTripLoggerCoordinator:
                 round(active.idle_seconds / 60.0, 1)
                 if active.idle_seconds > 0 else None
             ),
+            # v0.7.3 — live V95 + highway-ratio from the running
+            # sample deque so the tiles reflect current driving
+            # pattern mid-trip.
+            "v95_speed_kmh": _speed_stats(
+                active.speed_samples,
+                highway_threshold_kmh=_HIGHWAY_SPEED_KMH,
+            )[0],
+            "highway_ratio_pct": _speed_stats(
+                active.speed_samples,
+                highway_threshold_kmh=_HIGHWAY_SPEED_KMH,
+            )[1],
         }
         return self._snapshot_cache
 

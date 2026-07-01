@@ -2226,6 +2226,66 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     assert after.energy_source == "power_integration"
 
 
+def test_speed_stats_v95_and_highway_ratio() -> None:
+    """v0.7.3 — `_speed_stats` returns nearest-rank V95 + fraction
+    of samples ≥ threshold. Empty/all-None → (None, None).
+    """
+    from custom_components.ev_trip_logger.coordinator import _speed_stats
+
+    # Trip 206-style samples: 30-tick deque (30 s cadence over ~15 min)
+    # with mostly 40-60 km/h and a couple of highway bursts.
+    samples = (
+        [0.0, 0.0, 0.0]            # 3 idle at lights
+        + [40.0, 50.0, 55.0, 45.0] # urban
+        + [70.0, 75.0]             # extra-urban
+        + [95.0, 100.0, 105.0, 117.0, 110.0, 90.0]  # highway
+        + [55.0, 45.0, 30.0]       # slowing to town
+    )
+    v95, highway = _speed_stats(samples, highway_threshold_kmh=80.0)
+    assert v95 is not None and 100.0 <= v95 <= 117.0
+    # 6 samples ≥ 80 out of 18 → 33.3 %
+    assert highway == pytest.approx(33.3, abs=0.1)
+
+    # Empty deque → both None.
+    assert _speed_stats([], highway_threshold_kmh=80.0) == (None, None)
+    # All zeros (car idle whole trip) → V95=0, highway=0.
+    v95, highway = _speed_stats([0.0] * 5, highway_threshold_kmh=80.0)
+    assert v95 == 0.0
+    assert highway == 0.0
+
+
+async def test_trip_record_persists_v95_and_highway_ratio(
+    hass: HomeAssistant,
+) -> None:
+    """v0.7.3 — V95 + highway_ratio round-trip through storage and
+    show up in `_trip_to_attr` output for dashboard consumption.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+    from custom_components.ev_trip_logger.sensor import _trip_to_attr
+
+    entry = await _setup(hass)
+    coord = hass.data[DOMAIN][entry.entry_id]
+    rec = TripRecord(
+        started_at=dt_util.now() - timedelta(minutes=30),
+        ended_at=dt_util.now(),
+        duration_min=30.0,
+        distance_km=25.0,
+        energy_kwh=4.5,
+        consumption_kwh_100km=18.0,
+        v95_speed_kmh=105.0,
+        highway_ratio_pct=42.5,
+    )
+    trip_id = await coord.storage.async_insert(rec)
+    fetched = await coord.storage.async_get_trip_by_id(trip_id)
+    assert fetched is not None
+    assert fetched.v95_speed_kmh == pytest.approx(105.0)
+    assert fetched.highway_ratio_pct == pytest.approx(42.5)
+
+    attr = _trip_to_attr(fetched)
+    assert attr["v95_speed_kmh"] == pytest.approx(105.0)
+    assert attr["highway_ratio_pct"] == pytest.approx(42.5)
+
+
 async def test_trip_record_persists_idle_minutes_field(
     hass: HomeAssistant,
 ) -> None:
