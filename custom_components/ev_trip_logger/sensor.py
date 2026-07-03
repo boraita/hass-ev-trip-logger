@@ -815,6 +815,26 @@ def _r(value: float | None, ndigits: int) -> float | None:
     return round(value, ndigits) if value is not None else None
 
 
+def _classify_trip_character(highway_ratio_pct: float | None) -> str | None:
+    """v0.7.6 — bucket the trip by how much of it was highway-speed.
+
+    Thresholds pinned to _HIGHWAY_SPEED_KMH (80 km/h in the
+    coordinator):
+      * ≥ 60 % of samples ≥ 80 km/h → 'highway'  — motorway-dominated
+      * ≥ 25 % → 'mixed'                          — commute w/ some autopista
+      * ≥  1 % → 'urban'                          — city w/ occasional overtake
+      *   0    → 'urban'                          — pure city
+      * None   → None                             — no signal (no speed sensor)
+    """
+    if highway_ratio_pct is None:
+        return None
+    if highway_ratio_pct >= 60:
+        return "highway"
+    if highway_ratio_pct >= 25:
+        return "mixed"
+    return "urban"
+
+
 def _humanize_location(
     raw: str | None, address: str | None
 ) -> str | None:
@@ -897,6 +917,14 @@ def _trip_to_attr(
         # separate urban trips from autopista ones.
         "v95_speed_kmh": _r(getattr(trip, "v95_speed_kmh", None), 1),
         "highway_ratio_pct": _r(getattr(trip, "highway_ratio_pct", None), 1),
+        # v0.7.6 — one-word summary derived from highway_ratio_pct.
+        # Lets dashboards render a "urban / mixed / autopista" chip
+        # without reimplementing the same 3-line rule in every card.
+        # `None` when we lack signal (no CONF_SPEED wired → no
+        # samples → no ratio).
+        "trip_character": _classify_trip_character(
+            getattr(trip, "highway_ratio_pct", None),
+        ),
         # v0.7.5 — elevation profile stats from the configured
         # external provider (open-elevation / opentopodata / custom).
         # All three are None when the feature is off (default) or

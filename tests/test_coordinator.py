@@ -2254,6 +2254,27 @@ def test_speed_stats_v95_and_highway_ratio() -> None:
     assert highway == 0.0
 
 
+def test_classify_trip_character_thresholds() -> None:
+    """v0.7.6 — highway_ratio_pct → 'highway' / 'mixed' / 'urban' /
+    None mapping. Cutoffs at 25 % and 60 % mirror the intuition
+    'anything under a quarter is basically city driving' and 'over
+    60 % is unambiguously motorway'.
+    """
+    from custom_components.ev_trip_logger.sensor import (
+        _classify_trip_character,
+    )
+
+    assert _classify_trip_character(None) is None
+    assert _classify_trip_character(0.0) == "urban"
+    assert _classify_trip_character(10.0) == "urban"
+    assert _classify_trip_character(24.9) == "urban"
+    assert _classify_trip_character(25.0) == "mixed"
+    assert _classify_trip_character(45.0) == "mixed"
+    assert _classify_trip_character(59.9) == "mixed"
+    assert _classify_trip_character(60.0) == "highway"
+    assert _classify_trip_character(85.0) == "highway"
+
+
 async def test_trip_record_persists_v95_and_highway_ratio(
     hass: HomeAssistant,
 ) -> None:
