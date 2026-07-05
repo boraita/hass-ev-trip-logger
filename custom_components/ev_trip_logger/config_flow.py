@@ -54,6 +54,11 @@ from .const import (
     CONF_POWER,
     CONF_RECENT_LIMIT,
     CONF_SPEED,
+    CONF_RANGE_SENSOR,
+    CONF_HEADING_SENSOR,
+    CONF_DCFC_THRESHOLD_KW,
+    DEFAULT_DCFC_THRESHOLD_KW,
+    ABRP_MIN_SEND_INTERVAL_S,
     CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
     CONF_ELEVATION_PROVIDER,
@@ -207,6 +212,19 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="speed")
             ),
+            # v0.8.0 — ABRP-only extras: estimated range (km) and GPS heading (°).
+            _optional(
+                CONF_RANGE_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="distance")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="distance")
+            ),
+            _optional(
+                CONF_HEADING_SENSOR,
+                EntitySelector(EntitySelectorConfig(domain="sensor")),
+            ): EntitySelector(EntitySelectorConfig(domain="sensor")),
             # v0.5.77 — vehicle-native per-trip energy + distance sensors.
             # When set, the logger uses these as ground truth (avoids
             # SoC quantization + regen-trapezoid noise). Generic by
@@ -366,21 +384,49 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                     min=2, max=60, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min"
                 )
             ),
+            # v0.8.0 — DC fast-charge threshold, previously internal-only.
+            # Charges above this average power are tagged DCFC (and flagged
+            # is_dcfc to ABRP). Default 11 kW sits above 3-phase AC.
+            vol.Required(
+                CONF_DCFC_THRESHOLD_KW,
+                default=defaults.get(
+                    CONF_DCFC_THRESHOLD_KW, DEFAULT_DCFC_THRESHOLD_KW
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=5, max=50, step=1, mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="kW",
+                )
+            ),
             vol.Required(
                 CONF_ENERGY_PRICE,
                 default=defaults.get(CONF_ENERGY_PRICE, DEFAULT_ENERGY_PRICE),
             ): NumberSelector(
                 NumberSelectorConfig(
-                    min=0, max=5, step=0.001, mode=NumberSelectorMode.BOX
+                    min=0, max=5, step=0.001, mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="/kWh",
                 )
             ),
+            # ISO-4217 code — dropdown of common currencies, custom entry
+            # allowed for anything not listed (keeps it free-form but guides
+            # away from typos like "EURO").
             vol.Required(
                 CONF_CURRENCY,
                 default=defaults.get(CONF_CURRENCY, DEFAULT_CURRENCY),
-            ): TextSelector(),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(value=c, label=c)
+                        for c in ("EUR", "USD", "GBP", "CHF", "SEK", "NOK",
+                                  "DKK", "PLN", "CZK", "AUD", "CAD", "JPY")
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    custom_value=True,
+                )
+            ),
             vol.Required(
                 CONF_HOME_ZONE,
-                default=defaults.get(CONF_HOME_ZONE, "zone.home"),
+                default=defaults.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE),
             ): EntitySelector(EntitySelectorConfig(domain="zone")),
             vol.Required(
                 CONF_RECENT_LIMIT,
@@ -404,7 +450,7 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): NumberSelector(
                 NumberSelectorConfig(
-                    min=5, max=600, step=5,
+                    min=ABRP_MIN_SEND_INTERVAL_S, max=600, step=5,
                     mode=NumberSelectorMode.BOX,
                     unit_of_measurement="s",
                 )
