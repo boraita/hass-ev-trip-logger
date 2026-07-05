@@ -76,6 +76,8 @@ from .const import (
     CONF_IDLE_TRIP_TIMEOUT_MIN,
     CONF_POWER,
     CONF_SPEED,
+    CONF_RANGE_SENSOR,
+    CONF_HEADING_SENSOR,
     CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
     CONF_VEHICLE_FIRST_REGISTERED,
@@ -866,6 +868,12 @@ class EvTripLoggerCoordinator:
                     "Invalid vehicle_first_registered=%r — ignoring", first_reg,
                 )
         self._speed = merged.get(CONF_SPEED)
+        # v0.8.0 — optional sensors fed to ABRP telemetry only.
+        self._range = merged.get(CONF_RANGE_SENSOR)
+        self._heading = merged.get(CONF_HEADING_SENSOR)
+        # Latest modelled SoH %, cached by async_compute_expected_soh so the
+        # ABRP push can read it synchronously (see _async_maybe_send_abrp).
+        self._abrp_soh_cache: float | None = None
         # v0.5.43 — optional driver-identity sensor (BT connected device,
         # input_select, template sensor...). State == driver name.
         self._driver_sensor = merged.get(CONF_DRIVER_SENSOR)
@@ -1687,6 +1695,8 @@ class EvTripLoggerCoordinator:
         elif has_age or has_climate:
             confidence = "medium"
 
+        # Cache for the ABRP push (reads it synchronously, no await).
+        self._abrp_soh_cache = round(expected, 2)
         return {
             "expected_soh_pct": round(expected, 2),
             "factors": {k: round(v, 3) for k, v in factors.items()},
@@ -3219,6 +3229,16 @@ class EvTripLoggerCoordinator:
         veh_on = self._read_bool(self._vehicle_on)
         if veh_on is not None:
             is_parked = not veh_on
+        # v0.8.0 — extra fields when we have the data.
+        est_range = self._read_float(self._range) if self._range else None
+        heading = self._read_float(self._heading) if self._heading else None
+        capacity = self.battery_capacity  # calibrated kWh (>0 → sent)
+        soh = self._abrp_soh_cache  # modelled, cached by the SoH sensor
+        kwh_charged = (
+            self.current_charge.energy_added_kwh
+            if self.current_charge is not None
+            else None
+        )
         tlm = build_tlm(
             soc=soc,
             power_w=power_w_for_tlm,
@@ -3227,9 +3247,13 @@ class EvTripLoggerCoordinator:
             is_charging=is_charging,
             is_parked=is_parked,
             ext_temp=ext_temp,
-            est_range=None,  # no generic range sensor in our config
+            est_range=est_range,
             odometer=odo,
             car_model=self._abrp_car_model,
+            heading=heading,
+            soh=soh,
+            capacity=capacity,
+            kwh_charged=kwh_charged,
         )
         # Need at least SoC to be a useful sample.
         if tlm.get("soc") is None:

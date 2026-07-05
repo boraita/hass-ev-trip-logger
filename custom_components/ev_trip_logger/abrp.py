@@ -56,6 +56,10 @@ def build_tlm(
     est_range: float | None,
     odometer: float | None,
     car_model: str | None,
+    heading: float | None = None,
+    soh: float | None = None,
+    capacity: float | None = None,
+    kwh_charged: float | None = None,
 ) -> dict[str, Any]:
     """Build the ABRP ``tlm`` payload from primitives; ``None`` values dropped.
 
@@ -91,6 +95,21 @@ def build_tlm(
         tlm["est_battery_range"] = round(float(est_range), 1)
     if odometer is not None:
         tlm["odometer"] = round(float(odometer), 1)
+    # heading: GPS course 0-360°; only meaningful while moving but harmless
+    # parked. Normalised into range so a stray -1/361 sentinel can't leak.
+    if heading is not None:
+        tlm["heading"] = round(float(heading) % 360.0, 1)
+    # soh: state of health %. NOTE this is a *modelled/estimated* value on
+    # cloud-only vehicles (no BMS SoH over the API), sent as a best-effort
+    # hint for ABRP's range model — not a measured figure.
+    if soh is not None:
+        tlm["soh"] = round(float(soh), 1)
+    # capacity: usable pack capacity (kWh), from the calibrated estimate.
+    if capacity is not None and capacity > 0:
+        tlm["capacity"] = round(float(capacity), 2)
+    # kwh_charged: energy added so far in the active charge session.
+    if kwh_charged is not None and kwh_charged > 0:
+        tlm["kwh_charged"] = round(float(kwh_charged), 2)
     if car_model:
         tlm["car_model"] = car_model
     return tlm

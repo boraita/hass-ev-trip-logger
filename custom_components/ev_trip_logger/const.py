@@ -48,6 +48,13 @@ CONF_BATTERY_CHEMISTRY: Final = "battery_chemistry"
 CONF_VEHICLE_FIRST_REGISTERED: Final = "vehicle_first_registered"
 DEFAULT_BATTERY_CHEMISTRY: Final = "lfp"
 CONF_SPEED: Final = "speed_sensor"
+# v0.8.0 — optional sensors surfaced to ABRP telemetry (only used for the
+# ABRP push; no effect on trip logging). `range_sensor`: the vehicle's
+# estimated remaining range (km) → ABRP `est_battery_range`. `heading_sensor`:
+# GPS heading/course in degrees (0-360) → ABRP `heading`, improving ABRP's
+# route matching. Both optional; dropped from the payload when unset/invalid.
+CONF_RANGE_SENSOR: Final = "range_sensor"
+CONF_HEADING_SENSOR: Final = "heading_sensor"
 CONF_PLUG_SENSOR: Final = "plug_sensor"
 # v0.5.35 — optional polling-pause sensor (e.g. BYD's
 # switch.byd_sealion_7_disable_polling). When ON, the manufacturer
@@ -160,7 +167,7 @@ DEFAULT_MIN_TRIP_DISTANCE: Final = 0.5
 DEFAULT_IDLE_TIMEOUT: Final = 2
 DEFAULT_ENERGY_PRICE: Final = 0.15
 DEFAULT_CURRENCY: Final = "EUR"
-DEFAULT_HOME_ZONE: Final = "home"
+DEFAULT_HOME_ZONE: Final = "zone.home"
 # How many recent trips/charges/journeys to expose in the list sensors'
 # attributes for dashboards. Bounded so one state attribute stays well under
 # the recorder's per-state size limit.
