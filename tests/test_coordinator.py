@@ -23,6 +23,7 @@ from custom_components.ev_trip_logger.const import (
     CONF_NAME,
     CONF_ODOMETER,
     CONF_POWER,
+    CONF_POWER_SIGN_INVERTED,
     CONF_SPEED,
     CONF_VEHICLE_ON,
     DOMAIN,
@@ -1266,6 +1267,59 @@ async def test_current_charge_dcfc_classification_from_live_power(
     snap = coordinator.current_charge_snapshot()
     assert snap["power_kw"] == pytest.approx(90.0)
     assert snap["is_dcfc"] is True
+
+
+async def test_abrp_push_respects_power_sign_inverted(hass: HomeAssistant) -> None:
+    """v0.8.1 — the ABRP push path must honour CONF_POWER_SIGN_INVERTED,
+    not just _async_power_changed's local normalisation.
+
+    Before the fix, `_async_maybe_send_abrp` re-read the raw power
+    sensor and pre-negated it unconditionally, which cancelled
+    `build_tlm`'s own negation and sent the raw sensor sign straight
+    through to ABRP — ignoring the inversion flag entirely. For a
+    source configured as sign-inverted (discharge reported negative,
+    e.g. the user's BYD cloud sensor), that meant driving (discharge)
+    reached ABRP as negative and charging reached it as positive —
+    exactly backwards from ABRP's +discharge/-charge convention.
+    """
+    from types import SimpleNamespace
+
+    entry = await _setup(hass, **{
+        CONF_POWER: POW,
+        CONF_POWER_SIGN_INVERTED: True,
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    sent: list[dict] = []
+
+    async def _fake_send(tlm):
+        sent.append(tlm)
+        return True
+
+    # Stub in a fake client directly instead of going through real ABRP
+    # config (CONF_ABRP_TOKEN/API_KEY) — that would build a real
+    # AbrpClient on HA's shared aiohttp session, which is unnecessary
+    # network-adjacent setup for what's purely a sign-arithmetic test.
+    coordinator._abrp = SimpleNamespace(send=_fake_send)
+    coordinator.abrp_push_enabled = True
+
+    # Sign-inverted source: -20 kW raw while DRIVING (discharging).
+    hass.states.async_set(POW, "-20")
+    await hass.async_block_till_done()
+    coordinator._abrp_last_send = 0.0
+    await coordinator._async_maybe_send_abrp()
+    assert len(sent) == 1
+    # ABRP convention: discharge must arrive positive.
+    assert sent[0]["power"] == pytest.approx(20.0)
+
+    # Sign-inverted source: +8 kW raw while CHARGING.
+    hass.states.async_set(POW, "8")
+    await hass.async_block_till_done()
+    coordinator._abrp_last_send = 0.0
+    await coordinator._async_maybe_send_abrp()
+    assert len(sent) == 2
+    # ABRP convention: charge must arrive negative.
+    assert sent[1]["power"] == pytest.approx(-8.0)
 
 
 async def test_purge_trips_service_deletes_in_range(hass: HomeAssistant) -> None:
@@ -2687,6 +2741,58 @@ async def test_orphan_falls_back_when_recovery_empty(hass: HomeAssistant) -> Non
     new_row = inserts_after[0]
     assert new_row.confidence == "orphan_odo_only"
     assert new_row.odometer_end == pytest.approx(26825.0)
+
+
+async def test_orphan_duration_capped_when_padded_by_downtime(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.1 — a real missed drive (SoC drop tracks the km, so it's
+    classified 'orphan' not 'orphan_odo_only') must not inherit hours
+    of parked/HA-offline time as its duration.
+
+    Reproduces the 2026-07-18 case: HA restarts briefly, the live path
+    never sees the vehicle_on edges, and recorder recovery finds
+    nothing (nothing was recorded while HA was down either). The old
+    behaviour used the full last_trip.ended_at -> now span (3 h here)
+    as duration_min, producing an absurd ~1.7 km/h average for a real
+    5 km drive. It must now be capped to the longest duration
+    compatible with _ORPHAN_MIN_PLAUSIBLE_AVG_KMH (15 km/h floor).
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    last = TripRecord(
+        started_at=now - timedelta(hours=5),
+        ended_at=now - timedelta(hours=3),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+        soc_start=64.0, soc_end=60.0,
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    async def _empty_recover(*, since, until):
+        return 0
+
+    coordinator.async_recover_missing_trips_service = _empty_recover  # type: ignore[assignment]
+    inserts_before = (await coordinator.storage.async_recent_trips(50))
+
+    # 5 km gap, 1% SoC drop — ratio 1.0 vs the 15 kWh/100km default
+    # expectation (0.2%/km * 5 km = 1.0%), so this classifies 'orphan'.
+    await coordinator._async_insert_orphan_with_recovery(
+        last, now, 26829.0, 59.0, 5.0,
+    )
+    inserts_after = (await coordinator.storage.async_recent_trips(50))
+    assert len(inserts_after) == len(inserts_before) + 1
+    new_row = inserts_after[0]
+    assert new_row.confidence == "orphan"
+    # Capped to 5 km / 15 km/h == 20 min, not the naive 180 min span.
+    assert new_row.duration_min == pytest.approx(20.0)
+    assert new_row.avg_speed_kmh == pytest.approx(15.0)
+    assert new_row.started_at == now - timedelta(minutes=20.0)
+    assert new_row.odometer_end == pytest.approx(26829.0)
 
 
 def test_integrate_evse_from_recorder_masks_idle_windows() -> None:

@@ -1,6 +1,8 @@
 """Tests for the ABRP telemetry payload builder."""
 from __future__ import annotations
 
+import pytest
+
 from custom_components.ev_trip_logger.abrp import build_tlm
 
 
@@ -40,3 +42,24 @@ def test_heading_normalised_into_0_360() -> None:
 def test_soc_always_present_baseline() -> None:
     assert _base()["soc"] == 55.0
     assert "capacity" not in _base()  # not sent unless provided
+
+
+def test_soe_derived_from_soc_and_capacity() -> None:
+    """v0.8.1 — soe (present energy, kWh) is free to derive from two
+    fields we already send; ABRP accepts it as a lower-priority field.
+    """
+    tlm = _base(soc=55.0, capacity=80.0)
+    assert tlm["soe"] == pytest.approx(44.0)
+
+
+def test_soe_omitted_without_capacity() -> None:
+    assert "soe" not in _base(soc=55.0)
+
+
+def test_power_sign_discharge_positive_charge_negative() -> None:
+    """ABRP convention: +discharge / -charge. build_tlm's input is the
+    opposite (-discharge / +charge) so it can negate once and land on
+    ABRP's convention.
+    """
+    assert _base(power_w=-5000.0)["power"] == pytest.approx(5.0)  # discharge
+    assert _base(power_w=3000.0)["power"] == pytest.approx(-3.0)  # charge

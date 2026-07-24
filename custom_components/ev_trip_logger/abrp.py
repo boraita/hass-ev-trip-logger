@@ -107,6 +107,11 @@ def build_tlm(
     # capacity: usable pack capacity (kWh), from the calibrated estimate.
     if capacity is not None and capacity > 0:
         tlm["capacity"] = round(float(capacity), 2)
+        # soe: present energy (kWh) = soc% x capacity. Free to derive from
+        # two fields we already send; ABRP accepts it as a lower-priority
+        # telemetry field alongside soc/capacity.
+        if soc is not None:
+            tlm["soe"] = round(float(soc) / 100.0 * float(capacity), 2)
     # kwh_charged: energy added so far in the active charge session.
     if kwh_charged is not None and kwh_charged > 0:
         tlm["kwh_charged"] = round(float(kwh_charged), 2)

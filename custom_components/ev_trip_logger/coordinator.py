@@ -263,6 +263,16 @@ _ORPHAN_DEFAULT_KWH_100KM = 15.0
 # the SoC didn't track the km the way a real drive would.
 _ORPHAN_RATIO_MIN = 0.5
 _ORPHAN_RATIO_MAX = 2.0
+# v0.8.1 — floor on the average speed an 'orphan' (SoC-consistent) window
+# can imply before we treat it as padded by parked/offline time rather than
+# driving. A short HA restart (or any gap the live path + recorder recovery
+# both miss) still uses last_trip.ended_at -> now as the window, which bakes
+# in however long HA was down as if it were part of the drive. 15 km/h is a
+# conservative floor (well below sustained city-traffic speed); below it we
+# cap the window to the longest duration still compatible with "drove at
+# least this fast" instead of reporting hours of mostly-parked time as the
+# trip's duration.
+_ORPHAN_MIN_PLAUSIBLE_AVG_KMH = 15.0
 # Max age the synth-trip baseline can be before we discard it. Without
 # this, `_async_check_odo_jump` happily uses `_last_idle_odo` from
 # yesterday as the start anchor for today's drive, producing 10 h
@@ -3182,15 +3192,19 @@ class EvTripLoggerCoordinator:
         doesn't flood the endpoint. Skipped entirely if the client
         isn't configured.
 
-        Sign note: our power sensor is in kW with the standard EV
-        convention **+discharge / -charge**. ABRP wants kW with the
-        SAME convention. `build_tlm` negates the watts it receives so
-        the round-trip matches ABRP's sign expectation; we pre-negate
-        the W value here to cancel that, regardless of which vendor
-        produced the original sensor. `CONF_POWER_SIGN_INVERTED` is
-        the user-facing knob for sources that report discharge as
-        negative (e.g. some BYD cloud entities); ABRP push picks up
-        the already-corrected power without re-knowing about it.
+        Sign note: ABRP wants kW in the convention **+discharge /
+        -charge**. `build_tlm` negates whatever watts it receives, so
+        it expects the opposite convention as input (-discharge /
+        +charge) and flips it back. `CONF_POWER_SIGN_INVERTED` is the
+        user-facing knob for sources that report discharge as negative
+        (e.g. some BYD cloud entities) — applied here (not just in
+        `_async_power_changed`) because this reads the raw sensor
+        state fresh rather than reusing that method's already-flipped
+        local value. v0.8.1 fix: this used to skip the flag entirely
+        and pre-negate the raw reading unconditionally, which cancelled
+        `build_tlm`'s negation and sent the raw sensor sign straight
+        through — backwards for any source where discharge isn't
+        already negative.
         """
         if self._abrp is None or not self.abrp_push_enabled:
             return
@@ -3201,13 +3215,15 @@ class EvTripLoggerCoordinator:
         # Snapshot every value we feed into ABRP up-front (read once).
         soc = self._read_float(self._battery)
         power_kw = self._read_float(self._power) if self._power else None
-        # build_tlm expects W with BYD-gl convention (+charge/-discharge)
-        # and will negate. Our power_kw is +discharge/-charge, so
-        # convert to W and negate → after build_tlm's negation we get
-        # back to our (and ABRP's) +discharge/-charge convention.
+        # Normalise to +discharge/-charge exactly like _async_power_changed
+        # does (coordinator.py ~2913), since we're reading the raw sensor
+        # state fresh here rather than reusing that method's local value.
+        # build_tlm then negates once more to hand ABRP its own
+        # +discharge/-charge convention back.
         power_w_for_tlm: float | None = None
         if power_kw is not None:
-            power_w_for_tlm = -float(power_kw) * 1000.0
+            norm_kw = -power_kw if self._power_sign_inverted else power_kw
+            power_w_for_tlm = -float(norm_kw) * 1000.0
         speed = self._read_float(self._speed) if self._speed else None
         odo = self._read_float(self._odometer)
         ext_temp = self._read_float(self._temp) if self._temp else None
@@ -3830,6 +3846,31 @@ class EvTripLoggerCoordinator:
                     (now - last_trip.ended_at).total_seconds() / 3600.0,
                     last_trip.ended_at.isoformat(), now.isoformat(),
                 )
+        # v0.8.1 — same padding problem for real 'orphan' drives (SoC
+        # consistent with the km, so distance/energy stay trustworthy),
+        # but a short HA restart (or any gap the live path + recorder
+        # recovery both miss) still stretches the window from the
+        # previous trip's end to `now`, baking the downtime in as if it
+        # were driving. Cap it to the longest duration still compatible
+        # with having driven at _ORPHAN_MIN_PLAUSIBLE_AVG_KMH — this
+        # only ever shortens (never invents a faster-than-observed
+        # trip), so a 10 km gap can't read as a multi-hour drive.
+        elif confidence == "orphan" and duration_min > 0 and km_gap > 0:
+            implied_avg = km_gap / (duration_min / 60.0)
+            if implied_avg < _ORPHAN_MIN_PLAUSIBLE_AVG_KMH:
+                capped_min = (km_gap / _ORPHAN_MIN_PLAUSIBLE_AVG_KMH) * 60.0
+                bounded = now - timedelta(minutes=capped_min)
+                if bounded > last_trip.ended_at:
+                    _LOGGER.info(
+                        "Orphan duration capped: implied avg %.1f km/h < "
+                        "%.0f km/h floor — window likely padded by parked/"
+                        "offline time (%.1f min -> %.1f min)",
+                        implied_avg, _ORPHAN_MIN_PLAUSIBLE_AVG_KMH,
+                        duration_min, capped_min,
+                    )
+                    orphan_started_at = bounded
+                    duration_s = capped_min * 60.0
+                    duration_min = capped_min
 
         avg_speed = (
             (km_gap / (duration_min / 60.0))
