@@ -28,6 +28,7 @@
           "idle_trip_timeout_minutes": "Inside-trip idle watchdog (min) — force-close after this long without movement",
           "dcfc_threshold_kw": "DC fast-charge threshold (kW) — charges above this are tagged DCFC",
           "energy_price_kwh": "Home charge price per kWh (default when no charge logged)",
+          "energy_price_entity": "Home charge price entity (optional — overrides the fixed price with a live tariff sensor, e.g. Octopus/Nordpool/PVPC)",
           "currency": "Currency",
           "home_zone": "Home zone (closes journeys when device tracker enters)",
           "recent_trips_limit": "Recent trips to keep in lists"
@@ -63,6 +64,7 @@
           "idle_trip_timeout_minutes": "Inside-trip idle watchdog (min) — force-close after this long without movement",
           "dcfc_threshold_kw": "DC fast-charge threshold (kW) — charges above this are tagged DCFC",
           "energy_price_kwh": "Home charge price per kWh (default when no charge logged)",
+          "energy_price_entity": "Home charge price entity (optional — overrides the fixed price with a live tariff sensor, e.g. Octopus/Nordpool/PVPC)",
           "currency": "Currency",
           "home_zone": "Home zone (closes journeys when device tracker enters)",
           "recent_trips_limit": "Recent trips to keep in lists"

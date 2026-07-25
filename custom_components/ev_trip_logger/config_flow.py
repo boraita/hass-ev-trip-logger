@@ -32,6 +32,7 @@ from .const import (
     CONF_CURRENCY,
     CONF_DRIVER_SENSOR,
     CONF_ENERGY_PRICE,
+    CONF_ENERGY_PRICE_ENTITY,
     CONF_HOME_ZONE,
     CONF_IDLE_TIMEOUT,
     CONF_IDLE_TRIP_TIMEOUT_MIN,
@@ -407,6 +408,10 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                     unit_of_measurement="/kWh",
                 )
             ),
+            vol.Optional(
+                CONF_ENERGY_PRICE_ENTITY,
+                description={"suggested_value": defaults.get(CONF_ENERGY_PRICE_ENTITY)},
+            ): EntitySelector(EntitySelectorConfig(domain="sensor")),
             # ISO-4217 code — dropdown of common currencies, custom entry
             # allowed for anything not listed (keeps it free-form but guides
             # away from typos like "EURO").

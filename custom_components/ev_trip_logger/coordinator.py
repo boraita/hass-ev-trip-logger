@@ -59,6 +59,7 @@ from .const import (
     CONF_CHARGE_SENSOR,
     CONF_CURRENCY,
     CONF_ENERGY_PRICE,
+    CONF_ENERGY_PRICE_ENTITY,
     CONF_HOME_ZONE,
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
@@ -966,6 +967,7 @@ class EvTripLoggerCoordinator:
         self._idle_timeout = int(merged.get(CONF_IDLE_TIMEOUT, DEFAULT_IDLE_TIMEOUT))
         self._recent_limit = max(1, int(merged.get(CONF_RECENT_LIMIT, DEFAULT_RECENT_LIMIT)))
         self._energy_price = float(merged.get(CONF_ENERGY_PRICE, DEFAULT_ENERGY_PRICE))
+        self._energy_price_entity = merged.get(CONF_ENERGY_PRICE_ENTITY) or None
         self._currency = merged.get(CONF_CURRENCY, DEFAULT_CURRENCY)
         self._home_zone = merged.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE)
 
@@ -1525,6 +1527,30 @@ class EvTripLoggerCoordinator:
         self._geocode_cache[key] = label
         return label
 
+    def _current_energy_price(self) -> float:
+        """Live home tariff in €/kWh.
+
+        If a price entity is configured (`energy_price_entity`) and its
+        state is numeric, return that — so dynamic tariffs (Octopus,
+        Nordpool, PVPC, …) drive trip/charge cost. The state is read at
+        cost-computation time (trip/charge close), capturing the tariff
+        period in effect then. Falls back to the fixed `energy_price_kwh`
+        when no entity is set or its state is unavailable/non-numeric.
+        """
+        entity_id = self._energy_price_entity
+        if entity_id:
+            state = self.hass.states.get(entity_id)
+            if state is not None and state.state not in (
+                "unknown",
+                "unavailable",
+                "",
+            ):
+                try:
+                    return float(state.state)
+                except (ValueError, TypeError):
+                    pass
+        return float(self._energy_price)
+
     def _trip_cost_price_per_kwh(self) -> float:
         """€/kWh fallback for trip cost when FIFO inventory is empty.
 
@@ -1542,13 +1568,14 @@ class EvTripLoggerCoordinator:
             was logged (typical at fresh install) or when the
             inventory queue runs dry mid-trip.
         """
-        return float(self._energy_price)
+        return float(self._current_energy_price())
 
     @property
     def recent_avg_tariff_per_kwh(self) -> float:
         """v0.6.4 — kWh-weighted average price paid across recent
-        charges, fallback to the home tariff (`_energy_price`) when
-        nothing is cached or the average is zero.
+        charges, fallback to the home tariff (live entity if
+        configured, else `_energy_price`) when nothing is cached or
+        the average is zero.
 
         Powers the dashboard-friendly `cost_at_avg_tariff` attribute
         on trips. The default `cost` stays FIFO-correct (reflects
@@ -1562,7 +1589,7 @@ class EvTripLoggerCoordinator:
         cached = self._avg_tariff_cache_per_kwh
         if cached is not None and cached > 0:
             return cached
-        return float(self._energy_price)
+        return float(self._current_energy_price())
 
     @property
     def exterior_temp(self) -> float | None:
@@ -1845,7 +1872,7 @@ class EvTripLoggerCoordinator:
         # Re-cost the just-rewritten trips at the home tariff.
         try:
             await self.storage.async_recompute_trip_costs_from_charges(
-                default_price=self._energy_price
+                default_price=self._current_energy_price()
             )
         except Exception as exc:  # pragma: no cover — defensive
             _LOGGER.debug("Cost re-heal post-energy-heal failed: %s", exc)
@@ -1948,7 +1975,7 @@ class EvTripLoggerCoordinator:
         # propagated. Idempotent and cheap.
         try:
             healed = await self.storage.async_recompute_trip_costs_from_charges(
-                default_price=self._energy_price
+                default_price=self._current_energy_price()
             )
             if healed:
                 _LOGGER.info("Startup heal: recomputed cost on %d trip(s)", healed)
@@ -2849,7 +2876,7 @@ class EvTripLoggerCoordinator:
         # (and earlier trips heal if their basis changed).
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
-                self._energy_price,
+                self._current_energy_price(),
             )
 
         # v0.5.25 — persist the route so the dashboard map can render
@@ -3912,7 +3939,7 @@ class EvTripLoggerCoordinator:
         # v0.5.76 — keep FIFO inventory accounting consistent.
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
-                self._energy_price,
+                self._current_energy_price(),
             )
         _LOGGER.info(
             "Orphan trip inserted (%s): %.2f km, soc %s→%s, duration %.1f min",
@@ -3975,7 +4002,7 @@ class EvTripLoggerCoordinator:
         self._schedule_vehicle_heal(trip_id)
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
-                self._energy_price,
+                self._current_energy_price(),
             )
         _LOGGER.info(
             "Disconnect-orphan inserted #%s: %.2f km / %.1f min (soc %s→%s)",
@@ -4755,7 +4782,7 @@ class EvTripLoggerCoordinator:
         # changed.
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
-                self._energy_price,
+                self._current_energy_price(),
             )
 
         # v0.5.30 (issue #5) — when we just auto-stitched a new
@@ -4872,7 +4899,7 @@ class EvTripLoggerCoordinator:
             price_per_kwh = total_cost / kwh if kwh else 0.0
         else:
             if price_per_kwh is None:
-                price_per_kwh = self._energy_price
+                price_per_kwh = self._current_energy_price()
             price_per_kwh = float(price_per_kwh)
             total_cost = kwh * price_per_kwh
 
@@ -4940,7 +4967,7 @@ class EvTripLoggerCoordinator:
         # v0.5.76 — a new charge slice changes future FIFO cost basis;
         # rebuild trip costs so everything stays consistent.
         await self.storage.async_recompute_trip_costs_from_charges(
-            self._energy_price,
+            self._current_energy_price(),
         )
 
         self.hass.bus.async_fire(
@@ -5008,7 +5035,7 @@ class EvTripLoggerCoordinator:
         # used that energy. Trips with no prior charge fall back to the
         # configured home tariff.
         n = await self.storage.async_recompute_trip_costs_from_charges(
-            default_price=self._energy_price
+            default_price=self._current_energy_price()
         )
         if n:
             _LOGGER.info("Recomputed cost on %d trip(s) after price correction", n)
@@ -5048,7 +5075,7 @@ class EvTripLoggerCoordinator:
         # so derived sums (today/week/month) reflect the correction.
         try:
             await self.storage.async_recompute_trip_costs_from_charges(
-                default_price=self._energy_price
+                default_price=self._current_energy_price()
             )
         except Exception:  # pragma: no cover — defensive
             pass
@@ -5731,7 +5758,7 @@ class EvTripLoggerCoordinator:
             )
         if inserted:
             await self.storage.async_recompute_trip_costs_from_charges(
-                self._energy_price,
+                self._current_energy_price(),
             )
             self.last_trip = await self.storage.async_get_last()
             self._notify_listeners()
@@ -5859,7 +5886,7 @@ class EvTripLoggerCoordinator:
         # accounting as live / synth ones.
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
-                self._energy_price,
+                self._current_energy_price(),
             )
 
         if stitched_orphan_home and journey_id is not None:
@@ -6092,7 +6119,7 @@ class EvTripLoggerCoordinator:
         # Re-cost via FIFO so the trip's cost + basis reflect the new
         # energy. Idempotent.
         await self.storage.async_recompute_trip_costs_from_charges(
-            self._energy_price,
+            self._current_energy_price(),
         )
         self._notify_trip_log_listeners()
 
@@ -6566,7 +6593,7 @@ class EvTripLoggerCoordinator:
             kwh_so_far = (soc_now - active.soc_start) / 100.0 * self.battery_capacity
         # Live price: the user can correct it post-hoc on the last completed
         # charge; while in progress we project the configured home tariff.
-        price_per_kwh = self._energy_price
+        price_per_kwh = self._current_energy_price()
         total_cost = kwh_so_far * price_per_kwh if kwh_so_far else 0.0
         duration_min = max(0.0, (dt_util.now() - active.started_at).total_seconds() / 60.0)
         # is_dcfc classification: while charging we compare last_power_kw if

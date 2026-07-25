@@ -29,6 +29,7 @@
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
           "idle_trip_timeout_minutes": "Idle watchdog dentro de un trip (min) — cierra trip si no hay movimiento durante este tiempo",
           "energy_price_kwh": "Precio en casa por kWh (default cuando no hay carga registrada)",
+          "energy_price_entity": "Entidad de precio de carga (opcional — sustituye el precio fijo por un sensor de tarifa dinámica, p.ej. Octopus/Nordpool/PVPC)",
           "currency": "Moneda",
           "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)",
           "recent_trips_limit": "Viajes recientes a guardar en listas"
@@ -67,6 +68,7 @@
           "idle_timeout_minutes": "Tiempo de inactividad (min)",
           "idle_trip_timeout_minutes": "Idle watchdog dentro de un trip (min) — cierra trip si no hay movimiento durante este tiempo",
           "energy_price_kwh": "Precio en casa por kWh (default cuando no hay carga registrada)",
+          "energy_price_entity": "Entidad de precio de carga (opcional — sustituye el precio fijo por un sensor de tarifa dinámica, p.ej. Octopus/Nordpool/PVPC)",
           "currency": "Moneda",
           "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)",
           "recent_trips_limit": "Viajes recientes a guardar en listas"
