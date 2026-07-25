@@ -3,8 +3,10 @@
 Optional and credential-gated: only active when the user supplies an ABRP
 generic *user token* (and an *api_key*). Telemetry is pushed off the existing
 coordinator updates — we never start an independent timer that would force
-extra BYD polls (the shared BYD account is sensitive to aggressive polling;
-ABRP gets whatever the coordinator already fetched).
+extra upstream polls. Most cloud-polled EV integrations (BYD's shared account,
+Tesla Fleet, OVMS) have rate limits or shared quotas; piggybacking on the
+coordinator's existing fetches keeps this integration a passive consumer of
+whatever the user's upstream source already produces.
 
 The next-charge target SoC is read from ``/tlm/get_next_charge``, which only
 returns data while an ABRP route is active.
@@ -54,12 +56,21 @@ def build_tlm(
     est_range: float | None,
     odometer: float | None,
     car_model: str | None,
+    heading: float | None = None,
+    soh: float | None = None,
+    capacity: float | None = None,
+    kwh_charged: float | None = None,
 ) -> dict[str, Any]:
     """Build the ABRP ``tlm`` payload from primitives; ``None`` values dropped.
 
-    Sign note: BYD ``realtime.gl`` is **+charging / -discharging** (watts),
-    whereas ABRP ``power`` is **+discharge / -charge** (kW), so we negate.
-    Verify the sign once against a live drive/charge on first deploy.
+    Sign note: ABRP ``power`` is **+discharge / -charge** (kW). We negate
+    the watts we receive so the caller can pass in the standard EV
+    convention (+charging / -discharging) regardless of vendor — that
+    matches what some cloud sources emit natively (e.g. BYD's
+    ``realtime.gl``). For sensors that report the opposite sign, the
+    user enables ``CONF_POWER_SIGN_INVERTED`` upstream so this function
+    keeps a single negation rule. Verify the sign once against a live
+    drive/charge on first deploy.
     """
     tlm: dict[str, Any] = {"utc": int(time.time())}
     if soc is not None:
@@ -84,6 +95,26 @@ def build_tlm(
         tlm["est_battery_range"] = round(float(est_range), 1)
     if odometer is not None:
         tlm["odometer"] = round(float(odometer), 1)
+    # heading: GPS course 0-360°; only meaningful while moving but harmless
+    # parked. Normalised into range so a stray -1/361 sentinel can't leak.
+    if heading is not None:
+        tlm["heading"] = round(float(heading) % 360.0, 1)
+    # soh: state of health %. NOTE this is a *modelled/estimated* value on
+    # cloud-only vehicles (no BMS SoH over the API), sent as a best-effort
+    # hint for ABRP's range model — not a measured figure.
+    if soh is not None:
+        tlm["soh"] = round(float(soh), 1)
+    # capacity: usable pack capacity (kWh), from the calibrated estimate.
+    if capacity is not None and capacity > 0:
+        tlm["capacity"] = round(float(capacity), 2)
+        # soe: present energy (kWh) = soc% x capacity. Free to derive from
+        # two fields we already send; ABRP accepts it as a lower-priority
+        # telemetry field alongside soc/capacity.
+        if soc is not None:
+            tlm["soe"] = round(float(soc) / 100.0 * float(capacity), 2)
+    # kwh_charged: energy added so far in the active charge session.
+    if kwh_charged is not None and kwh_charged > 0:
+        tlm["kwh_charged"] = round(float(kwh_charged), 2)
     if car_model:
         tlm["car_model"] = car_model
     return tlm

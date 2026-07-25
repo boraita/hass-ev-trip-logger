@@ -12,6 +12,20 @@ CONF_ODOMETER: Final = "odometer_sensor"
 CONF_BATTERY: Final = "battery_sensor"
 CONF_VEHICLE_ON: Final = "vehicle_on_sensor"
 CONF_POWER: Final = "power_sensor"
+# v0.5.85 — sign convention of the configured power sensor. Default
+# is "discharge_positive": power > 0 when the motor draws energy
+# from the battery (Tesla, most EVs). Some integrations (BYD cloud
+# entity) report the opposite — discharge as negative. When the user
+# sees inflated `regen_kwh` and a `battery_calibration_factor`
+# stuck at None for every trip, this flag flips the integration so
+# discharge / regen accounting is correct again.
+CONF_POWER_SIGN_INVERTED: Final = "power_sign_inverted"
+# v0.5.89 — optional EVSE (wallbox) power sensor in WATTS or KW. When
+# wired, the integration sums it during the charge session to measure
+# AC-side energy delivered (independent of the car-side power sensor).
+# Comparing car battery input vs charger output exposes real AC→DC
+# losses + onboard charger efficiency (typically 10-15 % delta).
+CONF_EVSE_POWER_SENSOR: Final = "evse_power_sensor"
 CONF_CHARGE_SENSOR: Final = "charge_sensor"
 CONF_LOCATION: Final = "location_tracker"
 CONF_TEMP: Final = "exterior_temp_sensor"
@@ -34,6 +48,13 @@ CONF_BATTERY_CHEMISTRY: Final = "battery_chemistry"
 CONF_VEHICLE_FIRST_REGISTERED: Final = "vehicle_first_registered"
 DEFAULT_BATTERY_CHEMISTRY: Final = "lfp"
 CONF_SPEED: Final = "speed_sensor"
+# v0.8.0 — optional sensors surfaced to ABRP telemetry (only used for the
+# ABRP push; no effect on trip logging). `range_sensor`: the vehicle's
+# estimated remaining range (km) → ABRP `est_battery_range`. `heading_sensor`:
+# GPS heading/course in degrees (0-360) → ABRP `heading`, improving ABRP's
+# route matching. Both optional; dropped from the payload when unset/invalid.
+CONF_RANGE_SENSOR: Final = "range_sensor"
+CONF_HEADING_SENSOR: Final = "heading_sensor"
 CONF_PLUG_SENSOR: Final = "plug_sensor"
 # v0.5.35 — optional polling-pause sensor (e.g. BYD's
 # switch.byd_sealion_7_disable_polling). When ON, the manufacturer
@@ -98,6 +119,39 @@ DEFAULT_ABRP_PUSH_INTERVAL_S: Final = 30
 ABRP_NEXT_CHARGE_REFRESH_S: Final = 120
 
 CONF_BATTERY_CAPACITY: Final = "battery_capacity_kwh"
+# v0.6.3 — optional pick from `cohort_baselines.json`. When set, the
+# SoH model uses the cohort's observed "new" capacity as its 100 %
+# anchor (Tessie pattern) instead of nameplate. The file ships with a
+# seed list (BYD / Tesla / Hyundai / Kia / VW / Renault / MG /
+# Nissan / Polestar / Škoda); a blank value falls back to nameplate
+# so the integration stays usable for vehicles not in the seed.
+CONF_VEHICLE_MODEL: Final = "vehicle_model_key"
+# v0.6.6 — typical kW the vehicle draws while parked with ignition
+# on (HVAC compressor + electronics + infotainment). Used to estimate
+# how much of a trip's total kWh went to "waiting with the AC on" so
+# the dashboard can surface a "moving-only" consumption number.
+# 2.5 kW covers a mid-size SUV in summer with AC on. Set lower for
+# small EVs or winter, higher for ute / luxury cabin cooling.
+CONF_IDLE_POWER_ESTIMATE_KW: Final = "idle_power_estimate_kw"
+DEFAULT_IDLE_POWER_ESTIMATE_KW: Final = 2.5
+# v0.7.5 — optional elevation lookup at trip close. When enabled, the
+# integration sends the trip's downsampled GPS polyline to the
+# configured provider (open-elevation.com by default; opentopodata
+# variants + a user-hostable URL also supported) and stores
+# elevation_gain_m / elevation_loss_m / elevation_variance_m2.
+# Feature-flagged off by default because it sends GPS points off-
+# host, so opt-in is explicit. Provider list matches
+# `elevation._PROVIDER_URLS`.
+CONF_ELEVATION_PROVIDER: Final = "elevation_provider"
+CONF_ELEVATION_PROVIDER_URL: Final = "elevation_provider_url"
+DEFAULT_ELEVATION_PROVIDER: Final = "none"
+ELEVATION_PROVIDER_OPTIONS: Final = (
+    "none",
+    "open-elevation",
+    "opentopodata-eudem",
+    "opentopodata-srtm",
+    "custom",
+)
 CONF_DCFC_THRESHOLD_KW: Final = "dcfc_threshold_kw"
 CONF_IDLE_TRIP_TIMEOUT_MIN: Final = "idle_trip_timeout_minutes"
 DEFAULT_IDLE_TRIP_TIMEOUT_MIN: Final = 10
@@ -114,7 +168,7 @@ DEFAULT_MIN_TRIP_DISTANCE: Final = 0.5
 DEFAULT_IDLE_TIMEOUT: Final = 2
 DEFAULT_ENERGY_PRICE: Final = 0.15
 DEFAULT_CURRENCY: Final = "EUR"
-DEFAULT_HOME_ZONE: Final = "home"
+DEFAULT_HOME_ZONE: Final = "zone.home"
 # How many recent trips/charges/journeys to expose in the list sensors'
 # attributes for dashboards. Bounded so one state attribute stays well under
 # the recorder's per-state size limit.
@@ -140,5 +194,10 @@ SERVICE_PURGE_TRIPS: Final = "purge_trips"
 SERVICE_SET_TRIP: Final = "set_trip"
 SERVICE_SET_CHARGE: Final = "set_charge"
 SERVICE_RECOVER_MISSING_TRIPS: Final = "recover_missing_trips"
+# v0.5.95 — backfill evse_energy_kwh + charging_efficiency_pct on a
+# historical charge by trapezoidal-integrating the configured EVSE
+# power sensor's recorder history within [started_at, ended_at],
+# optionally masked by the charge_sensor=on windows.
+SERVICE_BACKFILL_CHARGE_EVSE: Final = "backfill_charge_evse"
 
 STORAGE_FILENAME_TEMPLATE: Final = "ev_trip_logger.{entry_id}.db"

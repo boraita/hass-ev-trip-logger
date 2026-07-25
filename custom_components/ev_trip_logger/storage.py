@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -114,7 +114,62 @@ CREATE TABLE IF NOT EXISTS trips (
     -- Equals cost / energy_kwh; useful for dashboards to surface the
     -- "what did this trip actually cost per kWh" answer (mixes home
     -- tariff and external charges).
-    cost_basis_per_kwh REAL
+    cost_basis_per_kwh REAL,
+    -- v0.5.84: per-trip battery-capacity calibration factor. Ratio of
+    -- the power-integration net energy (∫|P|·dt − 2·regen, the real
+    -- kWh drawn from the battery measured at the motor) to the SoC-
+    -- delta energy assuming nominal capacity. K ≈ 1.0 means battery
+    -- capacity matches nominal. Persistent drift toward K < 1.0 across
+    -- many trips signals real degradation (or power-integration gap).
+    -- NULL when soc_delta is too small (<2%, quantization-dominated)
+    -- or when energy_from_power is missing.
+    calibration_factor_k REAL,
+    -- v0.5.86: 95% confidence band on consumption_kwh_100km. Lower
+    -- and upper bounds capture quantization noise of the energy
+    -- source used. Useful when a 5km trip shows 16.5 with band
+    -- [11-22] vs a 30km trip showing 16.5 with band [15-18]; same
+    -- headline number, very different signal quality.
+    consumption_lower_kwh_100km REAL,
+    consumption_upper_kwh_100km REAL,
+    -- v0.5.86: heuristic flag. True when the trip's data has noise
+    -- dominating the signal (distance < 2 km on SoC-only, or
+    -- relative band > 40 %). Dashboards hide / grey these out of
+    -- aggregates so the rolling baselines aren't polluted by
+    -- quantization artifacts.
+    low_confidence INTEGER,
+    -- v0.6.0: gross discharge energy = ∫P·dt over P>0 segments.
+    -- Pairs with regen_kwh to separate "what came out of the battery"
+    -- from "what went back in" — OVMS-style split (ms_v_bat_energy_used
+    -- vs _recd). The existing energy_kwh stays NET (what the user
+    -- effectively burned); discharge_kwh is the gross half useful for
+    -- per-driver regen ratio, per-direction K calibration, and SoH
+    -- inputs that should exclude regen overhead.
+    discharge_kwh REAL,
+    -- v0.6.6: minutes the vehicle was on but stationary (waiting with
+    -- AC on, drive-through queues, traffic lights on a hot day).
+    -- Combined with the configured `idle_power_estimate_kw` lets
+    -- dashboards split "energy used moving" vs "energy burned
+    -- waiting" — explains high kWh/100km headlines on trips
+    -- dominated by idle time.
+    idle_minutes REAL,
+    -- v0.7.3: 95th-percentile of the trip's per-tick speed samples.
+    -- Ranked 4th-strongest feature for trip-level consumption
+    -- prediction in the Chalmers 2024 QRNN study (ρ ≈ 0.29). Robust
+    -- to a single spike (unlike max_speed_kmh). NULL when no speed
+    -- sensor was wired.
+    v95_speed_kmh REAL,
+    -- v0.7.3: percentage of live-tick samples where speed ≥ 80 km/h.
+    -- Lets dashboards render an "urban vs autopista" split without
+    -- re-deriving it from raw samples. NULL when no speed sensor.
+    highway_ratio_pct REAL,
+    -- v0.7.5: elevation profile stats from an external elevation
+    -- provider (open-elevation.com / opentopodata / custom URL).
+    -- Ranked 3rd-strongest feature for consumption prediction in
+    -- Chalmers 2024 QRNN study (ρ ≈ 0.39). All NULL when the
+    -- elevation feature is off (default) or the API call failed.
+    elevation_gain_m REAL,
+    elevation_loss_m REAL,
+    elevation_variance_m2 REAL
 );
 CREATE INDEX IF NOT EXISTS idx_trips_started_at ON trips(started_at);
 
@@ -134,7 +189,31 @@ CREATE TABLE IF NOT EXISTS charges (
     -- price_locked = 1 when the user has explicitly corrected the price via
     -- set_last_charge_price. Auto-detect must NOT stomp it with a phantom
     -- second insert. NULL/0 = price is just the default fallback.
-    price_locked INTEGER
+    price_locked INTEGER,
+    -- v0.5.90: AC-side energy delivered by the EVSE/wallbox (W·h
+    -- converted to kWh by the integration). Comparing kwh (battery
+    -- input) vs evse_energy_kwh (charger output) gives real AC→DC
+    -- efficiency. NULL when no `evse_power_sensor` was configured.
+    evse_energy_kwh REAL,
+    -- v0.5.90: kwh / evse_energy_kwh × 100. Typical AC home charger:
+    -- 88-94 %. DC fast: 92-97 %. Below 85 % signals lossy cable /
+    -- wallbox / onboard charger derating.
+    charging_efficiency_pct REAL,
+    -- v0.6.0: peak instantaneous charge power during the session
+    -- (max |power| sample from the vehicle's power sensor, or the
+    -- EVSE sensor when only that is wired). Drives DCFC-stress
+    -- accounting in the SoH model — Geotab's 22 700-EV study
+    -- (https://www.geotab.com/blog/ev-battery-health/) reports
+    -- ~3.0 %/yr degradation for heavy DCFC users (>100 kW peaks)
+    -- vs ~1.5 %/yr for AC-only, the largest operational stressor.
+    peak_charge_power_kw REAL,
+    -- v0.6.5: ambient temperature at charge close (read from
+    -- CONF_TEMP if wired). Feeds the SoH sample-gate: charges at
+    -- extreme temperatures (<5 °C or >35 °C) produce noisier
+    -- ΔSoC↔ΔkWh samples (BMS reserves a bigger buffer when cold,
+    -- fast-charging derates when hot) so they're excluded from the
+    -- capacity median. NULL when no temperature sensor is wired.
+    temperature_c REAL
 );
 CREATE INDEX IF NOT EXISTS idx_charges_ended_at ON charges(ended_at);
 
@@ -206,6 +285,40 @@ class TripRecord:
     # produced for this trip. Equals cost / energy_kwh once the
     # post-insert recompute has run; None until then.
     cost_basis_per_kwh: float | None = None
+    # v0.5.84: ratio of power-integrated net energy to SoC-derived
+    # nominal energy. ~1.0 when battery capacity matches nominal;
+    # rolling median across many trips estimates real degradation.
+    calibration_factor_k: float | None = None
+    # v0.5.86: 95% confidence band on `consumption_kwh_100km`. Lower
+    # and upper bounds derived from quantization noise of the source
+    # used. None when not computed.
+    consumption_lower_kwh_100km: float | None = None
+    consumption_upper_kwh_100km: float | None = None
+    # v0.5.86: heuristic — trips where noise dominates signal. True
+    # for sub-2km trips on SoC-only, or trips where the band is more
+    # than 40% of the headline value.
+    low_confidence: bool | None = None
+    # v0.6.0: gross discharge energy. Paired with regen_kwh, lets the
+    # caller see "energy out vs energy back" without losing the net
+    # number in `energy_kwh`. Always positive; None when no power
+    # samples were captured.
+    discharge_kwh: float | None = None
+    # v0.6.6: minutes the vehicle was on but stationary during the trip.
+    # Lets dashboards expose a "moving consumption" metric that excludes
+    # waiting-with-AC overhead. None when no live-tick data was captured
+    # (synth / recovered trips).
+    idle_minutes: float | None = None
+    # v0.7.3: 95th-percentile speed and highway-ratio derived from the
+    # trip's per-tick speed samples. Both None when no speed sensor
+    # was wired.
+    v95_speed_kmh: float | None = None
+    highway_ratio_pct: float | None = None
+    # v0.7.5: elevation profile stats from the configured provider.
+    # All None when the feature is disabled (default) or the API
+    # call failed (network / non-200 / malformed).
+    elevation_gain_m: float | None = None
+    elevation_loss_m: float | None = None
+    elevation_variance_m2: float | None = None
     trip_id: int | None = field(default=None, compare=False)
 
     @property
@@ -262,6 +375,13 @@ class TripRecord:
             "energy_source": self.energy_source,
             "energy_from_power": self.energy_from_power,
             "driver": self.driver,
+            "discharge_kwh": self.discharge_kwh,
+            "idle_minutes": self.idle_minutes,
+            "v95_speed_kmh": self.v95_speed_kmh,
+            "highway_ratio_pct": self.highway_ratio_pct,
+            "elevation_gain_m": self.elevation_gain_m,
+            "elevation_loss_m": self.elevation_loss_m,
+            "elevation_variance_m2": self.elevation_variance_m2,
         }
 
 
@@ -283,6 +403,21 @@ class ChargeRecord:
     # True if the user has explicitly set the price (incl. €0 for "free").
     # Auto-detect must not stomp it.
     price_locked: bool = False
+    # v0.5.90: AC-side energy from the configured EVSE / wallbox sensor.
+    # None when no `evse_power_sensor` was wired.
+    evse_energy_kwh: float | None = None
+    # v0.5.90: kwh / evse_energy_kwh × 100 — real AC→DC charging
+    # efficiency. None when evse_energy_kwh is missing or zero.
+    charging_efficiency_pct: float | None = None
+    # v0.6.0: peak instantaneous charging power observed during the
+    # session (max |power_kw| sample). Drives the DCFC-stress
+    # accumulator in the SoH model; sessions ≥ 100 kW are flagged as
+    # high-stress (Geotab fleet study). None when no power signal
+    # was available during the session.
+    peak_charge_power_kw: float | None = None
+    # v0.6.5: ambient temperature at close, drives the SoH sample-gate.
+    # None when no exterior-temp sensor is wired.
+    temperature_c: float | None = None
     charge_id: int | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -387,6 +522,33 @@ class TripStorage:
         # v0.5.76: weighted-average €/kWh from FIFO inventory replay.
         if "cost_basis_per_kwh" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN cost_basis_per_kwh REAL")
+        # v0.5.84: per-trip battery-capacity calibration factor.
+        if "calibration_factor_k" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN calibration_factor_k REAL")
+        # v0.5.86: consumption confidence band + low-confidence flag.
+        for col in (
+            "consumption_lower_kwh_100km",
+            "consumption_upper_kwh_100km",
+        ):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
+        if "low_confidence" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN low_confidence INTEGER")
+        # v0.6.0: gross discharge energy alongside regen, OVMS-style split.
+        if "discharge_kwh" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN discharge_kwh REAL")
+        # v0.6.6: idle_minutes — time spent vehicle_on=on but stationary.
+        if "idle_minutes" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN idle_minutes REAL")
+        # v0.7.3: V95 + highway ratio for speed-distribution metrics.
+        if "v95_speed_kmh" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN v95_speed_kmh REAL")
+        if "highway_ratio_pct" not in trip_cols:
+            conn.execute("ALTER TABLE trips ADD COLUMN highway_ratio_pct REAL")
+        # v0.7.5: elevation profile stats (opt-in feature).
+        for col in ("elevation_gain_m", "elevation_loss_m", "elevation_variance_m2"):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
         # v0.5.54: weather snapshot — averages of start/close readings
         # from the configured weather.* entity. All optional (NULL when
         # CONF_WEATHER_ENTITY isn't set).
@@ -456,6 +618,16 @@ class TripStorage:
             conn.execute("ALTER TABLE charges ADD COLUMN is_dcfc INTEGER")
         if "price_locked" not in charge_cols:
             conn.execute("ALTER TABLE charges ADD COLUMN price_locked INTEGER")
+        # v0.5.90: AC-side energy + AC→DC efficiency.
+        for col in ("evse_energy_kwh", "charging_efficiency_pct"):
+            if col not in charge_cols:
+                conn.execute(f"ALTER TABLE charges ADD COLUMN {col} REAL")
+        # v0.6.0: peak charge power (drives DCFC-stress accounting).
+        if "peak_charge_power_kw" not in charge_cols:
+            conn.execute("ALTER TABLE charges ADD COLUMN peak_charge_power_kw REAL")
+        # v0.6.5: ambient temperature at charge close (SoH sample gate).
+        if "temperature_c" not in charge_cols:
+            conn.execute("ALTER TABLE charges ADD COLUMN temperature_c REAL")
         # v0.5.0: trip_positions table for route-map drilldown.
         conn.execute(
             """
@@ -494,8 +666,19 @@ class TripStorage:
                     confidence, driver,
                     ambient_temp_c, weather_condition, humidity_pct,
                     wind_kmh, precipitation_mm,
-                    cost_basis_per_kwh
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    cost_basis_per_kwh,
+                    calibration_factor_k,
+                    consumption_lower_kwh_100km,
+                    consumption_upper_kwh_100km,
+                    low_confidence,
+                    discharge_kwh,
+                    idle_minutes,
+                    v95_speed_kmh,
+                    highway_ratio_pct,
+                    elevation_gain_m,
+                    elevation_loss_m,
+                    elevation_variance_m2
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat(),
@@ -539,6 +722,17 @@ class TripStorage:
                     record.wind_kmh,
                     record.precipitation_mm,
                     record.cost_basis_per_kwh,
+                    record.calibration_factor_k,
+                    record.consumption_lower_kwh_100km,
+                    record.consumption_upper_kwh_100km,
+                    int(record.low_confidence) if record.low_confidence is not None else None,
+                    record.discharge_kwh,
+                    record.idle_minutes,
+                    record.v95_speed_kmh,
+                    record.highway_ratio_pct,
+                    record.elevation_gain_m,
+                    record.elevation_loss_m,
+                    record.elevation_variance_m2,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -576,7 +770,16 @@ class TripStorage:
         "journey_id", "start_lat", "start_lon", "end_lat", "end_lon",
         "start_address", "end_address", "gps_distance_km",
         "kwh_charged_before", "kwh_charged_during", "confidence",
-        "driver", "cost_basis_per_kwh",
+        "driver", "cost_basis_per_kwh", "calibration_factor_k",
+        "consumption_lower_kwh_100km", "consumption_upper_kwh_100km",
+        "low_confidence",
+        "discharge_kwh",
+        "idle_minutes",
+        "v95_speed_kmh",
+        "highway_ratio_pct",
+        "elevation_gain_m",
+        "elevation_loss_m",
+        "elevation_variance_m2",
         # v0.5.77 — the vehicle-heal path overrides energy_kwh and
         # tags the row as `energy_source='vehicle'` for traceability.
         "energy_source",
@@ -587,6 +790,76 @@ class TripStorage:
         return await self._hass.async_add_executor_job(
             self._get_trip_by_id, trip_id,
         )
+
+    async def async_trips_needing_vehicle_heal(
+        self, hours: int = 24,
+    ) -> list[int]:
+        """v0.5.86 — IDs of recent trips that didn't get vehicle-heal.
+
+        Returns trips closed in the last `hours` whose `energy_source`
+        is anything except `'vehicle'`. The coordinator sweeps these
+        on startup so trips that missed the live heal (HA restart in
+        the 240 s window) get a second chance against the BYD-native
+        sensor.
+        """
+        return await self._hass.async_add_executor_job(
+            self._trips_needing_vehicle_heal, hours,
+        )
+
+    def _trips_needing_vehicle_heal(self, hours: int) -> list[int]:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM trips "
+                "WHERE ended_at >= ? "
+                "  AND (energy_source IS NULL OR energy_source != 'vehicle') "
+                "  AND distance_km IS NOT NULL AND distance_km > 0 "
+                "ORDER BY id DESC LIMIT 50",
+                (cutoff,),
+            ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    async def async_trips_missing_driver(
+        self, *, days: int, limit: int,
+    ) -> list[tuple[int, datetime, datetime]]:
+        """v0.5.97 — IDs + start/end of recent trips with driver=NULL.
+
+        Bounded by `days` (recorder retention is ~10 days, no point
+        looking further back) and `limit` (avoid hundreds of recorder
+        queries at boot on a fresh-install with a big history).
+        Returns rows newest-first so a partial sweep still covers the
+        user's most-recent activity.
+        """
+        return await self._hass.async_add_executor_job(
+            self._trips_missing_driver, days, limit,
+        )
+
+    def _trips_missing_driver(
+        self, days: int, limit: int,
+    ) -> list[tuple[int, datetime, datetime]]:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).isoformat()
+        rows: list[tuple[int, datetime, datetime]] = []
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT id, started_at, ended_at FROM trips "
+                "WHERE driver IS NULL "
+                "  AND started_at IS NOT NULL "
+                "  AND ended_at >= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (cutoff, limit),
+            )
+            for r in cur.fetchall():
+                try:
+                    s = datetime.fromisoformat(r[1])
+                    e = datetime.fromisoformat(r[2])
+                except (TypeError, ValueError):
+                    continue
+                rows.append((int(r[0]), s, e))
+        return rows
 
     def _get_trip_by_id(self, trip_id: int) -> "TripRecord | None":
         with self._connect() as conn:
@@ -1100,30 +1373,54 @@ class TripStorage:
         min_delta_pct: float = 30.0,
         min_charges: int = 5,
         window: int = 30,
-    ) -> tuple[float | None, int]:
+        min_kwh: float = 5.0,
+        temp_min_c: float | None = 5.0,
+        temp_max_c: float | None = 35.0,
+    ) -> tuple[float | None, int, dict[str, int]]:
         """v0.5.51 — derive effective pack capacity from real charges.
 
-        Returns `(median_kwh, n)`. Each eligible charge yields a sample
-        `kwh / (soc_end - soc_start) × 100`. Eligibility:
+        Returns `(median_kwh, n_used, reject_counts)`. Each eligible
+        charge yields a sample `kwh / (soc_end - soc_start) × 100`.
+
+        Gates:
           * `soc_start`, `soc_end`, `kwh` all populated
           * `(soc_end - soc_start) >= min_delta_pct` — keeps SoC
             quantization noise (±1 %) from dominating
-          * `kwh > 0`
+          * `kwh >= min_kwh` — Tessie threshold (>5 kWh by default);
+            BMS-derived measurements jitter wildly on tiny top-ups.
+          * `temperature_c` in `[temp_min_c, temp_max_c]` when present
+            — packs reserve a bigger buffer at <5 °C and derate at
+            >35 °C, both noise sources for capacity samples. Rows
+            without a temperature reading bypass the gate (we don't
+            penalise users without an exterior-temp sensor wired).
+
         Aggregates the median of the last `window` eligible charges
         (median is more robust than mean when one charge had a partially
-        depleted state-of-charge reading). Returns `(None, n)` when n <
-        min_charges and the caller should keep the declared capacity.
+        depleted state-of-charge reading). Returns `(None, n_used, …)`
+        when n_used < min_charges and the caller should keep the
+        declared capacity. `reject_counts` exposes per-gate drop
+        reasons for the SoH sensor's `extra_state_attributes` so the
+        UI can show "9 charges considered, 4 used, 5 rejected (3 too
+        small, 2 cold)".
         """
         return await self._hass.async_add_executor_job(
-            self._effective_capacity_kwh, min_delta_pct, min_charges, window
+            self._effective_capacity_kwh,
+            min_delta_pct, min_charges, window,
+            min_kwh, temp_min_c, temp_max_c,
         )
 
     def _effective_capacity_kwh(
-        self, min_delta_pct: float, min_charges: int, window: int
-    ) -> tuple[float | None, int]:
+        self,
+        min_delta_pct: float,
+        min_charges: int,
+        window: int,
+        min_kwh: float,
+        temp_min_c: float | None,
+        temp_max_c: float | None,
+    ) -> tuple[float | None, int, dict[str, int]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT kwh, soc_start, soc_end FROM charges "
+                "SELECT kwh, soc_start, soc_end, temperature_c FROM charges "
                 "WHERE kwh IS NOT NULL AND kwh > 0 "
                 "  AND soc_start IS NOT NULL AND soc_end IS NOT NULL "
                 "  AND (soc_end - soc_start) >= ? "
@@ -1131,16 +1428,128 @@ class TripStorage:
                 (min_delta_pct, window),
             ).fetchall()
         samples: list[float] = []
-        for kwh, s0, s1 in rows:
+        rejects = {
+            "kwh_too_small": 0,
+            "temp_cold": 0,
+            "temp_hot": 0,
+            "bad_soc_delta": 0,
+        }
+        for kwh, s0, s1, temp in rows:
             try:
+                kwh_f = float(kwh)
                 delta = float(s1) - float(s0)
-                if delta <= 0:
-                    continue
-                samples.append(float(kwh) / delta * 100.0)
             except (TypeError, ValueError):
                 continue
+            if delta <= 0:
+                rejects["bad_soc_delta"] += 1
+                continue
+            # v0.6.5 — Tessie threshold: tiny top-ups are noise.
+            if kwh_f < min_kwh:
+                rejects["kwh_too_small"] += 1
+                continue
+            # v0.6.5 — temperature window. Rows without a reading
+            # bypass the gate (treat as "unknown, assume normal").
+            if temp is not None:
+                try:
+                    t_f = float(temp)
+                    if temp_min_c is not None and t_f < temp_min_c:
+                        rejects["temp_cold"] += 1
+                        continue
+                    if temp_max_c is not None and t_f > temp_max_c:
+                        rejects["temp_hot"] += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            samples.append(kwh_f / delta * 100.0)
         n = len(samples)
         if n < min_charges:
+            return (None, n, rejects)
+        samples.sort()
+        mid = n // 2
+        median = (
+            samples[mid] if n % 2 == 1
+            else (samples[mid - 1] + samples[mid]) / 2.0
+        )
+        return (median, n, rejects)
+
+    async def async_avg_charging_efficiency_pct(
+        self,
+        *,
+        window: int = 30,
+        min_charges: int = 3,
+    ) -> tuple[float | None, int]:
+        """v0.5.90 — rolling-median AC→DC charging efficiency.
+
+        Each charge row with both `kwh` (battery input) and
+        `evse_energy_kwh` (charger output) contributes one sample:
+        kwh / evse_energy_kwh × 100. Median over the last `window`
+        eligible charges; (None, n) when n < `min_charges`. The
+        median is more robust than a mean when one DCFC session
+        skews the distribution.
+        """
+        return await self._hass.async_add_executor_job(
+            self._avg_charging_efficiency_pct, window, min_charges,
+        )
+
+    def _avg_charging_efficiency_pct(
+        self, window: int, min_charges: int,
+    ) -> tuple[float | None, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT charging_efficiency_pct FROM charges "
+                "WHERE charging_efficiency_pct IS NOT NULL "
+                "  AND charging_efficiency_pct > 0 "
+                "ORDER BY id DESC LIMIT ?",
+                (window,),
+            ).fetchall()
+        samples = [float(r[0]) for r in rows if r[0] is not None]
+        n = len(samples)
+        if n < min_charges:
+            return (None, n)
+        samples.sort()
+        mid = n // 2
+        median = (
+            samples[mid] if n % 2 == 1
+            else (samples[mid - 1] + samples[mid]) / 2.0
+        )
+        return (round(median, 2), n)
+
+    async def async_calibration_factor_k_median(
+        self,
+        *,
+        window: int = 30,
+        min_trips: int = 5,
+    ) -> tuple[float | None, int]:
+        """v0.5.84 — rolling-median per-trip battery calibration factor.
+
+        Each trip stores `calibration_factor_k = net_power_kwh /
+        (soc_delta_pct/100 × nominal_capacity_kwh)`. Aggregating the
+        median over the last `window` non-NULL trips smooths individual-
+        trip noise (sampling gaps in power integration) and surfaces a
+        proxy for real battery degradation. K ≈ 1.0 → capacity matches
+        nominal; persistent drift toward K < 1.0 → effective capacity
+        has dropped.
+
+        Returns `(median_k, n_samples)`. `(None, n)` when n < min_trips.
+        """
+        return await self._hass.async_add_executor_job(
+            self._calibration_factor_k_median, window, min_trips,
+        )
+
+    def _calibration_factor_k_median(
+        self, window: int, min_trips: int
+    ) -> tuple[float | None, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT calibration_factor_k FROM trips "
+                "WHERE calibration_factor_k IS NOT NULL "
+                "  AND calibration_factor_k > 0 "
+                "ORDER BY id DESC LIMIT ?",
+                (window,),
+            ).fetchall()
+        samples = [float(r[0]) for r in rows if r[0] is not None]
+        n = len(samples)
+        if n < min_trips:
             return (None, n)
         samples.sort()
         mid = n // 2
@@ -1213,18 +1622,25 @@ class TripStorage:
                     COALESCE(SUM(energy_kwh), 0) AS energy,
                     COALESCE(SUM(cost), 0) AS cost,
                     COALESCE(SUM(regen_kwh), 0) AS regen,
+                    COALESCE(SUM(discharge_kwh), 0) AS discharge,
                     COUNT(*) AS count
                 FROM trips WHERE started_at >= ?
                 """,
                 (since.isoformat(),),
             ).fetchone()
-        distance, energy, cost, regen, count = row
+        distance, energy, cost, regen, discharge, count = row
         avg_consumption = (energy / distance * 100) if distance else 0
+        # v0.6.0: regen_ratio = recovered / gross_discharge. Mirrors
+        # the EV-app convention so dashboards can render "you got 18 %
+        # back from braking this month" without bespoke template math.
+        regen_ratio = (regen / discharge) if discharge else 0.0
         return {
             "distance_km": float(distance),
             "energy_kwh": float(energy),
             "cost": float(cost),
             "regen_kwh": float(regen),
+            "discharge_kwh": float(discharge),
+            "regen_ratio": float(regen_ratio),
             "count": int(count),
             "avg_consumption_kwh_100km": float(avg_consumption),
         }
@@ -1238,8 +1654,10 @@ class TripStorage:
                 """
                 INSERT INTO charges (
                     started_at, ended_at, kwh, price_per_kwh, total_cost,
-                    currency, soc_start, soc_end, location, notes, is_dcfc
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    currency, soc_start, soc_end, location, notes, is_dcfc,
+                    evse_energy_kwh, charging_efficiency_pct,
+                    peak_charge_power_kw, temperature_c
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat() if record.started_at else None,
@@ -1253,6 +1671,10 @@ class TripStorage:
                     record.location,
                     record.notes,
                     int(record.is_dcfc) if record.is_dcfc is not None else None,
+                    record.evse_energy_kwh,
+                    record.charging_efficiency_pct,
+                    record.peak_charge_power_kw,
+                    record.temperature_c,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -1266,6 +1688,21 @@ class TripStorage:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM charges ORDER BY ended_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+        return _row_to_charge(row) if row else None
+
+    async def async_get_charge_by_id(
+        self, charge_id: int
+    ) -> ChargeRecord | None:
+        return await self._hass.async_add_executor_job(
+            self._get_charge_by_id, charge_id,
+        )
+
+    def _get_charge_by_id(self, charge_id: int) -> ChargeRecord | None:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM charges WHERE id = ?", (charge_id,),
             ).fetchone()
         return _row_to_charge(row) if row else None
 
@@ -1290,9 +1727,16 @@ class TripStorage:
         )
 
     # Columns the user can correct via the extended set_charge service.
+    # v0.5.95 — evse_energy_kwh added so the backfill_charge_evse service
+    # (and manual corrections) can write the AC-side integral. Patching
+    # this field auto-recomputes charging_efficiency_pct = kwh / evse × 100.
+    # v0.6.0 — peak_charge_power_kw added so the user can correct
+    # the SoH stress accumulator after the fact (e.g. when a session
+    # ran with the EVSE sensor disconnected but the user knows it was DCFC).
     _CHARGE_USER_EDITABLE = frozenset({
         "started_at", "ended_at", "kwh", "soc_start", "soc_end",
         "location", "notes", "is_dcfc", "currency",
+        "evse_energy_kwh", "peak_charge_power_kw", "temperature_c",
     })
 
     async def async_patch_charge(
@@ -1342,6 +1786,31 @@ class TripStorage:
                     conn.execute(
                         "UPDATE charges SET total_cost = ? WHERE id = ?",
                         (float(row["kwh"]) * float(row["price_per_kwh"]), charge_id),
+                    )
+            # v0.5.95 — if evse_energy_kwh was patched, recompute the
+            # AC→DC efficiency from current kwh on row. Skip when evse is
+            # zero / missing (efficiency undefined). When kwh was also
+            # patched in the same call the SELECT above already reflects
+            # both new values.
+            if "evse_energy_kwh" in clean or "kwh" in clean:
+                row = conn.execute(
+                    "SELECT kwh, evse_energy_kwh FROM charges WHERE id = ?",
+                    (charge_id,),
+                ).fetchone()
+                if (
+                    row is not None
+                    and row["evse_energy_kwh"] is not None
+                    and float(row["evse_energy_kwh"]) > 0
+                    and row["kwh"] is not None
+                ):
+                    eff = round(
+                        float(row["kwh"]) / float(row["evse_energy_kwh"]) * 100.0,
+                        1,
+                    )
+                    conn.execute(
+                        "UPDATE charges SET charging_efficiency_pct = ? "
+                        "WHERE id = ?",
+                        (eff, charge_id),
                     )
             row = conn.execute(
                 "SELECT * FROM charges WHERE id = ?", (charge_id,),
@@ -1795,7 +2264,12 @@ class TripStorage:
             return updated
 
     async def async_extend_last_charge(
-        self, extra_kwh: float, ended_at: datetime, soc_end: float | None = None
+        self,
+        extra_kwh: float,
+        ended_at: datetime,
+        soc_end: float | None = None,
+        extra_evse_kwh: float | None = None,
+        new_peak_power_kw: float | None = None,
     ) -> ChargeRecord | None:
         """Append to the most recent charge instead of inserting a new row.
 
@@ -1812,7 +2286,8 @@ class TripStorage:
         what we store now.
         """
         return await self._hass.async_add_executor_job(
-            self._extend_last_charge, extra_kwh, ended_at, soc_end
+            self._extend_last_charge, extra_kwh, ended_at, soc_end,
+            extra_evse_kwh, new_peak_power_kw,
         )
 
     def _extend_last_charge(
@@ -1820,6 +2295,8 @@ class TripStorage:
         extra_kwh: float,
         ended_at: datetime,
         soc_end: float | None,
+        extra_evse_kwh: float | None = None,
+        new_peak_power_kw: float | None = None,
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -1833,10 +2310,48 @@ class TripStorage:
             new_soc_end = (
                 float(soc_end) if soc_end is not None else row["soc_end"]
             )
+            # v0.5.94 — accumulate EVSE-side energy too. Without this,
+            # merged sessions (multi-pulse plugged windows) lost the
+            # AC measurement: subsequent merges UPDATEd the row but
+            # never wrote evse_energy_kwh / charging_efficiency_pct.
+            cur_evse = (
+                float(row["evse_energy_kwh"])
+                if ("evse_energy_kwh" in row.keys()
+                    and row["evse_energy_kwh"] is not None)
+                else 0.0
+            )
+            new_evse: float | None
+            if extra_evse_kwh is not None and extra_evse_kwh > 0:
+                new_evse = round(cur_evse + float(extra_evse_kwh), 3)
+            else:
+                new_evse = cur_evse if cur_evse > 0 else None
+            new_eff = (
+                round(new_kwh / new_evse * 100.0, 1)
+                if new_evse and new_evse > 0 else None
+            )
+            # v0.6.0 — peak power survives merges: keep the max of the
+            # existing row's value and the new pulse's peak.
+            cur_peak = (
+                float(row["peak_charge_power_kw"])
+                if ("peak_charge_power_kw" in row.keys()
+                    and row["peak_charge_power_kw"] is not None)
+                else None
+            )
+            new_peak: float | None
+            if new_peak_power_kw is not None and new_peak_power_kw > 0:
+                new_peak = max(cur_peak or 0.0, float(new_peak_power_kw))
+                new_peak = round(new_peak, 2)
+            else:
+                new_peak = cur_peak
             conn.execute(
                 "UPDATE charges SET kwh = ?, total_cost = ?, ended_at = ?, "
-                "soc_end = ? WHERE id = ?",
-                (new_kwh, new_total, ended_at.isoformat(), new_soc_end, row["id"]),
+                "soc_end = ?, evse_energy_kwh = ?, charging_efficiency_pct = ?, "
+                "peak_charge_power_kw = ? "
+                "WHERE id = ?",
+                (
+                    new_kwh, new_total, ended_at.isoformat(), new_soc_end,
+                    new_evse, new_eff, new_peak, row["id"],
+                ),
             )
             updated = conn.execute(
                 "SELECT * FROM charges WHERE id = ?", (row["id"],)
@@ -1862,7 +2377,14 @@ class TripStorage:
             self._charges_aggregates_since, since
         )
 
-    def _charges_aggregates_since(self, since: datetime) -> dict[str, float | int]:
+    def _charges_aggregates_since(self, since: datetime) -> dict[str, float | int | None]:
+        # v0.5.101 — also pair-sum kwh + evse_energy_kwh over rows that
+        # actually have EVSE data, so the dashboard can compute charging
+        # efficiency as a properly weighted ratio. Previously the
+        # dashboard would divide `energy_charged_this_month` (sum of
+        # ALL charges' kwh) by `sum(evse_energy_kwh)` (sum over the
+        # SUBSET that had EVSE wired) — a 5x-7x mismatch that produced
+        # impossible 700-800 % efficiency numbers.
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -1873,13 +2395,52 @@ class TripStorage:
                     COALESCE(SUM(CASE WHEN is_dcfc = 1 THEN kwh ELSE 0 END), 0) AS dc_kwh,
                     COALESCE(SUM(CASE WHEN is_dcfc = 1 THEN total_cost ELSE 0 END), 0) AS dc_cost,
                     COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN kwh ELSE 0 END), 0) AS ac_kwh,
-                    COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN total_cost ELSE 0 END), 0) AS ac_cost
+                    COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN total_cost ELSE 0 END), 0) AS ac_cost,
+                    COALESCE(SUM(
+                        CASE WHEN evse_energy_kwh IS NOT NULL
+                                  AND evse_energy_kwh > 0
+                             THEN kwh ELSE 0 END
+                    ), 0) AS kwh_with_evse,
+                    COALESCE(SUM(
+                        CASE WHEN evse_energy_kwh IS NOT NULL
+                                  AND evse_energy_kwh > 0
+                             THEN evse_energy_kwh ELSE 0 END
+                    ), 0) AS evse_kwh,
+                    SUM(CASE WHEN evse_energy_kwh IS NOT NULL
+                                  AND evse_energy_kwh > 0
+                             THEN 1 ELSE 0 END
+                    ) AS evse_count,
+                    -- v0.6.0: high-power-stress accounting. Sessions
+                    -- whose peak power exceeded 100 kW are flagged as
+                    -- the "heavy DCFC" cohort the Geotab fleet study
+                    -- ties to ~3 %/yr SoH loss vs ~1.5 %/yr light-use
+                    -- (https://www.geotab.com/blog/ev-battery-health/).
+                    COALESCE(SUM(
+                        CASE WHEN peak_charge_power_kw IS NOT NULL
+                                  AND peak_charge_power_kw >= 100
+                             THEN kwh ELSE 0 END
+                    ), 0) AS high_power_kwh,
+                    SUM(CASE WHEN peak_charge_power_kw IS NOT NULL
+                                  AND peak_charge_power_kw >= 100
+                             THEN 1 ELSE 0 END
+                    ) AS high_power_count,
+                    MAX(peak_charge_power_kw) AS peak_power_max
                 FROM charges WHERE ended_at >= ?
                 """,
                 (since.isoformat(),),
             ).fetchone()
-        kwh, cost, count, dc_kwh, dc_cost, ac_kwh, ac_cost = row
+        (kwh, cost, count, dc_kwh, dc_cost, ac_kwh, ac_cost,
+         kwh_with_evse, evse_kwh, evse_count,
+         high_power_kwh, high_power_count, peak_power_max) = row
         avg_price = (cost / kwh) if kwh else 0.0
+        # Efficiency is only meaningful when ≥1 charge in the period had
+        # EVSE data. Below that, return None so the UI shows "unknown"
+        # rather than 0 % (which would read as "100 % losses" — wrong).
+        charging_eff: float | None
+        if evse_count and evse_kwh > 0:
+            charging_eff = round(float(kwh_with_evse) / float(evse_kwh) * 100.0, 1)
+        else:
+            charging_eff = None
         return {
             "kwh": float(kwh),
             "total_cost": float(cost),
@@ -1891,6 +2452,17 @@ class TripStorage:
             "dc_kwh": float(dc_kwh),
             "dc_total_cost": float(dc_cost),
             "avg_dc_price_per_kwh": float(dc_cost / dc_kwh) if dc_kwh else 0.0,
+            # v0.5.101
+            "kwh_with_evse": float(kwh_with_evse),
+            "evse_kwh": float(evse_kwh),
+            "evse_count": int(evse_count or 0),
+            "charging_efficiency_pct": charging_eff,
+            # v0.6.0 — DCFC-stress accounting (>=100 kW peak threshold).
+            "high_power_kwh": float(high_power_kwh),
+            "high_power_count": int(high_power_count or 0),
+            "peak_power_max_kw": (
+                float(peak_power_max) if peak_power_max is not None else None
+            ),
         }
 
     async def async_consumption_by_temp_bucket(
@@ -2035,17 +2607,121 @@ class TripStorage:
                 """,
                 (months,),
             ).fetchall()
-        # Reverse to chronological order for chart consumers.
-        return list(reversed([
-            {
-                "month": r[0],
-                "distance_km": round(float(r[1]), 1),
-                "energy_kwh": round(float(r[2]), 2),
-                "cost": round(float(r[3]), 2),
-                "trips": int(r[4]),
+            # charged_kwh is in a separate table keyed by ended_at — bucket it
+            # by the same calendar month so dashboards get a clean per-month
+            # "to battery" figure. Charge-only months (no trips) don't add a
+            # row here; the lifetime accumulator remains the fallback for those.
+            charged = {
+                r[0]: float(r[1])
+                for r in conn.execute(
+                    """
+                    SELECT substr(ended_at, 1, 7) AS month,
+                           COALESCE(SUM(kwh), 0) AS charged_kwh
+                    FROM charges
+                    GROUP BY month
+                    """
+                ).fetchall()
             }
-            for r in rows
-        ]))
+        # Reverse to chronological order for chart consumers.
+        out: list[dict[str, Any]] = []
+        for r in reversed(rows):
+            distance_km = round(float(r[1]), 1)
+            energy_kwh = round(float(r[2]), 2)
+            out.append(
+                {
+                    "month": r[0],
+                    "distance_km": distance_km,
+                    "energy_kwh": energy_kwh,
+                    "cost": round(float(r[3]), 2),
+                    "trips": int(r[4]),
+                    "charged_kwh": round(charged.get(r[0], 0.0), 2),
+                    "avg_consumption_kwh_100km": (
+                        round(energy_kwh / distance_km * 100, 1)
+                        if distance_km > 0
+                        else None
+                    ),
+                }
+            )
+        return out
+
+    async def async_weekly_history(self, weeks: int = 26) -> list[dict[str, Any]]:
+        """Per-week rollup (km, kWh, cost, trips) for the last N ISO weeks."""
+        return await self._hass.async_add_executor_job(
+            self._weekly_history, weeks
+        )
+
+    def _weekly_history(self, weeks: int) -> list[dict[str, Any]]:
+        # Bucket by the *Monday* of each trip's week, matching the
+        # `distance_this_week` aggregate (`_period_start` uses
+        # ``midnight - weekday()``) and the dashboard's Monday-start
+        # grouping. SQLite's ``%W`` is avoided: it is Monday-based but
+        # off-by-one against true ISO weeks at year boundaries. strftime
+        # ``%w`` is Sunday=0, so Monday is ``(%w + 6) % 7`` days back.
+        with sqlite3.connect(self._path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    date(
+                        substr(started_at, 1, 10),
+                        '-' || ((CAST(strftime('%w', substr(started_at, 1, 10))
+                                 AS INTEGER) + 6) % 7) || ' days'
+                    ) AS week_start,
+                    COALESCE(SUM(distance_km), 0) AS distance_km,
+                    COALESCE(SUM(energy_kwh), 0) AS energy_kwh,
+                    COALESCE(SUM(cost), 0) AS cost,
+                    COUNT(*) AS trips
+                FROM trips
+                GROUP BY week_start
+                ORDER BY week_start DESC
+                LIMIT ?
+                """,
+                (weeks,),
+            ).fetchall()
+            # charged_kwh from the charges table, bucketed by the same
+            # Monday-of-week expression on ended_at. Weeks with charges but
+            # no trips don't add a row; the lifetime accumulator covers those.
+            charged = {
+                r[0]: float(r[1])
+                for r in conn.execute(
+                    """
+                    SELECT date(
+                        substr(ended_at, 1, 10),
+                        '-' || ((CAST(strftime('%w', substr(ended_at, 1, 10))
+                                 AS INTEGER) + 6) % 7) || ' days'
+                    ) AS week_start,
+                    COALESCE(SUM(kwh), 0) AS charged_kwh
+                    FROM charges
+                    GROUP BY week_start
+                    """
+                ).fetchall()
+            }
+
+        out: list[dict[str, Any]] = []
+        # Reverse to chronological order for chart consumers.
+        for r in reversed(rows):
+            week_start = r[0]
+            distance_km = round(float(r[1]), 1)
+            energy_kwh = round(float(r[2]), 2)
+            # week_start is a Monday, so isocalendar() yields the correct
+            # ISO year/week even when it straddles a calendar-year change.
+            iso_year, iso_week, _ = date.fromisoformat(week_start).isocalendar()
+            out.append(
+                {
+                    "week": f"{iso_year}-W{iso_week:02d}",
+                    "week_start": week_start,
+                    "distance_km": distance_km,
+                    "energy_kwh": energy_kwh,
+                    "cost": round(float(r[3]), 2),
+                    "trips": int(r[4]),
+                    "charged_kwh": round(charged.get(week_start, 0.0), 2),
+                    "avg_consumption_kwh_100km": (
+                        round(energy_kwh / distance_km * 100, 1)
+                        if distance_km > 0
+                        else None
+                    ),
+                }
+            )
+        return out
 
     async def async_daily_km_window(self, days: int = 60) -> list[dict[str, Any]]:
         """Per-day km totals for the last N days (zero-filled)."""
@@ -2755,6 +3431,17 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         wind_kmh=row["wind_kmh"] if "wind_kmh" in row.keys() else None,
         precipitation_mm=row["precipitation_mm"] if "precipitation_mm" in row.keys() else None,
         cost_basis_per_kwh=row["cost_basis_per_kwh"] if "cost_basis_per_kwh" in row.keys() else None,
+        calibration_factor_k=row["calibration_factor_k"] if "calibration_factor_k" in row.keys() else None,
+        consumption_lower_kwh_100km=row["consumption_lower_kwh_100km"] if "consumption_lower_kwh_100km" in row.keys() else None,
+        consumption_upper_kwh_100km=row["consumption_upper_kwh_100km"] if "consumption_upper_kwh_100km" in row.keys() else None,
+        low_confidence=bool(row["low_confidence"]) if ("low_confidence" in row.keys() and row["low_confidence"] is not None) else None,
+        discharge_kwh=row["discharge_kwh"] if "discharge_kwh" in row.keys() else None,
+        idle_minutes=row["idle_minutes"] if "idle_minutes" in row.keys() else None,
+        v95_speed_kmh=row["v95_speed_kmh"] if "v95_speed_kmh" in row.keys() else None,
+        highway_ratio_pct=row["highway_ratio_pct"] if "highway_ratio_pct" in row.keys() else None,
+        elevation_gain_m=row["elevation_gain_m"] if "elevation_gain_m" in row.keys() else None,
+        elevation_loss_m=row["elevation_loss_m"] if "elevation_loss_m" in row.keys() else None,
+        elevation_variance_m2=row["elevation_variance_m2"] if "elevation_variance_m2" in row.keys() else None,
     )
 
 
@@ -2774,6 +3461,22 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
         notes=row["notes"],
         is_dcfc=bool(is_dcfc_raw) if is_dcfc_raw is not None else None,
         price_locked=bool(row["price_locked"]) if "price_locked" in row.keys() and row["price_locked"] else False,
+        evse_energy_kwh=(
+            row["evse_energy_kwh"]
+            if "evse_energy_kwh" in row.keys() else None
+        ),
+        charging_efficiency_pct=(
+            row["charging_efficiency_pct"]
+            if "charging_efficiency_pct" in row.keys() else None
+        ),
+        peak_charge_power_kw=(
+            row["peak_charge_power_kw"]
+            if "peak_charge_power_kw" in row.keys() else None
+        ),
+        temperature_c=(
+            row["temperature_c"]
+            if "temperature_c" in row.keys() else None
+        ),
     )
 
 
@@ -2790,4 +3493,11 @@ def period_start(now: datetime, period: str) -> datetime:
         return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     if period == "30d":
         return now - timedelta(days=30)
+    if period == "lifetime":
+        # v0.6.1 — monotonically-growing accumulator anchor. Returning
+        # `datetime.min` lets the existing aggregate queries sum over
+        # every row without a special-case branch. The resulting
+        # sensors are TOTAL_INCREASING and qualify for the HA Energy
+        # dashboard (device_class=energy + total_increasing).
+        return datetime.min.replace(tzinfo=now.tzinfo)
     raise ValueError(f"unknown period {period!r}")

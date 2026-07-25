@@ -10,6 +10,7 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import (
     DOMAIN,
+    SERVICE_BACKFILL_CHARGE_EVSE,
     SERVICE_DELETE_LAST_CHARGE,
     SERVICE_DELETE_LAST_TRIP,
     SERVICE_END_TRIP,
@@ -324,6 +325,38 @@ def async_register_services(hass: HomeAssistant) -> None:
         ),
     )
 
+    async def _backfill_charge_evse(call: ServiceCall) -> None:
+        charge_id = int(call.data["charge_id"])
+        sensor = call.data.get("evse_power_sensor")
+        mask = bool(call.data.get("mask_by_charge_sensor", True))
+        for c in _resolve_coordinators(hass, call):
+            patched = await c.async_backfill_charge_evse_service(
+                charge_id=charge_id,
+                evse_power_sensor=sensor,
+                mask_by_charge_sensor=mask,
+            )
+            if patched is not None:
+                _LOGGER.info(
+                    "backfill_charge_evse: entry=%s charge=%s evse=%.3f "
+                    "eff=%s",
+                    c.entry_id, charge_id,
+                    patched.evse_energy_kwh or 0.0,
+                    patched.charging_efficiency_pct,
+                )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_BACKFILL_CHARGE_EVSE, _backfill_charge_evse,
+        schema=_SCHEMA_ENTRY.extend(
+            {
+                vol.Required("charge_id"): vol.All(
+                    vol.Coerce(int), vol.Range(min=1),
+                ),
+                vol.Optional("evse_power_sensor"): cv.string,
+                vol.Optional("mask_by_charge_sensor", default=True): cv.boolean,
+            }
+        ),
+    )
+
 
 @callback
 def async_unregister_services(hass: HomeAssistant) -> None:
@@ -341,6 +374,7 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_SET_TRIP,
         SERVICE_SET_CHARGE,
         SERVICE_RECOVER_MISSING_TRIPS,
+        SERVICE_BACKFILL_CHARGE_EVSE,
     ):
         if hass.services.has_service(DOMAIN, name):
             hass.services.async_remove(DOMAIN, name)

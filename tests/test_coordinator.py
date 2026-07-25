@@ -1,7 +1,7 @@
 """Tests for the trip detection state machine and storage integration."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNKNOWN
@@ -23,6 +23,7 @@ from custom_components.ev_trip_logger.const import (
     CONF_NAME,
     CONF_ODOMETER,
     CONF_POWER,
+    CONF_POWER_SIGN_INVERTED,
     CONF_SPEED,
     CONF_VEHICLE_ON,
     DOMAIN,
@@ -1268,6 +1269,59 @@ async def test_current_charge_dcfc_classification_from_live_power(
     assert snap["is_dcfc"] is True
 
 
+async def test_abrp_push_respects_power_sign_inverted(hass: HomeAssistant) -> None:
+    """v0.8.1 — the ABRP push path must honour CONF_POWER_SIGN_INVERTED,
+    not just _async_power_changed's local normalisation.
+
+    Before the fix, `_async_maybe_send_abrp` re-read the raw power
+    sensor and pre-negated it unconditionally, which cancelled
+    `build_tlm`'s own negation and sent the raw sensor sign straight
+    through to ABRP — ignoring the inversion flag entirely. For a
+    source configured as sign-inverted (discharge reported negative,
+    e.g. the user's BYD cloud sensor), that meant driving (discharge)
+    reached ABRP as negative and charging reached it as positive —
+    exactly backwards from ABRP's +discharge/-charge convention.
+    """
+    from types import SimpleNamespace
+
+    entry = await _setup(hass, **{
+        CONF_POWER: POW,
+        CONF_POWER_SIGN_INVERTED: True,
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    sent: list[dict] = []
+
+    async def _fake_send(tlm):
+        sent.append(tlm)
+        return True
+
+    # Stub in a fake client directly instead of going through real ABRP
+    # config (CONF_ABRP_TOKEN/API_KEY) — that would build a real
+    # AbrpClient on HA's shared aiohttp session, which is unnecessary
+    # network-adjacent setup for what's purely a sign-arithmetic test.
+    coordinator._abrp = SimpleNamespace(send=_fake_send)
+    coordinator.abrp_push_enabled = True
+
+    # Sign-inverted source: -20 kW raw while DRIVING (discharging).
+    hass.states.async_set(POW, "-20")
+    await hass.async_block_till_done()
+    coordinator._abrp_last_send = 0.0
+    await coordinator._async_maybe_send_abrp()
+    assert len(sent) == 1
+    # ABRP convention: discharge must arrive positive.
+    assert sent[0]["power"] == pytest.approx(20.0)
+
+    # Sign-inverted source: +8 kW raw while CHARGING.
+    hass.states.async_set(POW, "8")
+    await hass.async_block_till_done()
+    coordinator._abrp_last_send = 0.0
+    await coordinator._async_maybe_send_abrp()
+    assert len(sent) == 2
+    # ABRP convention: charge must arrive negative.
+    assert sent[1]["power"] == pytest.approx(-8.0)
+
+
 async def test_purge_trips_service_deletes_in_range(hass: HomeAssistant) -> None:
     """purge_trips deletes trips by started_at range; in-memory state refreshes."""
     from custom_components.ev_trip_logger.const import SERVICE_PURGE_TRIPS
@@ -2224,3 +2278,577 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     after = await c.storage.async_get_trip_by_id(trip_id)
     assert after.energy_kwh == pytest.approx(2.60)
     assert after.energy_source == "power_integration"
+
+
+def test_speed_stats_v95_and_highway_ratio() -> None:
+    """v0.7.3 — `_speed_stats` returns nearest-rank V95 + fraction
+    of samples ≥ threshold. Empty/all-None → (None, None).
+    """
+    from custom_components.ev_trip_logger.coordinator import _speed_stats
+
+    # Trip 206-style samples: 30-tick deque (30 s cadence over ~15 min)
+    # with mostly 40-60 km/h and a couple of highway bursts.
+    samples = (
+        [0.0, 0.0, 0.0]            # 3 idle at lights
+        + [40.0, 50.0, 55.0, 45.0] # urban
+        + [70.0, 75.0]             # extra-urban
+        + [95.0, 100.0, 105.0, 117.0, 110.0, 90.0]  # highway
+        + [55.0, 45.0, 30.0]       # slowing to town
+    )
+    v95, highway = _speed_stats(samples, highway_threshold_kmh=80.0)
+    assert v95 is not None and 100.0 <= v95 <= 117.0
+    # 6 samples ≥ 80 out of 18 → 33.3 %
+    assert highway == pytest.approx(33.3, abs=0.1)
+
+    # Empty deque → both None.
+    assert _speed_stats([], highway_threshold_kmh=80.0) == (None, None)
+    # All zeros (car idle whole trip) → V95=0, highway=0.
+    v95, highway = _speed_stats([0.0] * 5, highway_threshold_kmh=80.0)
+    assert v95 == 0.0
+    assert highway == 0.0
+
+
+def test_classify_trip_character_thresholds() -> None:
+    """v0.7.6 — highway_ratio_pct → 'highway' / 'mixed' / 'urban' /
+    None mapping. Cutoffs at 25 % and 60 % mirror the intuition
+    'anything under a quarter is basically city driving' and 'over
+    60 % is unambiguously motorway'.
+    """
+    from custom_components.ev_trip_logger.sensor import (
+        _classify_trip_character,
+    )
+
+    assert _classify_trip_character(None) is None
+    assert _classify_trip_character(0.0) == "urban"
+    assert _classify_trip_character(10.0) == "urban"
+    assert _classify_trip_character(24.9) == "urban"
+    assert _classify_trip_character(25.0) == "mixed"
+    assert _classify_trip_character(45.0) == "mixed"
+    assert _classify_trip_character(59.9) == "mixed"
+    assert _classify_trip_character(60.0) == "highway"
+    assert _classify_trip_character(85.0) == "highway"
+
+
+async def test_trip_record_persists_v95_and_highway_ratio(
+    hass: HomeAssistant,
+) -> None:
+    """v0.7.3 — V95 + highway_ratio round-trip through storage and
+    show up in `_trip_to_attr` output for dashboard consumption.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+    from custom_components.ev_trip_logger.sensor import _trip_to_attr
+
+    entry = await _setup(hass)
+    coord = hass.data[DOMAIN][entry.entry_id]
+    rec = TripRecord(
+        started_at=dt_util.now() - timedelta(minutes=30),
+        ended_at=dt_util.now(),
+        duration_min=30.0,
+        distance_km=25.0,
+        energy_kwh=4.5,
+        consumption_kwh_100km=18.0,
+        v95_speed_kmh=105.0,
+        highway_ratio_pct=42.5,
+    )
+    trip_id = await coord.storage.async_insert(rec)
+    fetched = await coord.storage.async_get_trip_by_id(trip_id)
+    assert fetched is not None
+    assert fetched.v95_speed_kmh == pytest.approx(105.0)
+    assert fetched.highway_ratio_pct == pytest.approx(42.5)
+
+    attr = _trip_to_attr(fetched)
+    assert attr["v95_speed_kmh"] == pytest.approx(105.0)
+    assert attr["highway_ratio_pct"] == pytest.approx(42.5)
+
+
+async def test_trip_record_persists_idle_minutes_field(
+    hass: HomeAssistant,
+) -> None:
+    """v0.7.2 (a.k.a. v0.6.6 idle-tracking) — `idle_minutes` is a
+    persisted column on trips; `_trip_to_attr` derives idle_ratio_pct,
+    idle_energy_kwh_est, and moving_consumption_kwh_100km from it
+    plus the coordinator's `_idle_power_estimate_kw`. Verifies the
+    full chain without depending on live-tick timing.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+    from custom_components.ev_trip_logger.sensor import _trip_to_attr
+
+    entry = await _setup(hass)
+    coord = hass.data[DOMAIN][entry.entry_id]
+    coord._idle_power_estimate_kw = 2.5
+    now = dt_util.now()
+    # Trip 205-style: 19 km, 4.95 kWh, 120 min total, 95 min idle.
+    rec = TripRecord(
+        started_at=now - timedelta(minutes=120),
+        ended_at=now,
+        duration_min=120.0,
+        distance_km=19.0,
+        energy_kwh=4.95,
+        consumption_kwh_100km=26.1,
+        idle_minutes=95.0,
+    )
+    trip_id = await coord.storage.async_insert(rec)
+    fetched = await coord.storage.async_get_trip_by_id(trip_id)
+    assert fetched is not None
+    assert fetched.idle_minutes == pytest.approx(95.0)
+
+    attr = _trip_to_attr(
+        fetched, score_baseline=14.5, idle_power_estimate_kw=2.5,
+    )
+    # Idle ratio: 95 / 120 × 100 = 79.2 %
+    assert attr["idle_ratio_pct"] == pytest.approx(79.2, abs=0.05)
+    # Idle energy estimate: 95 / 60 × 2.5 = 3.96 kWh
+    assert attr["idle_energy_kwh_est"] == pytest.approx(3.96, abs=0.02)
+    # Moving consumption: (4.95 - 3.96) / 19 × 100 = 5.2 kWh/100km
+    assert attr["moving_consumption_kwh_100km"] == pytest.approx(5.2, abs=0.2)
+    # Headline consumption stays at 26.1 — `cost_at_avg_tariff`-style
+    # split: the dashboard now has BOTH numbers and the user can see
+    # the moving-only figure.
+    assert attr["consumption_kwh_100km"] == pytest.approx(26.1)
+
+
+async def test_trip_to_attr_handles_missing_idle(hass: HomeAssistant) -> None:
+    """v0.7.2 — synth / recovered trips have idle_minutes=None.
+    The derived metrics must come back as None (not 0, not a crash).
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+    from custom_components.ev_trip_logger.sensor import _trip_to_attr
+
+    rec = TripRecord(
+        started_at=dt_util.now() - timedelta(minutes=30),
+        ended_at=dt_util.now(),
+        duration_min=30.0,
+        distance_km=20.0,
+        energy_kwh=4.0,
+        consumption_kwh_100km=20.0,
+        idle_minutes=None,  # synth path
+    )
+    attr = _trip_to_attr(rec, idle_power_estimate_kw=2.5)
+    assert attr["idle_minutes"] is None
+    assert attr["idle_ratio_pct"] is None
+    assert attr["idle_energy_kwh_est"] is None
+    assert attr["moving_consumption_kwh_100km"] is None
+
+
+async def test_recent_avg_tariff_falls_back_to_home_price_when_no_charges(
+    hass: HomeAssistant,
+) -> None:
+    """v0.6.4 — `recent_avg_tariff_per_kwh` returns the configured
+    home tariff when the storage aggregate has no recent charges
+    (empty cache → fallback). Prevents the dashboard `cost_at_avg_
+    tariff` from rendering 0 € on a fresh install just because no
+    charges are logged yet.
+    """
+    from custom_components.ev_trip_logger.const import CONF_ENERGY_PRICE
+
+    entry = await _setup(hass, **{CONF_ENERGY_PRICE: 0.07})
+    coord = hass.data[DOMAIN][entry.entry_id]
+    # No charges in storage → refresh sets cache to None → property
+    # falls back to home tariff.
+    await coord._async_refresh_avg_tariff_cache()
+    assert coord._avg_tariff_cache_per_kwh is None
+    assert coord.recent_avg_tariff_per_kwh == pytest.approx(0.07)
+
+
+async def test_recent_avg_tariff_uses_weighted_avg_over_recent_charges(
+    hass: HomeAssistant,
+) -> None:
+    """v0.6.4 — when recent charges exist, the cache holds the
+    kWh-weighted average. Verifies that the FIFO "free charge" case
+    that triggered this feature (charge 22 at €0.00 mixed with home
+    charges at €0.07) returns a sensible blended number, not zero.
+    """
+    from custom_components.ev_trip_logger.const import CONF_ENERGY_PRICE
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_ENERGY_PRICE: 0.07})
+    coord = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    # Two charges: 10 kWh @ 0.07 + 5 kWh @ 0.00 → weighted avg
+    # = 0.70 / 15 = 0.0467 €/kWh.
+    await coord.storage.async_insert_charge(ChargeRecord(
+        ended_at=now - timedelta(days=2),
+        kwh=10.0, price_per_kwh=0.07, total_cost=0.70, currency="EUR",
+    ))
+    await coord.storage.async_insert_charge(ChargeRecord(
+        ended_at=now - timedelta(days=1),
+        kwh=5.0, price_per_kwh=0.00, total_cost=0.00, currency="EUR",
+    ))
+    await coord._async_refresh_avg_tariff_cache()
+    assert coord._avg_tariff_cache_per_kwh == pytest.approx(0.0467, abs=0.001)
+    assert coord.recent_avg_tariff_per_kwh == pytest.approx(0.0467, abs=0.001)
+
+
+async def test_cohort_baseline_anchors_soh_against_observed_new(
+    hass: HomeAssistant,
+) -> None:
+    """v0.6.3 — when CONF_VEHICLE_MODEL picks a model from the seeded
+    cohort JSON, the SoH 100 % anchor uses that cohort's observed
+    "new" capacity instead of nameplate. Independent of
+    `battery_capacity` (which still routes through nameplate /
+    live-calibration). Tessie pattern: lets the dashboard tell the
+    user "you're at 99 % vs cohort" even when their car's nameplate
+    is optimistic.
+    """
+    from custom_components.ev_trip_logger.const import CONF_VEHICLE_MODEL
+
+    entry = await _setup(hass, **{
+        CONF_BATTERY_CAPACITY: 82.5,  # nameplate
+        CONF_VEHICLE_MODEL: "byd_sealion_7_premium",
+    })
+    coord = hass.data[DOMAIN][entry.entry_id]
+    # Cohort `cohort_new_kwh` for this model is 80.6 (from the shipped
+    # JSON). Picking it shifts the baseline AWAY from nameplate.
+    assert coord.battery_capacity_baseline == pytest.approx(80.6)
+    assert coord.vehicle_model_key == "byd_sealion_7_premium"
+    # Sanity: `battery_capacity` (for SoC math) stays at nameplate
+    # until live-calibration lands. The cohort baseline only routes
+    # through SoH.
+    assert coord.battery_capacity == pytest.approx(82.5)
+
+    # No cohort picked → falls back to nameplate.
+    entry2 = await _setup(hass, **{
+        CONF_BATTERY_CAPACITY: 82.5,
+    })
+    coord2 = hass.data[DOMAIN][entry2.entry_id]
+    assert coord2.battery_capacity_baseline == pytest.approx(82.5)
+    assert coord2.vehicle_model_key is None
+
+    # Unknown key → silently falls back to nameplate (no crash, no
+    # warning spam — keeps the integration usable for vehicles the
+    # seed list doesn't cover yet).
+    entry3 = await _setup(hass, **{
+        CONF_BATTERY_CAPACITY: 82.5,
+        CONF_VEHICLE_MODEL: "made_up_model_xyz",
+    })
+    coord3 = hass.data[DOMAIN][entry3.entry_id]
+    assert coord3.battery_capacity_baseline == pytest.approx(82.5)
+
+
+def test_cohort_baseline_options_returns_seeded_models() -> None:
+    """v0.6.3 — the helper used by the config-flow dropdown returns
+    the same seeded model list every call, sorted by human label.
+    Used as a smoke test: a typo in the JSON or a missing seed key
+    fails loud here before the config-flow renders a broken form.
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        cohort_baseline_options,
+    )
+
+    options = cohort_baseline_options()
+    keys = {k for k, _ in options}
+    # Multi-vendor coverage — never hard-pin to one make.
+    assert "byd_sealion_7_premium" in keys
+    assert "tesla_model_3_lr" in keys
+    assert "hyundai_ioniq_5_lr" in keys
+    assert "vw_id4_pro" in keys
+    # Sorted alphabetically by label (deterministic for diff-friendly
+    # config-flow UI).
+    labels = [lbl for _, lbl in options]
+    assert labels == sorted(labels)
+
+
+async def test_orphan_gap_honors_user_min_distance(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.100 — _detect_orphan_gap respects CONF_MIN_TRIP_DISTANCE.
+
+    User sets min=2.0 in options because a 1-km re-park maneuver
+    shouldn't count as a trip. Before v0.5.100 the orphan path used
+    its own hardcoded floor of 0.3 km and would still fire on the
+    1-km gap, producing a phantom orphan_odo_only row. Now the floor
+    is max(0.3, user_min), so the orphan path skips gaps below the
+    user's threshold.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass, **{
+        CONF_MIN_TRIP_DISTANCE: 2.0,
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    base = dt_util.now()
+    last = TripRecord(
+        started_at=base - timedelta(hours=2),
+        ended_at=base - timedelta(minutes=30),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    # 1-km gap (re-park) — below user threshold, must NOT trigger orphan.
+    assert coordinator._detect_orphan_gap(base, 26825.0) is None
+    # 2.5-km gap — above threshold, orphan still detected.
+    payload = coordinator._detect_orphan_gap(base, 26826.5)
+    assert payload is not None
+    assert payload[1] == pytest.approx(2.5)
+
+
+async def test_recover_segments_via_vehicle_on_handles_sparse_odo(
+    hass: HomeAssistant,
+) -> None:
+    """v0.5.99 — vehicle_on-driven segmentation must split two separate
+    missed drives even when the recorder only has 3 odometer samples.
+
+    The trip-193 case in miniature: cloud-polled odometer reports at
+    18:08 (post-trip-192), 18:20 (mid mini-drive A), 19:07 (mid mini-
+    drive B). The old odometer-walker coalesced these into ONE big
+    segment (no plateau-finalize between samples because no sample
+    arrived during the 47-min idle) AND skipped it because the
+    segment started 26 s before trip 192's recorded end. v0.5.99
+    walks vehicle_on edges instead, producing two clean segments.
+    """
+    from types import SimpleNamespace
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    base = datetime(2026, 6, 25, 18, 0, 0, tzinfo=timezone.utc)
+    # Mock state objects with the recorder's expected shape.
+    def _s(ts_min, ts_sec, state):
+        ts = base + timedelta(minutes=ts_min, seconds=ts_sec)
+        return SimpleNamespace(state=str(state), last_updated=ts,
+                               attributes={})
+
+    vehicle_on_states = [
+        _s(8, 26, "off"),     # 18:08:26 trip 192 closes
+        _s(18, 34, "on"),     # 18:18:34 drive A starts
+        _s(22, 25, "off"),    # 18:22:25 drive A ends
+        _s(66, 44, "on"),     # 19:06:44 drive B starts
+        _s(69, 26, "off"),    # 19:09:26 drive B ends
+    ]
+    odometer_states = [
+        _s(8, 0, "26824"),    # last known just before window
+        _s(20, 17, "26825"),  # +1 km after drive A
+        _s(67, 50, "26826"),  # +1 km after drive B
+    ]
+
+    async def _fake_executor(func, *args, **kwargs):
+        # state_changes_during_period(hass, start, end, entity_id)
+        eid = args[3]
+        if eid == VOK:
+            states = [s for s in vehicle_on_states
+                      if args[1] <= s.last_updated <= args[2]]
+            return {VOK: states}
+        if eid == ODO:
+            states = [s for s in odometer_states
+                      if args[1] <= s.last_updated <= args[2]]
+            return {ODO: states}
+        return {eid: []}
+
+    # Recorder access uses get_instance(hass).async_add_executor_job.
+    # Patch the returned instance.
+    fake_recorder = SimpleNamespace(async_add_executor_job=_fake_executor)
+    segments = await coordinator._recover_segments_via_vehicle_on(
+        since=base,
+        until=base + timedelta(hours=2),
+        recorder=fake_recorder,
+    )
+    # Both drives recovered, each ≥ min_distance.
+    assert len(segments) == 2
+    s1, s2 = segments
+    assert s1[0] == base + timedelta(minutes=18, seconds=34)
+    assert s1[1] == base + timedelta(minutes=22, seconds=25)
+    assert s1[2] == pytest.approx(26824.0)
+    assert s1[3] == pytest.approx(26825.0)
+    assert s2[0] == base + timedelta(minutes=66, seconds=44)
+    assert s2[1] == base + timedelta(minutes=69, seconds=26)
+    assert s2[2] == pytest.approx(26825.0)
+    assert s2[3] == pytest.approx(26826.0)
+
+
+async def test_orphan_yields_to_recovered_live_trips(hass: HomeAssistant) -> None:
+    """v0.5.98 — when the recorder still has the precise vehicle_on
+    edges of a missed drive, the orphan_odo_only synthetic window
+    must NOT be inserted. The user's trip-193 case: a real 4-min /
+    1-km re-park happened between trip 192 (closed) and trip 193's
+    detection at the next ignition. The pre-v0.5.98 path produced a
+    30-min orphan_odo_only row; recovery has the real timestamps so
+    it inserts a proper live row and the orphan must yield.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    # Pre-seed a closed last_trip so _detect_orphan_gap has something
+    # to anchor against.
+    now = dt_util.now()
+    last = TripRecord(
+        started_at=now - timedelta(hours=2),
+        ended_at=now - timedelta(minutes=45),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+        soc_start=64.0, soc_end=61.0, soc_used_pct=3.0,
+        energy_kwh=2.48, consumption_kwh_100km=41.2,
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    # Force recover_missing_trips_service to claim it inserted 1 row.
+    recovery_calls: list[tuple[datetime, datetime]] = []
+    inserts_before = (await coordinator.storage.async_recent_trips(50))
+
+    async def _fake_recover(*, since, until):
+        recovery_calls.append((since, until))
+        return 1
+
+    coordinator.async_recover_missing_trips_service = _fake_recover  # type: ignore[assignment]
+
+    # Drive the wrapper directly — bypasses _open_trip plumbing so the
+    # test asserts only on the orphan/recovery decision.
+    await coordinator._async_insert_orphan_with_recovery(
+        last, now, 26825.0, 61.0, 1.0,
+    )
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0][0] == last.ended_at
+    inserts_after = (await coordinator.storage.async_recent_trips(50))
+    # No new row beyond `last` — the orphan was suppressed because
+    # recovery claimed to have covered the gap.
+    assert len(inserts_after) == len(inserts_before)
+
+
+async def test_orphan_falls_back_when_recovery_empty(hass: HomeAssistant) -> None:
+    """v0.5.98 — when recovery returns 0 (no recorder evidence of a
+    real drive) the orphan_odo_only insert still fires as the
+    residual catch for true odo-drift / catch-up snapshots.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    last = TripRecord(
+        started_at=now - timedelta(hours=2),
+        ended_at=now - timedelta(minutes=10),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+        soc_start=64.0, soc_end=61.0, soc_used_pct=3.0,
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    async def _empty_recover(*, since, until):
+        return 0
+
+    coordinator.async_recover_missing_trips_service = _empty_recover  # type: ignore[assignment]
+    inserts_before = (await coordinator.storage.async_recent_trips(50))
+
+    await coordinator._async_insert_orphan_with_recovery(
+        last, now, 26825.0, 61.0, 1.0,
+    )
+    inserts_after = (await coordinator.storage.async_recent_trips(50))
+    assert len(inserts_after) == len(inserts_before) + 1
+    new_row = inserts_after[0]
+    assert new_row.confidence == "orphan_odo_only"
+    assert new_row.odometer_end == pytest.approx(26825.0)
+
+
+async def test_orphan_duration_capped_when_padded_by_downtime(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.1 — a real missed drive (SoC drop tracks the km, so it's
+    classified 'orphan' not 'orphan_odo_only') must not inherit hours
+    of parked/HA-offline time as its duration.
+
+    Reproduces the 2026-07-18 case: HA restarts briefly, the live path
+    never sees the vehicle_on edges, and recorder recovery finds
+    nothing (nothing was recorded while HA was down either). The old
+    behaviour used the full last_trip.ended_at -> now span (3 h here)
+    as duration_min, producing an absurd ~1.7 km/h average for a real
+    5 km drive. It must now be capped to the longest duration
+    compatible with _ORPHAN_MIN_PLAUSIBLE_AVG_KMH (15 km/h floor).
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    last = TripRecord(
+        started_at=now - timedelta(hours=5),
+        ended_at=now - timedelta(hours=3),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+        soc_start=64.0, soc_end=60.0,
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    async def _empty_recover(*, since, until):
+        return 0
+
+    coordinator.async_recover_missing_trips_service = _empty_recover  # type: ignore[assignment]
+    inserts_before = (await coordinator.storage.async_recent_trips(50))
+
+    # 5 km gap, 1% SoC drop — ratio 1.0 vs the 15 kWh/100km default
+    # expectation (0.2%/km * 5 km = 1.0%), so this classifies 'orphan'.
+    await coordinator._async_insert_orphan_with_recovery(
+        last, now, 26829.0, 59.0, 5.0,
+    )
+    inserts_after = (await coordinator.storage.async_recent_trips(50))
+    assert len(inserts_after) == len(inserts_before) + 1
+    new_row = inserts_after[0]
+    assert new_row.confidence == "orphan"
+    # Capped to 5 km / 15 km/h == 20 min, not the naive 180 min span.
+    assert new_row.duration_min == pytest.approx(20.0)
+    assert new_row.avg_speed_kmh == pytest.approx(15.0)
+    assert new_row.started_at == now - timedelta(minutes=20.0)
+    assert new_row.odometer_end == pytest.approx(26829.0)
+
+
+def test_integrate_evse_from_recorder_masks_idle_windows() -> None:
+    """v0.5.95 — backfill integrator masks samples to charge_sensor=on
+    windows and converts W → kW transparently.
+
+    Setup: a 2-hour charge window with the wallbox reporting 7000 W
+    flat. The car says charging=on for the first hour, charging=off
+    for the second. Integrated energy should be ≈ 7 kWh (the masked
+    second hour drops out) — not 14 kWh (no mask) and not 0 (wrong
+    unit handling).
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        EvTripLoggerCoordinator,
+    )
+
+    class _S:
+        def __init__(self, state, when, unit=None):
+            self.state = state
+            self.last_updated = when
+            self.last_changed = when
+            self.attributes = (
+                {"unit_of_measurement": unit} if unit else {}
+            )
+
+    t0 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+    evse = [
+        _S("7000", t0 + timedelta(minutes=m), unit="W")
+        for m in range(0, 121, 10)
+    ]
+    charge_states = [
+        _S("on", t0),
+        _S("off", t0 + timedelta(hours=1)),
+    ]
+    kwh = EvTripLoggerCoordinator._integrate_evse_from_recorder(
+        evse_states=evse,
+        charge_states=charge_states,
+        window_start=t0,
+        window_end=t0 + timedelta(hours=2),
+    )
+    # 7 kW × 1 h, masked to first hour only.
+    assert kwh == pytest.approx(7.0, abs=0.05)
+
+    # Same samples, NO mask → 7 kW × 2 h ≈ 14 kWh.
+    full = EvTripLoggerCoordinator._integrate_evse_from_recorder(
+        evse_states=evse,
+        charge_states=[],
+        window_start=t0,
+        window_end=t0 + timedelta(hours=2),
+    )
+    assert full == pytest.approx(14.0, abs=0.05)
+
+    # Empty → None (don't write a phantom zero onto the charge row).
+    assert EvTripLoggerCoordinator._integrate_evse_from_recorder(
+        evse_states=[],
+        charge_states=charge_states,
+        window_start=t0,
+        window_end=t0 + timedelta(hours=2),
+    ) is None

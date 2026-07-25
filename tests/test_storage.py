@@ -122,6 +122,8 @@ async def test_aggregates_when_empty(storage: TripStorage) -> None:
         "distance_km": 0.0,
         "energy_kwh": 0.0,
         "regen_kwh": 0.0,
+        "discharge_kwh": 0.0,
+        "regen_ratio": 0.0,
         "cost": 0.0,
         "count": 0,
         "avg_consumption_kwh_100km": 0.0,
@@ -292,6 +294,126 @@ async def test_charges_aggregates_avg_price(storage: TripStorage) -> None:
     assert aggs["avg_price_per_kwh"] == pytest.approx(8.0 / 30.0)
 
 
+def _at(y: int, m: int, d: int, h: int = 10) -> datetime:
+    """A timezone-aware local datetime (matches dt_util.now() used at insert)."""
+    return datetime(y, m, d, h, 0, tzinfo=dt_util.DEFAULT_TIME_ZONE)
+
+
+async def test_weekly_history_buckets_by_iso_monday(storage: TripStorage) -> None:
+    # Mon 2026-06-22 and Sun 2026-06-28 are the same ISO week (2026-W26);
+    # Mon 2026-06-29 starts the next week (2026-W27).
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 22), ended_at=_at(2026, 6, 22, 11),
+              distance_km=100.0, energy_kwh=20.0, cost=3.0)
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 28), ended_at=_at(2026, 6, 28, 11),
+              distance_km=117.0, energy_kwh=22.2, cost=0.1)
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 29), ended_at=_at(2026, 6, 29, 11),
+              distance_km=40.0, energy_kwh=8.0, cost=1.0)
+    )
+
+    weeks = await storage.async_weekly_history(26)
+    assert len(weeks) == 2
+    # Chronological order.
+    w26, w27 = weeks
+    assert w26["week"] == "2026-W26"
+    assert w26["week_start"] == "2026-06-22"
+    assert w26["distance_km"] == pytest.approx(217.0)
+    assert w26["energy_kwh"] == pytest.approx(42.2)
+    assert w26["cost"] == pytest.approx(3.1)
+    assert w26["trips"] == 2
+    # 42.2 / 217.0 * 100 = 19.4
+    assert w26["avg_consumption_kwh_100km"] == pytest.approx(19.4, abs=0.05)
+
+    assert w27["week"] == "2026-W27"
+    assert w27["week_start"] == "2026-06-29"
+    assert w27["trips"] == 1
+
+
+async def test_weekly_history_labels_year_boundary_week(storage: TripStorage) -> None:
+    # Mon 2025-12-29's week contains Thu 2026-01-01 → ISO week 2026-W01.
+    await storage.async_insert(
+        _trip(started_at=_at(2025, 12, 29), ended_at=_at(2025, 12, 29, 11),
+              distance_km=12.0, energy_kwh=2.0, cost=0.3)
+    )
+    weeks = await storage.async_weekly_history(26)
+    assert len(weeks) == 1
+    assert weeks[0]["week"] == "2026-W01"
+    assert weeks[0]["week_start"] == "2025-12-29"
+
+
+async def test_weekly_history_empty_is_empty_list(storage: TripStorage) -> None:
+    assert await storage.async_weekly_history(26) == []
+
+
+async def test_weekly_history_charged_kwh_buckets_on_ended_at(
+    storage: TripStorage,
+) -> None:
+    # Trips anchor the week rows; charges are bucketed by ended_at into the
+    # same Monday-of-week. A charge closing late Sunday (2026-06-28 23:00)
+    # still lands in week 2026-W26 (Monday 2026-06-22).
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 22), ended_at=_at(2026, 6, 22, 11))
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 29), ended_at=_at(2026, 6, 29, 11))
+    )
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 6, 23), kwh=30.0))
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 6, 28, 23), kwh=5.0))
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 6, 29), kwh=12.0))
+
+    weeks = {w["week"]: w for w in await storage.async_weekly_history(26)}
+    assert weeks["2026-W26"]["charged_kwh"] == pytest.approx(35.0)
+    assert weeks["2026-W27"]["charged_kwh"] == pytest.approx(12.0)
+
+
+async def test_weekly_history_charged_kwh_zero_when_no_charges(
+    storage: TripStorage,
+) -> None:
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 22), ended_at=_at(2026, 6, 22, 11))
+    )
+    weeks = await storage.async_weekly_history(26)
+    assert weeks[0]["charged_kwh"] == 0.0
+
+
+async def test_monthly_history_charged_kwh_buckets_on_ended_at(
+    storage: TripStorage,
+) -> None:
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 5, 15), ended_at=_at(2026, 5, 15, 11))
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 10), ended_at=_at(2026, 6, 10, 11))
+    )
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 5, 20), kwh=40.0))
+    await storage.async_insert_charge(_charge(ended_at=_at(2026, 6, 1), kwh=8.0))
+
+    months = {m["month"]: m for m in await storage.async_monthly_history(12)}
+    assert months["2026-05"]["charged_kwh"] == pytest.approx(40.0)
+    assert months["2026-06"]["charged_kwh"] == pytest.approx(8.0)
+
+
+async def test_monthly_history_avg_consumption_per_100km(
+    storage: TripStorage,
+) -> None:
+    # Two trips in June: 60 km / 9 kWh and 40 km / 11 kWh → 20 kWh over 100 km
+    # = 20.0 kWh/100km for the month.
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 5), ended_at=_at(2026, 6, 5, 11),
+              distance_km=60.0, energy_kwh=9.0)
+    )
+    await storage.async_insert(
+        _trip(started_at=_at(2026, 6, 12), ended_at=_at(2026, 6, 12, 11),
+              distance_km=40.0, energy_kwh=11.0)
+    )
+    months = {m["month"]: m for m in await storage.async_monthly_history(12)}
+    assert months["2026-06"]["avg_consumption_kwh_100km"] == pytest.approx(20.0)
+
+
 @pytest.mark.parametrize(
     "consumption, expected",
     [
@@ -370,6 +492,183 @@ def test_period_start_unknown_raises() -> None:
         period_start(dt_util.now(), "decade")
 
 
+async def test_discharge_kwh_round_trip_and_regen_ratio(
+    storage: TripStorage,
+) -> None:
+    """v0.6.0 — discharge_kwh is persisted and the period aggregate
+    derives regen_ratio = sum(regen)/sum(discharge), letting dashboards
+    render 'you got X % back from braking' without bespoke templates.
+    """
+    now = dt_util.now()
+    # Trip with regen 1.0 / discharge 5.0 → ratio 0.20
+    await storage.async_insert(_trip(
+        ended_at=now, energy_kwh=4.0, regen_kwh=1.0, discharge_kwh=5.0,
+    ))
+    # Trip with regen 0.5 / discharge 5.0 → second trip contributes
+    # 5.5/10.0 = 0.55 ratio when summed: regen=1.5, discharge=10.0
+    await storage.async_insert(_trip(
+        ended_at=now, energy_kwh=4.5, regen_kwh=0.5, discharge_kwh=5.0,
+    ))
+    aggs = await storage.async_aggregates_since(now - timedelta(days=1))
+    assert aggs["regen_kwh"] == pytest.approx(1.5)
+    assert aggs["discharge_kwh"] == pytest.approx(10.0)
+    assert aggs["regen_ratio"] == pytest.approx(0.15)
+    # Round-trip: reading the latest trip back picks up discharge_kwh.
+    last = await storage.async_get_last()
+    assert last is not None
+    assert last.discharge_kwh == pytest.approx(5.0)
+
+
+async def test_peak_charge_power_persists_and_aggregates_high_power(
+    storage: TripStorage,
+) -> None:
+    """v0.6.0 — peak_charge_power_kw is persisted on insert AND on
+    extend (max-merge), and the period aggregate flags the >=100 kW
+    cohort separately so the SoH model can score high-stress sessions
+    (Geotab fleet study).
+    """
+    now = dt_util.now()
+    # AC home charge — peak ~7 kW.
+    await storage.async_insert_charge(_charge(
+        kwh=15.0, ended_at=now, peak_charge_power_kw=7.2,
+    ))
+    # DCFC session — peak 150 kW.
+    await storage.async_insert_charge(_charge(
+        kwh=40.0, ended_at=now, peak_charge_power_kw=150.0,
+    ))
+    # Merge an extra pulse onto the most recent charge with a lower
+    # peak (50 kW). The session's peak must STAY at 150 kW — i.e. the
+    # merge does a max, not a replace.
+    merged = await storage.async_extend_last_charge(
+        extra_kwh=2.0,
+        ended_at=now + timedelta(minutes=5),
+        new_peak_power_kw=50.0,
+    )
+    assert merged is not None
+    assert merged.peak_charge_power_kw == pytest.approx(150.0)
+    # Period aggregate: only the DCFC counts toward high_power.
+    agg = await storage.async_charges_aggregates_since(now - timedelta(days=1))
+    assert agg["high_power_kwh"] == pytest.approx(42.0)
+    assert agg["high_power_count"] == 1
+    assert agg["peak_power_max_kw"] == pytest.approx(150.0)
+
+
+async def test_charges_aggregates_pairs_kwh_with_evse(
+    storage: TripStorage,
+) -> None:
+    """v0.5.101 — period aggregates expose a paired kwh_with_evse +
+    evse_kwh so dashboards can compute charging efficiency as a
+    proper ratio.
+
+    The dashboard's pre-fix template divided `energy_charged_this_month`
+    (all charges, including ones with NULL evse) by sum(evse_energy_kwh)
+    over only the rows that had EVSE — five charges of 15 kWh each
+    against one EVSE-bearing 16 kWh row produced 75/16 × 100 = 469 %.
+    The fixed aggregate pairs both sides so the ratio is always
+    0-100 %.
+    """
+    now = dt_util.now()
+    # 3 charges WITHOUT evse, 1 WITH.
+    for kwh in (15.0, 15.0, 15.0):
+        await storage.async_insert_charge(_charge(kwh=kwh, ended_at=now))
+    await storage.async_insert_charge(
+        _charge(kwh=16.0, ended_at=now,
+                evse_energy_kwh=18.0, charging_efficiency_pct=88.9),
+    )
+    agg = await storage.async_charges_aggregates_since(
+        now - timedelta(days=30),
+    )
+    # Total kwh includes all 4 charges. Paired sums only the row with
+    # EVSE: 16 kwh / 18 evse × 100 ≈ 88.9 %.
+    assert agg["kwh"] == pytest.approx(61.0)
+    assert agg["kwh_with_evse"] == pytest.approx(16.0)
+    assert agg["evse_kwh"] == pytest.approx(18.0)
+    assert agg["evse_count"] == 1
+    assert agg["charging_efficiency_pct"] == pytest.approx(88.9, abs=0.2)
+
+
+async def test_period_start_lifetime_anchors_at_datetime_min(
+    storage: TripStorage,
+) -> None:
+    """v0.6.1 — `period_start(now, 'lifetime')` returns a sentinel
+    early enough that every persisted row falls inside, so a
+    lifetime-period ChargesAggregateSensor sums the entire history
+    without a special-case branch in the query path.
+    """
+    from custom_components.ev_trip_logger.storage import period_start
+
+    now = dt_util.now()
+    sentinel = period_start(now, "lifetime")
+    # 50 years before "now" still has to fall after the sentinel —
+    # otherwise rows older than a couple of years wouldn't be counted
+    # in the lifetime accumulator.
+    very_old = now - timedelta(days=365 * 50)
+    assert sentinel < very_old
+    # Tz-aware (so the SQL `>= ?` comparison against ISO strings
+    # doesn't blow up on a tz-naive sentinel vs tz-aware row).
+    assert sentinel.tzinfo is not None
+
+    # Round-trip: a row inserted with an ancient `ended_at` is summed
+    # by `_charges_aggregates_since(period_start(now, 'lifetime'))`.
+    await storage.async_insert_charge(_charge(
+        kwh=10.0, ended_at=very_old, evse_energy_kwh=11.0,
+        charging_efficiency_pct=90.9,
+    ))
+    await storage.async_insert_charge(_charge(
+        kwh=20.0, ended_at=now, evse_energy_kwh=22.0,
+        charging_efficiency_pct=90.9, peak_charge_power_kw=120.0,
+    ))
+    agg = await storage.async_charges_aggregates_since(sentinel)
+    # Both charges counted.
+    assert agg["kwh"] == pytest.approx(30.0)
+    assert agg["evse_kwh"] == pytest.approx(33.0)
+    # Only the 120 kW one falls in the high-power cohort.
+    assert agg["high_power_kwh"] == pytest.approx(20.0)
+    assert agg["high_power_count"] == 1
+
+
+async def test_charges_aggregates_efficiency_none_without_evse(
+    storage: TripStorage,
+) -> None:
+    """When no charge in the period has EVSE data, charging_efficiency_pct
+    is None (state 'unknown' on the sensor) — never 0, which would look
+    like a 100 % loss."""
+    now = dt_util.now()
+    for kwh in (15.0, 15.0):
+        await storage.async_insert_charge(_charge(kwh=kwh, ended_at=now))
+    agg = await storage.async_charges_aggregates_since(
+        now - timedelta(days=30),
+    )
+    assert agg["charging_efficiency_pct"] is None
+    assert agg["evse_count"] == 0
+
+
+async def test_patch_charge_evse_recomputes_efficiency(
+    storage: TripStorage,
+) -> None:
+    """v0.5.95 — patching evse_energy_kwh writes efficiency.
+
+    The backfill_charge_evse service writes the integrated AC energy
+    onto a historical charge via async_patch_charge. The patch must
+    auto-compute charging_efficiency_pct = kwh / evse × 100 so the
+    dashboard can render both numbers without a separate write.
+    """
+    cid = await storage.async_insert_charge(_charge(kwh=10.0))
+    patched = await storage.async_patch_charge(
+        cid, {"evse_energy_kwh": 11.5},
+    )
+    assert patched is not None
+    assert patched.evse_energy_kwh == pytest.approx(11.5)
+    # kwh 10 / evse 11.5 ≈ 86.96 → rounded to 87.0
+    assert patched.charging_efficiency_pct == pytest.approx(87.0, abs=0.1)
+    # Patching kwh later updates total_cost AND re-derives efficiency
+    # from the stored evse value, so a corrected kwh stays consistent.
+    patched2 = await storage.async_patch_charge(cid, {"kwh": 9.2})
+    assert patched2 is not None
+    assert patched2.kwh == pytest.approx(9.2)
+    assert patched2.charging_efficiency_pct == pytest.approx(80.0, abs=0.1)
+
+
 async def test_extend_last_charge_uses_absolute_soc_end(
     storage: TripStorage,
 ) -> None:
@@ -412,7 +711,7 @@ async def test_effective_capacity_below_threshold(storage: TripStorage) -> None:
             kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
             soc_start=soc_s, soc_end=soc_e,
         ))
-    cap, n = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert cap is None
@@ -440,11 +739,59 @@ async def test_effective_capacity_median_of_eligible_charges(
             kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
             soc_start=s0, soc_end=s1,
         ))
-    cap, n = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert n == 5
     assert cap == pytest.approx(83.0)
+
+
+async def test_effective_capacity_gates_min_kwh_and_temperature(
+    storage: TripStorage,
+) -> None:
+    """v0.6.5 — sample gates: ΔkWh ≥ 5 (Tessie threshold) and
+    temperature in [5, 35] °C. Rows with NULL temperature bypass the
+    temperature gate (we don't penalise users without an exterior
+    temp sensor). Reject counts surface in the third tuple element.
+    """
+    now = dt_util.now()
+    # 6 eligible charges by ΔSoC alone:
+    #   - 1 big at normal temp → SAMPLE (40 kWh / 60 % = 66.67)
+    #   - 1 big at 2 °C → rejected (cold)
+    #   - 1 big at 40 °C → rejected (hot)
+    #   - 1 with NULL temp → SAMPLE (no temp gate)
+    #   - 1 with kwh=3.0 (below Tessie 5) → rejected (kwh_too_small)
+    #   - 1 with kwh=4.5 (below 5) → rejected (kwh_too_small)
+    rows = [
+        (40.0, 20.0, 80.0, 22.0),   # 60 % Δ, 22 °C → used (66.67)
+        (40.0, 20.0, 80.0,  2.0),   # cold
+        (40.0, 20.0, 80.0, 40.0),   # hot
+        (40.0, 20.0, 80.0, None),   # temp NULL → used (66.67)
+        ( 3.0, 70.0, 80.0, 22.0),   # 10 % Δ but kwh<5 — rejected as
+                                    #   kwh_too_small; ΔSoC > 30 ? no:
+                                    #   delta = 10, so rejected pre-gate
+                                    #   (skipped from SELECT). Adjust:
+        ( 4.5, 20.0, 80.0, 22.0),   # 60 % Δ, kwh=4.5 → kwh_too_small
+    ]
+    for kwh, s0, s1, t in rows:
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=now - timedelta(hours=1),
+            ended_at=now,
+            kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
+            soc_start=s0, soc_end=s1,
+            temperature_c=t,
+        ))
+    # Use min_charges=1 so the small N doesn't suppress the result.
+    cap, n, rejects = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=1,
+    )
+    # Two samples survive: the 22 °C row and the temp=NULL row.
+    # Both imply 66.67 kWh → median = 66.67.
+    assert n == 2
+    assert cap == pytest.approx(66.67, abs=0.05)
+    assert rejects["temp_cold"] == 1
+    assert rejects["temp_hot"] == 1
+    assert rejects["kwh_too_small"] == 1
 
 
 async def test_effective_capacity_filters_small_top_ups(
@@ -466,7 +813,7 @@ async def test_effective_capacity_filters_small_top_ups(
             kwh=40.0, price_per_kwh=0.2, total_cost=8.0,
             soc_start=20.0, soc_end=80.0,  # 60 % Δ → 66.67 kWh
         ))
-    cap, n = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert n == 5

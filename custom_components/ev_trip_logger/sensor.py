@@ -75,6 +75,83 @@ _TRIP_FIELDS_EXTRA_LAST: dict[str, dict[str, Any]] = {
         "precision": 2,
         "slug": "cost",
     },
+    # v0.6.4 — `kwh × recent_avg_tariff_per_kwh`. Companion to `cost`
+    # that is always monotonic with kWh (the FIFO `cost` reads weirdly
+    # when a trip eats a free / off-peak inventory slice). The
+    # underlying value is computed by LastTripExtraSensor against the
+    # coordinator's cached avg tariff; precision matches `cost`.
+    "cost_at_avg_tariff": {
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": None,
+        "precision": 2,
+        "slug": "cost_at_avg_tariff",
+    },
+    # v0.6.6 — idle accounting tiles. `idle_minutes` is the raw
+    # accumulator; `moving_consumption_kwh_100km` is the "what would
+    # this trip have cost if you hadn't waited with the AC on"
+    # estimate; `idle_ratio_pct` answers "how much of the trip was
+    # stationary?". Top-level sensors so users can mount them in a
+    # gauge / tile card without writing a template.
+    "idle_minutes": {
+        "unit": UnitOfTime.MINUTES,
+        "device_class": SensorDeviceClass.DURATION,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 0,
+        "icon": "mdi:car-clock",
+        "slug": "idle_minutes",
+    },
+    "moving_consumption_kwh_100km": {
+        "unit": "kWh/100km",
+        "icon": "mdi:car-electric",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "slug": "moving_consumption",
+    },
+    "idle_ratio_pct": {
+        "unit": PERCENTAGE,
+        "icon": "mdi:timer-pause-outline",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "slug": "idle_ratio",
+    },
+    # v0.7.3 — speed distribution top-level sensors so dashboards
+    # can render an "urban vs autopista" pill and a "V95 highway
+    # cruise" number without templating attrs manually.
+    "v95_speed_kmh": {
+        "unit": UnitOfSpeed.KILOMETERS_PER_HOUR,
+        "device_class": SensorDeviceClass.SPEED,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "icon": "mdi:speedometer-medium",
+        "slug": "v95_speed",
+    },
+    "highway_ratio_pct": {
+        "unit": PERCENTAGE,
+        "icon": "mdi:highway",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "slug": "highway_ratio",
+    },
+    # v0.7.5 — elevation profile top-level tiles. `gain_m` is the
+    # intuitive "how much did I climb this trip" number; `loss_m`
+    # mirrors it downhill; variance is the ranked-feature-3 signal
+    # from the Chalmers 2024 QRNN study.
+    "elevation_gain_m": {
+        "unit": UnitOfLength.METERS,
+        "device_class": SensorDeviceClass.DISTANCE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 0,
+        "icon": "mdi:elevation-rise",
+        "slug": "elevation_gain",
+    },
+    "elevation_loss_m": {
+        "unit": UnitOfLength.METERS,
+        "device_class": SensorDeviceClass.DISTANCE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 0,
+        "icon": "mdi:elevation-decline",
+        "slug": "elevation_loss",
+    },
     "score": {
         "icon": "mdi:speedometer",
         "state_class": SensorStateClass.MEASUREMENT,
@@ -219,6 +296,16 @@ async def async_setup_entry(
             AggregateSensor(coordinator, period="month", key="regen_kwh"),
             AggregateSensor(coordinator, period="30d", key="regen_kwh"),
             AggregateSensor(coordinator, period="year", key="regen_kwh"),
+            # v0.6.0 — gross discharge as a first-class metric (OVMS
+            # pattern). Pairs with regen_kwh so dashboards can render
+            # "energy out vs energy back" without losing the net number
+            # in `energy_kwh`. Plus a derived regen_ratio so the
+            # dashboard doesn't have to do the division client-side.
+            AggregateSensor(coordinator, period="month", key="discharge_kwh"),
+            AggregateSensor(coordinator, period="30d", key="discharge_kwh"),
+            AggregateSensor(coordinator, period="year", key="discharge_kwh"),
+            AggregateSensor(coordinator, period="month", key="regen_ratio"),
+            AggregateSensor(coordinator, period="30d", key="regen_ratio"),
         ]
     )
 
@@ -246,6 +333,11 @@ async def async_setup_entry(
     entities.append(ConsumptionBySeasonSensor(coordinator))
     entities.append(ConsumptionByTimeOfDaySensor(coordinator))
     entities.append(BatterySohSensor(coordinator))
+    # v0.5.84 — measured-degradation proxy from per-trip power-vs-SoC
+    # cross-validation. Independent signal vs the chemistry-model SoH.
+    entities.append(BatteryCalibrationFactorSensor(coordinator))
+    # v0.5.90 — rolling-median AC→DC efficiency from EVSE-side energy.
+    entities.append(AvgChargingEfficiencySensor(coordinator))
     # v0.5.57 — expected SoH model based on age/km/chemistry/climate.
     entities.append(ExpectedBatterySohSensor(coordinator))
     entities.append(BatteryHealthVsExpectedSensor(coordinator))
@@ -258,6 +350,7 @@ async def async_setup_entry(
 
     # v0.5.0 — dashboard-driven additions
     entities.append(MonthlyHistorySensor(coordinator))
+    entities.append(WeeklyHistorySensor(coordinator))
     entities.append(DailyKm60dSensor(coordinator))
     entities.append(TripPatternsSensor(coordinator))
     entities.append(TopsSensor(coordinator))
@@ -278,18 +371,54 @@ async def async_setup_entry(
             LastChargeSensor(coordinator, key="total_cost"),
             LastChargeSensor(coordinator, key="price_per_kwh"),
             LastChargeSensor(coordinator, key="is_dcfc"),
+            # v0.5.90 — AC-side energy + AC→DC efficiency.
+            LastChargeSensor(coordinator, key="evse_energy_kwh"),
+            LastChargeSensor(coordinator, key="charging_efficiency_pct"),
+            # v0.6.0 — peak charging power per session, drives DCFC
+            # stress accounting.
+            LastChargeSensor(coordinator, key="peak_charge_power_kw"),
             CurrentChargeSensor(coordinator, key="kwh"),
             CurrentChargeSensor(coordinator, key="total_cost"),
             CurrentChargeSensor(coordinator, key="price_per_kwh"),
             CurrentChargeSensor(coordinator, key="power_kw"),
             CurrentChargeSensor(coordinator, key="duration_min"),
             CurrentChargeSensor(coordinator, key="is_dcfc"),
+            # v0.5.92 — also expose current-charge EVSE energy + efficiency.
+            CurrentChargeSensor(coordinator, key="evse_energy_kwh"),
+            CurrentChargeSensor(coordinator, key="charging_efficiency_pct"),
             ChargesAggregateSensor(coordinator, period="month", key="kwh"),
             ChargesAggregateSensor(coordinator, period="month", key="total_cost"),
             ChargesAggregateSensor(coordinator, period="month", key="count"),
             ChargesAggregateSensor(coordinator, period="30d", key="avg_price_per_kwh"),
             ChargesAggregateSensor(coordinator, period="30d", key="avg_ac_price_per_kwh"),
             ChargesAggregateSensor(coordinator, period="30d", key="avg_dc_price_per_kwh"),
+            # v0.5.101 — period-bound charging efficiency. Uses the
+            # paired SUM(kwh)/SUM(evse) over rows with EVSE data, so
+            # the result is always 0-100 %. Replaces the dashboard
+            # template that mixed `energy_charged_this_month`
+            # (all charges) with `sum(evse)` (only EVSE charges) and
+            # produced 700-800 % numbers.
+            ChargesAggregateSensor(
+                coordinator, period="month", key="charging_efficiency_pct",
+            ),
+            ChargesAggregateSensor(
+                coordinator, period="year", key="charging_efficiency_pct",
+            ),
+            # v0.6.1 — grid-side energy (OVMS-style first-class pair).
+            ChargesAggregateSensor(coordinator, period="month", key="evse_kwh"),
+            ChargesAggregateSensor(coordinator, period="year", key="evse_kwh"),
+            ChargesAggregateSensor(coordinator, period="lifetime", key="evse_kwh"),
+            # v0.6.1 — lifetime battery-side accumulator (HA Energy
+            # dashboard contribution; TOTAL_INCREASING + energy
+            # device_class).
+            ChargesAggregateSensor(coordinator, period="lifetime", key="kwh"),
+            # v0.6.1 — DCFC stress signals at period + lifetime scope.
+            ChargesAggregateSensor(coordinator, period="month", key="high_power_kwh"),
+            ChargesAggregateSensor(coordinator, period="year", key="high_power_kwh"),
+            ChargesAggregateSensor(coordinator, period="lifetime", key="high_power_kwh"),
+            ChargesAggregateSensor(coordinator, period="month", key="high_power_count"),
+            ChargesAggregateSensor(coordinator, period="lifetime", key="high_power_count"),
+            ChargesAggregateSensor(coordinator, period="lifetime", key="peak_power_max_kw"),
         ]
     )
 
@@ -458,6 +587,40 @@ class LastTripExtraSensor(_BaseTripSensor):
             return trip.score_with_baseline(
                 self._coordinator.score_baseline_kwh_100km
             )
+        if self._key == "cost_at_avg_tariff":
+            # v0.6.4 — computed (not persisted): kWh × the trailing-30d
+            # weighted avg €/kWh (falls back to home tariff via the
+            # `recent_avg_tariff_per_kwh` property when no cache yet).
+            if trip.energy_kwh is None or trip.energy_kwh <= 0:
+                return None
+            return round(
+                trip.energy_kwh
+                * self._coordinator.recent_avg_tariff_per_kwh,
+                2,
+            )
+        # v0.6.6 — derived idle metrics. Computed at read time from
+        # `idle_minutes` + the configured `idle_power_estimate_kw` so
+        # users can tune the estimate without rewriting history.
+        idle_min = getattr(trip, "idle_minutes", None)
+        if self._key == "moving_consumption_kwh_100km":
+            if (
+                idle_min is None or trip.energy_kwh is None
+                or trip.distance_km is None or trip.distance_km <= 0
+            ):
+                return None
+            idle_kwh = (
+                idle_min / 60.0
+                * self._coordinator._idle_power_estimate_kw
+            )
+            moving_kwh = max(0.0, trip.energy_kwh - idle_kwh)
+            return round(moving_kwh / trip.distance_km * 100.0, 1)
+        if self._key == "idle_ratio_pct":
+            if (
+                idle_min is None or trip.duration_min is None
+                or trip.duration_min <= 0
+            ):
+                return None
+            return round(idle_min / trip.duration_min * 100.0, 1)
         return getattr(trip, self._key, None)
 
 
@@ -511,6 +674,34 @@ class CurrentTripExtraSensor(_BaseTripSensor):
                     return round(last.score, 1)
                 return None
             return self._IDLE_DEFAULTS.get(self._key)
+        if self._key == "cost_at_avg_tariff":
+            # v0.6.4 — kWh-projected cost at the recent avg tariff.
+            energy = snapshot.get("energy_kwh")
+            if energy is None or energy <= 0:
+                return 0.0
+            return round(
+                energy * self._coordinator.recent_avg_tariff_per_kwh, 2,
+            )
+        # v0.6.6 — live idle metrics from the active trip snapshot.
+        idle_min = snapshot.get("idle_minutes")
+        if self._key == "moving_consumption_kwh_100km":
+            energy = snapshot.get("energy_kwh")
+            distance = snapshot.get("distance_km")
+            if (
+                idle_min is None or energy is None
+                or distance is None or distance <= 0
+            ):
+                return None
+            idle_kwh = (
+                idle_min / 60.0
+                * self._coordinator._idle_power_estimate_kw
+            )
+            return round(max(0.0, energy - idle_kwh) / distance * 100.0, 1)
+        if self._key == "idle_ratio_pct":
+            duration = snapshot.get("duration_min")
+            if idle_min is None or duration is None or duration <= 0:
+                return None
+            return round(idle_min / duration * 100.0, 1)
         return snapshot.get(self._key)
 
 
@@ -521,6 +712,11 @@ class AggregateSensor(_BaseTripSensor):
         "distance_km": (UnitOfLength.KILOMETERS, SensorDeviceClass.DISTANCE, None),
         "energy_kwh": (UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, None),
         "regen_kwh": (UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, "mdi:battery-charging"),
+        # v0.6.0 — gross discharge alongside regen, OVMS-style split.
+        "discharge_kwh": (UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY, "mdi:battery-arrow-down"),
+        # v0.6.0 — recovered / discharged ratio, 0-1. MEASUREMENT
+        # state-class (it's a ratio, not a cumulative).
+        "regen_ratio": (PERCENTAGE, None, "mdi:recycle"),
         "cost": (None, SensorDeviceClass.MONETARY, "mdi:currency-eur"),
         "count": (None, None, "mdi:counter"),
         "avg_consumption_kwh_100km": ("kWh/100km", None, "mdi:car-electric"),
@@ -530,6 +726,8 @@ class AggregateSensor(_BaseTripSensor):
         "distance_km": "distance",
         "energy_kwh": "energy",
         "regen_kwh": "regen",
+        "discharge_kwh": "discharge",
+        "regen_ratio": "regen_ratio",
         "cost": "cost",
         "count": "count",
         "avg_consumption_kwh_100km": "avg_consumption",
@@ -542,6 +740,8 @@ class AggregateSensor(_BaseTripSensor):
         "distance_km": SensorStateClass.TOTAL_INCREASING,
         "energy_kwh": SensorStateClass.TOTAL_INCREASING,
         "regen_kwh": SensorStateClass.TOTAL_INCREASING,
+        "discharge_kwh": SensorStateClass.TOTAL_INCREASING,
+        "regen_ratio": SensorStateClass.MEASUREMENT,
         "cost": SensorStateClass.TOTAL,
         # v0.5.43 — TOTAL_INCREASING (was MEASUREMENT): the count climbs
         # within the period and resets at the boundary, which is exactly
@@ -597,7 +797,13 @@ class AggregateSensor(_BaseTripSensor):
     async def _async_refresh(self, *_: Any) -> None:
         since = period_start(dt_util.now(), self._period)
         aggregates = await self._coordinator.storage.async_aggregates_since(since)
-        self._value = aggregates.get(self._key)
+        raw = aggregates.get(self._key)
+        # v0.6.0 — regen_ratio comes back as 0-1 from storage; surface
+        # as a 0-100 percentage to match PERCENTAGE unit + the way the
+        # dashboard wants to render it.
+        if self._key == "regen_ratio" and isinstance(raw, (int, float)):
+            raw = round(float(raw) * 100.0, 1)
+        self._value = raw
         self.async_write_ha_state()
 
     @property
@@ -607,6 +813,26 @@ class AggregateSensor(_BaseTripSensor):
 
 def _r(value: float | None, ndigits: int) -> float | None:
     return round(value, ndigits) if value is not None else None
+
+
+def _classify_trip_character(highway_ratio_pct: float | None) -> str | None:
+    """v0.7.6 — bucket the trip by how much of it was highway-speed.
+
+    Thresholds pinned to _HIGHWAY_SPEED_KMH (80 km/h in the
+    coordinator):
+      * ≥ 60 % of samples ≥ 80 km/h → 'highway'  — motorway-dominated
+      * ≥ 25 % → 'mixed'                          — commute w/ some autopista
+      * ≥  1 % → 'urban'                          — city w/ occasional overtake
+      *   0    → 'urban'                          — pure city
+      * None   → None                             — no signal (no speed sensor)
+    """
+    if highway_ratio_pct is None:
+        return None
+    if highway_ratio_pct >= 60:
+        return "highway"
+    if highway_ratio_pct >= 25:
+        return "mixed"
+    return "urban"
 
 
 def _humanize_location(
@@ -629,7 +855,11 @@ def _humanize_location(
 
 
 def _trip_to_attr(
-    trip: Any, *, score_baseline: float = 14.5
+    trip: Any,
+    *,
+    score_baseline: float = 14.5,
+    avg_tariff_per_kwh: float | None = None,
+    idle_power_estimate_kw: float | None = None,
 ) -> dict[str, Any]:
     """Serialise a TripRecord for sensor attributes.
 
@@ -642,6 +872,16 @@ def _trip_to_attr(
     `coordinator.score_baseline_kwh_100km` for the per-car-calibrated
     value; falls back to the historical 14.5 default to keep this
     function callable without a coordinator (e.g. tests).
+
+    v0.6.4 — `avg_tariff_per_kwh` is the weighted-avg €/kWh across the
+    user's recent charges (typically `coordinator.recent_avg_tariff_per_kwh`,
+    fallback to the home tariff). Used to compute a companion
+    `cost_at_avg_tariff` value alongside the FIFO-correct `cost`: the
+    FIFO number reflects which inventory slice the trip ate (so it's
+    very low when the trip happened to consume a free / off-peak
+    slice) and is mathematically honest, while `cost_at_avg_tariff`
+    is always monotonic with kWh — useful for side-by-side trip
+    comparisons. Dashboards pick whichever fits the card.
     """
     start_addr = getattr(trip, "start_address", None)
     end_addr = getattr(trip, "end_address", None)
@@ -664,8 +904,104 @@ def _trip_to_attr(
         "max_speed_kmh": _r(trip.max_speed_kmh, 0),
         "max_power_kw": _r(trip.max_power_kw, 1),
         "regen_kwh": _r(trip.regen_kwh, 2),
+        # v0.6.0 — paired with regen_kwh: gross energy out of the
+        # battery before regen recovery. Dashboards can compute
+        # `regen_kwh / discharge_kwh` for a per-trip "energy recovered"
+        # ratio.
+        "discharge_kwh": _r(getattr(trip, "discharge_kwh", None), 2),
+        # v0.7.3 — speed-distribution metrics from per-tick samples.
+        # `v95_speed_kmh` is a spike-robust "how fast were you really
+        # going most of the time" number (unlike max_speed_kmh which
+        # a single sensor blip can inflate); `highway_ratio_pct` is
+        # the fraction of samples at ≥ 80 km/h and lets dashboards
+        # separate urban trips from autopista ones.
+        "v95_speed_kmh": _r(getattr(trip, "v95_speed_kmh", None), 1),
+        "highway_ratio_pct": _r(getattr(trip, "highway_ratio_pct", None), 1),
+        # v0.7.6 — one-word summary derived from highway_ratio_pct.
+        # Lets dashboards render a "urban / mixed / autopista" chip
+        # without reimplementing the same 3-line rule in every card.
+        # `None` when we lack signal (no CONF_SPEED wired → no
+        # samples → no ratio).
+        "trip_character": _classify_trip_character(
+            getattr(trip, "highway_ratio_pct", None),
+        ),
+        # v0.7.5 — elevation profile stats from the configured
+        # external provider (open-elevation / opentopodata / custom).
+        # All three are None when the feature is off (default) or
+        # the fetch failed. `gain_m` and `loss_m` are the intuitive
+        # numbers; `variance_m2` is the Chalmers-QRNN feature.
+        "elevation_gain_m": _r(getattr(trip, "elevation_gain_m", None), 1),
+        "elevation_loss_m": _r(getattr(trip, "elevation_loss_m", None), 1),
+        "elevation_variance_m2": _r(
+            getattr(trip, "elevation_variance_m2", None), 1,
+        ),
+        # v0.6.6 — idle accounting. Lets dashboards split "energy used
+        # moving" vs "energy burned waiting with the AC on" — explains
+        # high kWh/100km headlines on trips dominated by stationary
+        # time (drive-throughs, waiting in the parking with motor on).
+        "idle_minutes": _r(getattr(trip, "idle_minutes", None), 1),
+        "idle_ratio_pct": (
+            _r(
+                getattr(trip, "idle_minutes", 0) / trip.duration_min * 100.0,
+                1,
+            )
+            if (
+                getattr(trip, "idle_minutes", None) is not None
+                and trip.duration_min and trip.duration_min > 0
+            )
+            else None
+        ),
+        "idle_energy_kwh_est": (
+            _r(
+                getattr(trip, "idle_minutes", 0) / 60.0
+                * idle_power_estimate_kw,
+                2,
+            )
+            if (
+                getattr(trip, "idle_minutes", None) is not None
+                and idle_power_estimate_kw is not None
+                and idle_power_estimate_kw > 0
+            )
+            else None
+        ),
+        "moving_consumption_kwh_100km": (
+            _r(
+                max(
+                    0.0,
+                    trip.energy_kwh
+                    - (getattr(trip, "idle_minutes", 0) or 0) / 60.0
+                    * idle_power_estimate_kw,
+                )
+                / trip.distance_km * 100.0,
+                1,
+            )
+            if (
+                trip.energy_kwh is not None
+                and trip.distance_km and trip.distance_km > 0
+                and getattr(trip, "idle_minutes", None) is not None
+                and idle_power_estimate_kw is not None
+                and idle_power_estimate_kw > 0
+            )
+            else None
+        ),
         "avg_temp_c": _r(trip.avg_temp_c, 1),
         "cost": _r(trip.cost, 2),
+        # v0.6.4 — companion to `cost` that's always monotonic with
+        # kWh. Computed as kwh × the trailing-30d weighted-avg €/kWh
+        # (or home tariff when no recent charges exist). Useful when
+        # the FIFO `cost` shows counter-intuitive jumps because a
+        # trip ate a free / off-peak inventory slice.
+        "cost_at_avg_tariff": (
+            _r(trip.energy_kwh * avg_tariff_per_kwh, 2)
+            if (
+                trip.energy_kwh is not None
+                and trip.energy_kwh > 0
+                and avg_tariff_per_kwh is not None
+                and avg_tariff_per_kwh > 0
+            )
+            else None
+        ),
+        "avg_tariff_per_kwh": _r(avg_tariff_per_kwh, 4),
         "currency": trip.currency,
         "score": _r(trip.score_with_baseline(score_baseline), 1),
         # v0.5.19 — origin/destination now show the geocoded address
@@ -713,6 +1049,24 @@ def _trip_to_attr(
         # v0.5.43 — who drove (state of the configured driver sensor,
         # e.g. the BT-connected phone). NULL when unidentified.
         "driver": getattr(trip, "driver", None),
+        # v0.5.76 — weighted-avg €/kWh after FIFO replay.
+        "cost_basis_per_kwh": _r(
+            getattr(trip, "cost_basis_per_kwh", None), 3
+        ),
+        # v0.5.84 — per-trip battery-capacity calibration factor K.
+        "calibration_factor_k": _r(
+            getattr(trip, "calibration_factor_k", None), 3
+        ),
+        # v0.5.86 — 95 % CI band on consumption + low-confidence flag.
+        # Dashboards can render "16.5 ± 8" instead of just "16.5" so
+        # quantization noise on short trips is visible at a glance.
+        "consumption_lower_kwh_100km": _r(
+            getattr(trip, "consumption_lower_kwh_100km", None), 1
+        ),
+        "consumption_upper_kwh_100km": _r(
+            getattr(trip, "consumption_upper_kwh_100km", None), 1
+        ),
+        "low_confidence": getattr(trip, "low_confidence", None),
     }
 
 
@@ -733,6 +1087,13 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         "notes": charge.notes,
         "is_dcfc": charge.is_dcfc,
         "price_locked": getattr(charge, "price_locked", False),
+        # v0.5.90 — AC-side metered energy + AC→DC efficiency.
+        "evse_energy_kwh": _r(
+            getattr(charge, "evse_energy_kwh", None), 2
+        ),
+        "charging_efficiency_pct": _r(
+            getattr(charge, "charging_efficiency_pct", None), 1
+        ),
     }
 
 
@@ -1105,8 +1466,18 @@ class RecentTripsSensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         baseline = self._coordinator.score_baseline_kwh_100km
+        avg_tariff = self._coordinator.recent_avg_tariff_per_kwh
+        idle_kw = getattr(self._coordinator, "_idle_power_estimate_kw", None)
         return {
-            "trips": [_trip_to_attr(t, score_baseline=baseline) for t in self._trips],
+            "trips": [
+                _trip_to_attr(
+                    t,
+                    score_baseline=baseline,
+                    avg_tariff_per_kwh=avg_tariff,
+                    idle_power_estimate_kw=idle_kw,
+                )
+                for t in self._trips
+            ],
             # v0.5.50 — expose the active calibration so dashboards can
             # show a "calibrated for THIS car" caption next to the score.
             "score_baseline_kwh_100km": round(baseline, 2),
@@ -1661,6 +2032,36 @@ _CHARGE_FIELD_CONFIG: dict[str, dict[str, Any]] = {
         "slug_last": "last_charge_type",
         "slug_current": "current_charge_type",
     },
+    "evse_energy_kwh": {
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "device_class": SensorDeviceClass.ENERGY,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "precision": 2,
+        "icon": "mdi:transmission-tower",
+        "slug_last": "last_charge_evse_kwh",
+        "slug_current": "current_charge_evse_kwh",
+    },
+    "charging_efficiency_pct": {
+        "unit": PERCENTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "icon": "mdi:percent",
+        "slug_last": "last_charge_efficiency",
+        "slug_current": "current_charge_efficiency",
+    },
+    # v0.6.0 — peak instantaneous charging power during the session.
+    # Surfaces the DCFC-stress signal at the row scope; the
+    # >=100 kW threshold drives the SoH model and the lifetime/period
+    # high-power aggregates.
+    "peak_charge_power_kw": {
+        "unit": UnitOfPower.KILO_WATT,
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "precision": 1,
+        "icon": "mdi:lightning-bolt",
+        "slug_last": "last_charge_peak_power",
+        "slug_current": "current_charge_peak_power",
+    },
 }
 
 
@@ -1746,6 +2147,10 @@ class CurrentChargeSensor(_BaseTripSensor):
     # via _is_dcfc_label.
     _IDLE_NUMERIC_KEYS = frozenset({
         "kwh", "total_cost", "power_kw", "duration_min",
+        # v0.5.92 — show 0 in idle for these too so the dashboard
+        # reads "0 kWh / 0 %" cleanly instead of "unknown" between
+        # sessions.
+        "evse_energy_kwh", "charging_efficiency_pct",
     })
 
     @property
@@ -1824,6 +2229,61 @@ class ChargesAggregateSensor(_BaseTripSensor):
             "precision": 4,
             "slug": "avg_dc_charge_price",
         },
+        # v0.5.101 — kWh-weighted AC→DC efficiency over the period:
+        # SUM(kwh) / SUM(evse_energy_kwh) × 100 across the charges
+        # that actually had EVSE data. State is None when no charge
+        # in the period had EVSE, so the UI reads "unknown" instead
+        # of 0 (which would look like total loss).
+        "charging_efficiency_pct": {
+            "device_class": None,
+            "state_class": SensorStateClass.MEASUREMENT,
+            "unit": PERCENTAGE,
+            "icon": "mdi:battery-charging-high",
+            "precision": 1,
+            "slug": "avg_charging_efficiency",
+        },
+        # v0.6.1 — grid-side energy delivered by the EVSE / wallbox
+        # over the period. `kwh` (battery-side) tracks what landed in
+        # the pack; `evse_kwh` tracks what came out of the wall. The
+        # paired exposure mirrors OVMS' v.c.kwh vs v.c.kwh.grid and
+        # lets the HA Energy dashboard track grid consumption (the
+        # battery-side value would under-count by the AC→DC losses).
+        "evse_kwh": {
+            "unit": UnitOfEnergy.KILO_WATT_HOUR,
+            "device_class": SensorDeviceClass.ENERGY,
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "icon": "mdi:transmission-tower-export",
+            "precision": 2,
+            "slug": "grid_energy_charged",
+        },
+        # v0.6.1 — DCFC-stress signals at period scope, sourced from
+        # the v0.6.0 high-power cohort (peak_charge_power_kw >= 100).
+        # `high_power_kwh` totals the kWh delivered in high-stress
+        # sessions; `high_power_count` is just the session count;
+        # `peak_power_max_kw` is informational ("best ever peak").
+        "high_power_kwh": {
+            "unit": UnitOfEnergy.KILO_WATT_HOUR,
+            "device_class": SensorDeviceClass.ENERGY,
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "icon": "mdi:flash-alert",
+            "precision": 2,
+            "slug": "high_power_charged",
+        },
+        "high_power_count": {
+            "device_class": None,
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "icon": "mdi:flash-alert-outline",
+            "precision": 0,
+            "slug": "high_power_sessions",
+        },
+        "peak_power_max_kw": {
+            "unit": UnitOfPower.KILO_WATT,
+            "device_class": SensorDeviceClass.POWER,
+            "state_class": SensorStateClass.MEASUREMENT,
+            "icon": "mdi:lightning-bolt",
+            "precision": 1,
+            "slug": "peak_charge_power_max",
+        },
     }
 
     _PERIOD_SUFFIX = {
@@ -1832,6 +2292,10 @@ class ChargesAggregateSensor(_BaseTripSensor):
         "month": "this_month",
         "year": "this_year",
         "30d": "30d",
+        # v0.6.1 — monotonically-growing accumulator since first-ever
+        # logged row. Pairs with the TOTAL_INCREASING state-class so HA
+        # picks the right LTS aggregation (sum-over-cycles, not mean).
+        "lifetime": "lifetime",
     }
 
     def __init__(
@@ -1850,16 +2314,28 @@ class ChargesAggregateSensor(_BaseTripSensor):
             "avg_ac_price_per_kwh",
             "avg_dc_price_per_kwh",
         )
+        # v0.5.101 — unit precedence: explicit cfg["unit"] (kwh,
+        # percentage, etc) > per-kWh derived (price sensors) > raw
+        # currency (totals) > no unit (counts).
+        # v0.6.1 — generalised the count exception. Any key whose
+        # name ends in "_count" is unit-less (and any key with no
+        # device_class + no unit + no per_kwh_unit also is — a
+        # session count or a peak-max integer shouldn't inherit a
+        # currency unit from the cost-sensor fallback).
+        if cfg.get("unit"):
+            unit = cfg["unit"]
+        elif cfg.get("per_kwh_unit"):
+            unit = f"{coordinator.currency}/kWh"
+        elif key == "count" or key.endswith("_count"):
+            unit = None
+        elif cfg.get("device_class") is None:
+            unit = None
+        else:
+            unit = coordinator.currency
         self.entity_description = SensorEntityDescription(
             key=slug,
             translation_key=slug,
-            native_unit_of_measurement=(
-                cfg.get("unit")
-                if key == "kwh"
-                else f"{coordinator.currency}/kWh"
-                if cfg.get("per_kwh_unit")
-                else (coordinator.currency if key != "count" else None)
-            ),
+            native_unit_of_measurement=unit,
             device_class=cfg.get("device_class"),
             state_class=cfg.get("state_class"),
             icon=cfg.get("icon"),
@@ -2095,6 +2571,54 @@ class MonthlyHistorySensor(_BaseTripSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"months": self._months}
+
+
+class WeeklyHistorySensor(_BaseTripSensor):
+    """Per-week rollups for the last 26 ISO weeks (long, reliable weekly series).
+
+    Mirrors ``MonthlyHistorySensor`` but buckets by the Monday of each ISO
+    week (matching ``distance_this_week`` and the dashboard's Monday-start
+    grouping). Dashboards read ``attributes.weeks`` instead of re-bucketing
+    the short ``recent_trips`` window.
+    """
+
+    _unrecorded_attributes = frozenset({"weeks"})
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="weekly_history",
+            translation_key="weekly_history",
+            icon="mdi:chart-bar-stacked",
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_weekly_history"
+        self._weeks: list[dict[str, Any]] = []
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh, _AGGREGATE_REFRESH)
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._weeks = await self._coordinator.storage.async_weekly_history(26)
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int:
+        return len(self._weeks)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"weeks": self._weeks}
 
 
 class DailyKm60dSensor(_BaseTripSensor):
@@ -2728,11 +3252,16 @@ class BatterySohSensor(_BaseTripSensor):
 
     @property
     def native_value(self) -> float | None:
-        declared = self._coordinator._battery_capacity_declared
+        # v0.6.3 — anchor SoH against the cohort baseline ("observed
+        # new capacity for vehicles like yours") when the user has
+        # picked a model from `cohort_baselines.json`, else nameplate.
+        # Tessie pattern: this reduces the per-user calibration period
+        # before SoH stabilises.
+        baseline = self._coordinator.battery_capacity_baseline
         calibrated = self._coordinator._battery_capacity_calibrated
-        if calibrated is None or declared <= 0:
+        if calibrated is None or baseline <= 0:
             return 100.0  # no data yet → assume healthy
-        return round(calibrated / declared * 100.0, 2)
+        return round(calibrated / baseline * 100.0, 2)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -2779,10 +3308,28 @@ class BatterySohSensor(_BaseTripSensor):
                 age_years = None
         return {
             "declared_capacity_kwh": declared,
+            # v0.6.3 — surface which baseline drives the SoH %, so a
+            # dashboard can show "94 % (vs cohort)" vs "94 % (vs
+            # nameplate)" and the user understands the anchor.
+            "baseline_capacity_kwh": coord.battery_capacity_baseline,
+            "baseline_source": (
+                f"cohort:{coord._cohort_baseline_source}"
+                if coord._cohort_baseline_source
+                else "nameplate"
+            ),
+            "vehicle_model_key": coord.vehicle_model_key,
             "calibrated_capacity_kwh": (
                 round(calibrated, 2) if calibrated is not None else None
             ),
             "calibration_charges": coord._battery_capacity_calibration_n,
+            # v0.6.5 — per-gate reject counts from the last
+            # calibration sweep (Tessie ΔkWh > 5 + temperature
+            # window). Lets the dashboard render "9 considered, 4
+            # used, 3 too-small, 2 cold" instead of just a single
+            # opaque number.
+            "calibration_rejects": dict(
+                coord._battery_capacity_calibration_rejects
+            ),
             "degradation_kwh_per_year": rate_kwh_per_year,
             # v0.5.66 — TWO km figures. `logger_km` drives the model
             # (what the integration has actually observed). `odometer_km`
@@ -2795,6 +3342,149 @@ class BatterySohSensor(_BaseTripSensor):
             "age_years": age_years,
             "battery_chemistry": coord._battery_chemistry,
             "history": self._history,
+        }
+
+
+class AvgChargingEfficiencySensor(_BaseTripSensor):
+    """v0.5.90 — rolling-median AC→DC charging efficiency across the
+    last 30 charge sessions where both EVSE energy and battery kWh are
+    recorded. State is the median %; attributes show sample count.
+
+    Useful for catching: lossy cables (drops below 85 %), EVSE
+    derating issues, or DCFC sessions interleaved with AC (DCFC is
+    typically 92-97 %, AC home 88-94 %).
+    """
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="avg_charging_efficiency_30d",
+            translation_key="avg_charging_efficiency_30d",
+            native_unit_of_measurement=PERCENTAGE,
+            state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:percent-circle",
+            suggested_display_precision=1,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = (
+            f"{coordinator.entry_id}_avg_charging_efficiency_30d"
+        )
+        self._median: float | None = None
+        self._n: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._median, self._n = (
+            await self._coordinator.storage.async_avg_charging_efficiency_pct(
+                window=30, min_charges=3,
+            )
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._median
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "sample_count": self._n,
+            "window_charges": 30,
+            "interpretation": (
+                "AC home charger typical 88-94 %, DCFC 92-97 %. "
+                "Below 85 % signals lossy cable / wallbox derating "
+                "/ onboard charger inefficiency. Only charges with "
+                "an EVSE power sensor wired contribute."
+            ),
+        }
+
+
+class BatteryCalibrationFactorSensor(_BaseTripSensor):
+    """v0.5.84 — rolling-median per-trip battery-capacity calibration K.
+
+    K = net_power_kwh / (soc_delta × nominal_capacity). Aggregated as
+    the median over the last 30 trips with both signals available.
+    Persistent K < 1.0 indicates real degradation (real capacity is
+    K × nominal). Per-trip K is noisy due to power-integration
+    sampling gaps; the rolling median is the actionable number.
+    """
+
+    _unrecorded_attributes = frozenset({"history"})
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="battery_calibration_factor",
+            translation_key="battery_calibration_factor",
+            icon="mdi:scale-balance",
+            suggested_display_precision=3,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._attr_unique_id = (
+            f"{coordinator.entry_id}_battery_calibration_factor"
+        )
+        self._median: float | None = None
+        self._n: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await self._async_refresh()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_refresh, _AGGREGATE_REFRESH
+            )
+        )
+        self.async_on_remove(
+            self._coordinator.async_add_trip_log_listener(self._schedule_refresh)
+        )
+
+    @callback
+    def _schedule_refresh(self) -> None:
+        self.hass.async_create_task(self._async_refresh())
+
+    async def _async_refresh(self, *_: Any) -> None:
+        self._median, self._n = (
+            await self._coordinator.storage.async_calibration_factor_k_median(
+                window=30, min_trips=5,
+            )
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._median
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "sample_count": self._n,
+            "window_trips": 30,
+            "min_trips_required": 5,
+            "nominal_capacity_kwh": self._coordinator.battery_capacity,
+            "effective_capacity_kwh": (
+                round(self._median * self._coordinator.battery_capacity, 2)
+                if self._median is not None else None
+            ),
+            "interpretation": (
+                "K ≈ 1.0 → capacity matches nominal. K < 1.0 → real "
+                "capacity is K × nominal (degradation). Per-trip K is "
+                "noisy; this median over 30 trips is the trustworthy "
+                "signal. Only trips with SoC delta ≥ 2% AND non-zero "
+                "power integration AND positive net energy contribute."
+            ),
         }
 
 

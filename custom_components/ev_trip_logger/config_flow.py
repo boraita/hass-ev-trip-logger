@@ -18,6 +18,7 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -47,17 +48,31 @@ from .const import (
     CONF_POLLING_PAUSED_SENSOR,
     CONF_LAST_TRIP_ENERGY_SENSOR,
     CONF_LAST_TRIP_DISTANCE_SENSOR,
+    CONF_POWER_SIGN_INVERTED,
+    CONF_EVSE_POWER_SENSOR,
     CONF_TRACKED_SENSORS,
     DEFAULT_ABRP_PUSH_INTERVAL_S,
     CONF_POWER,
     CONF_RECENT_LIMIT,
     CONF_SPEED,
+    CONF_RANGE_SENSOR,
+    CONF_HEADING_SENSOR,
+    CONF_DCFC_THRESHOLD_KW,
+    DEFAULT_DCFC_THRESHOLD_KW,
+    ABRP_MIN_SEND_INTERVAL_S,
     CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
+    CONF_ELEVATION_PROVIDER,
+    CONF_ELEVATION_PROVIDER_URL,
+    CONF_IDLE_POWER_ESTIMATE_KW,
     CONF_VEHICLE_FIRST_REGISTERED,
+    CONF_VEHICLE_MODEL,
     CONF_VEHICLE_ON,
     DEFAULT_BATTERY_CHEMISTRY,
     DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_ELEVATION_PROVIDER,
+    DEFAULT_IDLE_POWER_ESTIMATE_KW,
+    ELEVATION_PROVIDER_OPTIONS,
     DEFAULT_CURRENCY,
     DEFAULT_ENERGY_PRICE,
     DEFAULT_HOME_ZONE,
@@ -89,6 +104,15 @@ def _required_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
         }
     )
+
+
+def _cohort_options() -> list[tuple[str, str]]:
+    """Lazy import so the config_flow module load doesn't pull in
+    coordinator + its dependencies for trivial cases (HA imports
+    config_flow eagerly during entry restore)."""
+    from .coordinator import cohort_baseline_options  # noqa: PLC0415
+
+    return cohort_baseline_options()
 
 
 def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
@@ -189,6 +213,19 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="speed")
             ),
+            # v0.8.0 — ABRP-only extras: estimated range (km) and GPS heading (°).
+            _optional(
+                CONF_RANGE_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="distance")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="distance")
+            ),
+            _optional(
+                CONF_HEADING_SENSOR,
+                EntitySelector(EntitySelectorConfig(domain="sensor")),
+            ): EntitySelector(EntitySelectorConfig(domain="sensor")),
             # v0.5.77 — vehicle-native per-trip energy + distance sensors.
             # When set, the logger uses these as ground truth (avoids
             # SoC quantization + regen-trapezoid noise). Generic by
@@ -205,6 +242,25 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="distance")
+            ),
+            # v0.5.85 — power-sensor polarity. Default off (positive =
+            # discharge). Flip ON for BYD-cloud-style sensors that
+            # report discharge as negative.
+            vol.Optional(
+                CONF_POWER_SIGN_INVERTED,
+                default=defaults.get(CONF_POWER_SIGN_INVERTED, False),
+            ): bool,
+            # v0.5.89 — EVSE / wallbox power sensor for AC-side energy
+            # accounting during charges. Optional; when wired,
+            # comparing battery-input vs EVSE-output exposes real
+            # charging efficiency.
+            _optional(
+                CONF_EVSE_POWER_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="power")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="power")
             ),
             vol.Required(
                 CONF_BATTERY_CAPACITY,
@@ -234,6 +290,75 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_VEHICLE_FIRST_REGISTERED,
                 DateSelector(),
             ): DateSelector(),
+            # v0.6.3 — optional cohort baseline pick. Lookup keys come
+            # from `cohort_baselines.json`; selecting one anchors the
+            # SoH 100 % point against the observed-new capacity for
+            # that model (Tessie pattern). Leave blank to keep the
+            # nameplate behaviour. Local import keeps the JSON load
+            # off the module-import path of config_flow at HA boot.
+            _optional(
+                CONF_VEHICLE_MODEL,
+                SelectSelector(
+                    SelectSelectorConfig(
+                        options=[
+                            SelectOptionDict(value=k, label=lbl)
+                            for k, lbl in _cohort_options()
+                        ],
+                        mode=SelectSelectorMode.DROPDOWN,
+                        translation_key="vehicle_model_key",
+                        custom_value=True,
+                    )
+                ),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(value=k, label=lbl)
+                        for k, lbl in _cohort_options()
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key="vehicle_model_key",
+                    custom_value=True,
+                )
+            ),
+            # v0.6.6 — kW the vehicle draws while parked with ignition
+            # on (HVAC + electronics). Drives the moving-consumption
+            # estimate so the dashboard can split "energy moving" vs
+            # "energy waiting". 2.5 kW is a reasonable mid-size SUV
+            # summer default; range 0.5-5 covers small EVs to large
+            # luxury cabins.
+            vol.Required(
+                CONF_IDLE_POWER_ESTIMATE_KW,
+                default=defaults.get(
+                    CONF_IDLE_POWER_ESTIMATE_KW,
+                    DEFAULT_IDLE_POWER_ESTIMATE_KW,
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0.5, max=5.0, step=0.1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="kW",
+                )
+            ),
+            # v0.7.5 — optional elevation provider. Default "none"
+            # keeps the trip's GPS route on-host; users opt in per
+            # deployment. "custom" pairs with the URL field below to
+            # point at a self-hosted OpenTopoData instance.
+            vol.Optional(
+                CONF_ELEVATION_PROVIDER,
+                default=defaults.get(
+                    CONF_ELEVATION_PROVIDER, DEFAULT_ELEVATION_PROVIDER,
+                ),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=list(ELEVATION_PROVIDER_OPTIONS),
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key="elevation_provider",
+                )
+            ),
+            _optional(
+                CONF_ELEVATION_PROVIDER_URL,
+                TextSelector(),
+            ): TextSelector(),
             vol.Required(
                 CONF_MIN_TRIP_DISTANCE,
                 default=defaults.get(CONF_MIN_TRIP_DISTANCE, DEFAULT_MIN_TRIP_DISTANCE),
@@ -260,25 +385,53 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                     min=2, max=60, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min"
                 )
             ),
+            # v0.8.0 — DC fast-charge threshold, previously internal-only.
+            # Charges above this average power are tagged DCFC (and flagged
+            # is_dcfc to ABRP). Default 11 kW sits above 3-phase AC.
+            vol.Required(
+                CONF_DCFC_THRESHOLD_KW,
+                default=defaults.get(
+                    CONF_DCFC_THRESHOLD_KW, DEFAULT_DCFC_THRESHOLD_KW
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=5, max=50, step=1, mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="kW",
+                )
+            ),
             vol.Required(
                 CONF_ENERGY_PRICE,
                 default=defaults.get(CONF_ENERGY_PRICE, DEFAULT_ENERGY_PRICE),
             ): NumberSelector(
                 NumberSelectorConfig(
-                    min=0, max=5, step=0.001, mode=NumberSelectorMode.BOX
+                    min=0, max=5, step=0.001, mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="/kWh",
                 )
             ),
             vol.Optional(
                 CONF_ENERGY_PRICE_ENTITY,
                 description={"suggested_value": defaults.get(CONF_ENERGY_PRICE_ENTITY)},
             ): EntitySelector(EntitySelectorConfig(domain="sensor")),
+            # ISO-4217 code — dropdown of common currencies, custom entry
+            # allowed for anything not listed (keeps it free-form but guides
+            # away from typos like "EURO").
             vol.Required(
                 CONF_CURRENCY,
                 default=defaults.get(CONF_CURRENCY, DEFAULT_CURRENCY),
-            ): TextSelector(),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(value=c, label=c)
+                        for c in ("EUR", "USD", "GBP", "CHF", "SEK", "NOK",
+                                  "DKK", "PLN", "CZK", "AUD", "CAD", "JPY")
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    custom_value=True,
+                )
+            ),
             vol.Required(
                 CONF_HOME_ZONE,
-                default=defaults.get(CONF_HOME_ZONE, "zone.home"),
+                default=defaults.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE),
             ): EntitySelector(EntitySelectorConfig(domain="zone")),
             vol.Required(
                 CONF_RECENT_LIMIT,
@@ -302,7 +455,7 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): NumberSelector(
                 NumberSelectorConfig(
-                    min=5, max=600, step=5,
+                    min=ABRP_MIN_SEND_INTERVAL_S, max=600, step=5,
                     mode=NumberSelectorMode.BOX,
                     unit_of_measurement="s",
                 )
