@@ -1426,6 +1426,48 @@ async def test_recent_trips_attr_exposes_full_schema(hass: HomeAssistant) -> Non
     assert t["destination_raw"] == "Trabajo ele "
 
 
+async def test_avg_speed_dropped_when_it_exceeds_max_speed(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.3 — avg_speed_kmh > max_speed_kmh is physically impossible:
+    the max is a running ceiling sampled over the exact same window the
+    average covers. Seen in production from the stale-odometer-anchor
+    bug (distance inflated with km driven before `started_at`, duration
+    only covering the real short window) — e.g. a real trip logged
+    112.7 km/h average against a genuine 47 km/h max. max_speed_kmh is
+    tracked independently from live speed samples and stays trustworthy
+    even when distance/duration are corrupted, so close-time must drop
+    avg_speed rather than persist the impossible value.
+    """
+    entry = await _setup(hass, **{CONF_SPEED: SPD})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current is not None
+    assert coordinator.current.odometer_start == 1000.0
+    trip_started_at = coordinator.current.started_at
+
+    # Genuine max speed seen live during the trip: a modest 40 km/h.
+    hass.states.async_set(SPD, "40")
+    await hass.async_block_till_done()
+    assert coordinator.current.max_speed_kmh == pytest.approx(40.0)
+
+    # Odometer jumps 10 km. Closing only 7.5 min after open makes the
+    # naive distance/duration average 80 km/h — above the real 40 km/h
+    # max, but still well under the blunt >300 km/h sanity cap, so only
+    # the new avg-vs-max guard can catch it.
+    hass.states.async_set(ODO, "1010")
+    await hass.async_block_till_done()
+    await coordinator._async_close_trip(trip_started_at + timedelta(minutes=7.5))
+
+    last = await coordinator.storage.async_get_last()
+    assert last is not None
+    assert last.distance_km == pytest.approx(10.0)
+    assert last.max_speed_kmh == pytest.approx(40.0)
+    assert last.avg_speed_kmh is None
+
+
 async def test_recent_charges_attr_exposes_full_schema(hass: HomeAssistant) -> None:
     """Recent_charges must include is_dcfc, started_at, soc_*, notes."""
     from custom_components.ev_trip_logger.storage import ChargeRecord, TripStorage
@@ -1695,6 +1737,62 @@ async def test_live_open_retry_cancelled_on_off_edge(hass: HomeAssistant) -> Non
     hass.states.async_set(ODO, "1000")
     await _advance(hass, 5)
     assert coordinator.current is None
+
+
+async def test_live_open_distrusts_stale_odometer(hass: HomeAssistant) -> None:
+    """v0.8.3 — a valid-but-stale odometer reading must not anchor a new
+    trip's odometer_start.
+
+    Reproduces a real case: a short vehicle_on blip opens and closes
+    before the cloud delivers a fresh odometer sample, so it gets
+    discarded as noise (distance ~0, below min_trip_distance). The odo
+    entity is left holding a value that is now old. When the NEXT
+    vehicle_on=on edge fires, `hass.states.get(odometer)` still returns
+    that old-but-valid value — indistinguishable from a fresh one by
+    value alone. Before the fix, the live opener accepted it immediately,
+    so the real trip's distance silently absorbed whatever km built up
+    since that stale reading, while duration only covered the new
+    edge's own short window — producing impossible average speeds.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(ODO, "1000")
+        hass.states.async_set(BAT, "80")
+        hass.states.async_set(VOK, STATE_OFF)
+        data = {
+            CONF_NAME: "Test EV",
+            CONF_ODOMETER: ODO,
+            CONF_BATTERY: BAT,
+            CONF_VEHICLE_ON: VOK,
+            CONF_BATTERY_CAPACITY: 75.0,
+            CONF_MIN_TRIP_DISTANCE: 0.5,
+            CONF_IDLE_TIMEOUT: 1,
+        }
+        entry = MockConfigEntry(domain=DOMAIN, data=data, title="Test EV")
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        # Odometer sample ages past the freshness window with no update —
+        # simulates the cloud going quiet after a discarded short blip.
+        frozen.tick(timedelta(seconds=120))  # > _ODOMETER_STALE_MAX_AGE_S (90s)
+
+        # Ignition fires for what should be a real trip. The odometer
+        # value is still "1000" (valid, not unknown/unavailable) but stale.
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+        assert coordinator.current is None
+        assert coordinator._pending_open_unsub is not None
+
+        # Cloud catches up with a fresh sample — only now must the trip
+        # open, anchored on the fresh value rather than the stale "1000".
+        hass.states.async_set(ODO, "1007")
+        await hass.async_block_till_done()
+        assert coordinator.current is not None
+        assert coordinator.current.odometer_start == 1007.0
+        assert coordinator._pending_open_unsub is None
 
 
 async def test_score_baseline_defaults_then_calibrates(hass: HomeAssistant) -> None:

@@ -342,6 +342,21 @@ _ORPHAN_DISCONNECT_MAX_AGE = timedelta(hours=24)
 # offsets while vehicle_on stays ON. The chain is cancelled on any
 # off-edge or once another path opens the trip first.
 _LIVE_OPEN_RETRY_DELAYS_S: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0)
+# v0.8.3 — how old an odometer reading may be at a live vehicle_on=on
+# edge before we distrust it as the new trip's start anchor. `_read_float`
+# happily returns a stale-but-valid `hass.states` value when the cloud
+# source hasn't polled recently — indistinguishable from a fresh one by
+# value alone. Left unchecked, a short vehicle_on blip that opens+closes
+# faster than the cloud can deliver a sample gets discarded as noise
+# (`_async_close_trip`'s min-distance branch), but the NEXT trip then
+# opens with this same stale odometer as its anchor: its distance silently
+# absorbs the discarded blip's km (plus any cloud-silence gap since), while
+# its duration only spans its own short on/off window — producing
+# physically impossible average speeds. Routing a stale reading into the
+# same retry chain as a missing one gives the cloud a chance to catch up
+# before we anchor on it; if it never does, the trip still falls through
+# to the synthetic/orphan path, which has its own gap-aware baseline.
+_ODOMETER_STALE_MAX_AGE_S = 90.0
 # v0.5.50 — score baseline calibration.
 # Default 14.5 kWh/100km is the reference anchor — the kWh/100km that
 # maps to 10/10 before any calibration kicks in. Once 10+ eligible trips
@@ -2298,11 +2313,14 @@ class EvTripLoggerCoordinator:
             )
             return
 
-        if self._read_float(self._odometer) is not None:
+        if self._read_float_if_fresh(
+            self._odometer, now, _ODOMETER_STALE_MAX_AGE_S
+        ) is not None:
             self._open_trip(now)
             return
 
-        # Odometer still stale. Nudge the upstream poll, then queue the
+        # Odometer still stale (missing, or present but too old to trust
+        # as this trip's start anchor). Nudge the upstream poll, then queue the
         # next retry. If we've exhausted the chain, log once and let the
         # synthetic path own this trip.
         if self._odometer or self._battery:
@@ -2400,17 +2418,20 @@ class EvTripLoggerCoordinator:
         # which already handles None gracefully (charge-end anchor,
         # ring buffer, current value fallbacks). Battery's
         # subsequent ticks update last_seen_soc as usual.
+        _metric_now = dt_util.now()
         if (
             self.current is None
             and self._read_bool(self._vehicle_on) is True
-            and self._read_float(self._odometer) is not None
+            and self._read_float_if_fresh(
+                self._odometer, _metric_now, _ODOMETER_STALE_MAX_AGE_S
+            ) is not None
         ):
             # v0.5.49 — odometer just landed; the deferred retry chain
             # would still re-check soon, but opening here makes the
             # response immediate and avoids a stale `_pending_open_unsub`
             # firing a no-op a few seconds later.
             self._cancel_pending_open()
-            self._open_trip(dt_util.now())
+            self._open_trip(_metric_now)
             return
 
         if self.current_charge is not None:
@@ -4574,6 +4595,28 @@ class EvTripLoggerCoordinator:
             # Sub-second time deltas produce nonsense (e.g. 40 000 km/h when
             # you bump the odometer slider just after turning on). Cap it.
             avg_speed = None
+        # v0.8.3 — avg_speed > max_speed is physically impossible (the max
+        # is a running ceiling sampled over the same window) and a strong
+        # signal that distance/duration are corrupted even when neither
+        # alone crosses the blunt >300 km/h cap above — e.g. a stale
+        # odometer anchor (_ODOMETER_STALE_MAX_AGE_S) inflating distance
+        # with km driven before `started_at` while duration only covers
+        # the real short window. max_speed_kmh is tracked independently
+        # from live speed samples (_async_speed_changed) and stays
+        # trustworthy in that case, so don't let a broken avg outrank it
+        # on the dashboard. 5% slack absorbs rounding / sampling-cadence
+        # gaps, not corruption.
+        if (
+            avg_speed is not None
+            and active.max_speed_kmh
+            and avg_speed > active.max_speed_kmh * 1.05
+        ):
+            _LOGGER.warning(
+                "Trip avg_speed %.1f km/h exceeds max_speed %.1f km/h — "
+                "distance/duration input is inconsistent, dropping avg_speed",
+                avg_speed, active.max_speed_kmh,
+            )
+            avg_speed = None
         avg_temp = (
             sum(active.temp_samples) / len(active.temp_samples)
             if active.temp_samples
@@ -5956,6 +5999,31 @@ class EvTripLoggerCoordinator:
             return None
         try:
             return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _read_float_if_fresh(
+        self, entity_id: str | None, now: datetime, max_age_s: float,
+    ) -> float | None:
+        """Like `_read_float`, but None if the state is older than
+        `max_age_s` relative to `now`.
+
+        `hass.states.get()` keeps returning the last known value
+        indefinitely on a cloud-polled entity that has gone quiet —
+        `_read_float` can't tell "fresh" from "leftover from before the
+        car went quiet". Callers that use this value to anchor a new
+        trip's odometer_start need to know the difference (see
+        `_ODOMETER_STALE_MAX_AGE_S`).
+        """
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in _INVALID_STATES:
+            return None
+        if (now - state.last_updated).total_seconds() > max_age_s:
+            return None
+        try:
+            return float(state.state)
         except (TypeError, ValueError):
             return None
 
