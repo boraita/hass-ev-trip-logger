@@ -15,6 +15,7 @@ from .const import (
     SERVICE_DELETE_LAST_TRIP,
     SERVICE_END_TRIP,
     SERVICE_EXPORT_CSV,
+    SERVICE_FIX_SPEED_STATS,
     SERVICE_LOG_CHARGE,
     SERVICE_LOG_MANUAL_TRIP,
     SERVICE_PURGE_TRIPS,
@@ -279,6 +280,18 @@ def async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_PURGE_TRIPS, _purge_trips, schema=_SCHEMA_PURGE_TRIPS
     )
 
+    async def _fix_speed_stats(call: ServiceCall) -> None:
+        for c in _resolve_coordinators(hass, call):
+            n = await c.async_fix_speed_stats_service()
+            _LOGGER.info(
+                "fix_speed_stats: cleared avg_speed_kmh on %d trip(s) for entry %s",
+                n, c.entry_id,
+            )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_FIX_SPEED_STATS, _fix_speed_stats, schema=_SCHEMA_ENTRY,
+    )
+
     async def _set_trip(call: ServiceCall) -> None:
         # Build the patch dict from every field the user passed.
         # entry_id and trip_id are stripped; everything else is forwarded.
@@ -375,6 +388,7 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_SET_CHARGE,
         SERVICE_RECOVER_MISSING_TRIPS,
         SERVICE_BACKFILL_CHARGE_EVSE,
+        SERVICE_FIX_SPEED_STATS,
     ):
         if hass.services.has_service(DOMAIN, name):
             hass.services.async_remove(DOMAIN, name)

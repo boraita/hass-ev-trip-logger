@@ -1362,6 +1362,57 @@ async def test_purge_trips_service_deletes_in_range(hass: HomeAssistant) -> None
     assert remaining[0].distance_km == pytest.approx(3.0)
 
 
+async def test_fix_speed_stats_service_clears_impossible_avg_speed(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.3 — fix_speed_stats backfills the avg > max sanity check onto
+    trips persisted before the close-time guard existed. Only rows where
+    avg_speed_kmh > max_speed_kmh (with the 5% margin) get cleared;
+    everything else (including trips with no max_speed_kmh at all) is
+    left untouched.
+    """
+    from custom_components.ev_trip_logger.const import SERVICE_FIX_SPEED_STATS
+    from custom_components.ev_trip_logger.storage import TripRecord, TripStorage
+
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    storage: TripStorage = coordinator.storage
+    base = dt_util.now() - timedelta(days=1)
+
+    # Corrupted: avg (112.7) way above max (47) — the reported production case.
+    bad_id = await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=4, seconds=18),
+        duration_min=4.3, distance_km=8.0,
+        avg_speed_kmh=112.7, max_speed_kmh=47.0,
+    ))
+    # Healthy: max well above avg, as any normal trip with stops looks.
+    good_id = await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=1),
+        ended_at=base + timedelta(hours=1, minutes=48),
+        duration_min=48.0, distance_km=20.0,
+        avg_speed_kmh=25.0, max_speed_kmh=133.0,
+    ))
+    # No max_speed_kmh recorded at all — nothing to compare against, must
+    # not be touched even though its avg_speed_kmh looks high.
+    no_max_id = await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=2),
+        ended_at=base + timedelta(hours=2, minutes=5),
+        duration_min=5.0, distance_km=10.0,
+        avg_speed_kmh=120.0, max_speed_kmh=None,
+    ))
+
+    await hass.services.async_call(
+        DOMAIN, SERVICE_FIX_SPEED_STATS, {}, blocking=True,
+    )
+
+    bad = await storage.async_get_trip_by_id(bad_id)
+    good = await storage.async_get_trip_by_id(good_id)
+    no_max = await storage.async_get_trip_by_id(no_max_id)
+    assert bad.avg_speed_kmh is None
+    assert good.avg_speed_kmh == pytest.approx(25.0)
+    assert no_max.avg_speed_kmh == pytest.approx(120.0)
+
+
 async def test_recent_trips_attr_exposes_full_schema(hass: HomeAssistant) -> None:
     """Recent_trips items must expose every captured field.
 

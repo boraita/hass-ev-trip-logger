@@ -966,6 +966,37 @@ class TripStorage:
             ).fetchone()
         return _row_to_record(row) if row else None
 
+    async def async_fix_avg_speed_outliers(self, margin: float = 1.05) -> int:
+        """Null out avg_speed_kmh where it exceeds max_speed_kmh.
+
+        avg_speed_kmh > max_speed_kmh is physically impossible — the max
+        is a running ceiling sampled over the exact same window the
+        average covers. `_async_close_trip` guards against this at close
+        time since v0.8.3 (e.g. the stale-odometer-anchor bug inflating
+        distance with km driven before `started_at`), but rows persisted
+        before that fix need a one-time backfill. `_update_trip` can't be
+        reused here — it silently skips any field passed as `None`, by
+        design, so it can never NULL a column. `margin` (default 5%)
+        absorbs rounding / sampling-cadence gaps, not genuine corruption.
+        Returns the number of rows fixed.
+        """
+        return await self._hass.async_add_executor_job(
+            self._fix_avg_speed_outliers, margin,
+        )
+
+    def _fix_avg_speed_outliers(self, margin: float) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE trips SET avg_speed_kmh = NULL
+                WHERE avg_speed_kmh IS NOT NULL
+                  AND max_speed_kmh IS NOT NULL
+                  AND avg_speed_kmh > max_speed_kmh * ?
+                """,
+                (margin,),
+            )
+            return cur.rowcount
+
     async def async_purge_trips(
         self, since: datetime | None = None, until: datetime | None = None
     ) -> int:

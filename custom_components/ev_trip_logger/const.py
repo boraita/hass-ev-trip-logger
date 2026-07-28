@@ -199,5 +199,6 @@ SERVICE_RECOVER_MISSING_TRIPS: Final = "recover_missing_trips"
 # power sensor's recorder history within [started_at, ended_at],
 # optionally masked by the charge_sensor=on windows.
 SERVICE_BACKFILL_CHARGE_EVSE: Final = "backfill_charge_evse"
+SERVICE_FIX_SPEED_STATS: Final = "fix_speed_stats"
 
 STORAGE_FILENAME_TEMPLATE: Final = "ev_trip_logger.{entry_id}.db"

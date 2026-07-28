@@ -112,6 +112,10 @@
     "purge_trips": {
       "name": "Purgar viajes",
       "description": "Borra viajes en un rango de fechas. Útil para limpiar datos malos de versiones antiguas."
+    },
+    "fix_speed_stats": {
+      "name": "Arreglar estadísticas de velocidad",
+      "description": "Mantenimiento: pone a nulo avg_speed_kmh en cualquier viaje donde supere el max_speed_kmh registrado. Corrección puntual para viajes guardados antes del guardarraíl de cierre de v0.8.3."
     }
   },
   "entity": {

@@ -5436,6 +5436,19 @@ class EvTripLoggerCoordinator:
             self._notify_trip_log_listeners()
         return count
 
+    async def async_fix_speed_stats_service(self) -> int:
+        """Maintenance backfill: null out avg_speed_kmh on any persisted
+        trip where it exceeds max_speed_kmh — the same sanity check
+        `_async_close_trip` has applied at close time since v0.8.3,
+        applied retroactively to rows written before that fix.
+        """
+        n = await self.storage.async_fix_avg_speed_outliers()
+        if n:
+            self.last_trip = await self.storage.async_get_last()
+            self._notify_listeners()
+            self._notify_trip_log_listeners()
+        return n
+
     async def async_recover_missing_trips_service(
         self, *, since: datetime, until: datetime | None = None,
     ) -> int:

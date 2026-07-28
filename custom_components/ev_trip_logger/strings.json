@@ -86,6 +86,10 @@
     "log_manual_trip": {
       "name": "Log manual trip",
       "description": "Backfill a trip the live detector missed. Required: started_at, ended_at, and either distance_km or both odometer bounds."
+    },
+    "fix_speed_stats": {
+      "name": "Fix speed stats",
+      "description": "Maintenance: clears avg_speed_kmh on any trip where it exceeds the recorded max_speed_kmh. One-time backfill for trips logged before the v0.8.3 close-time guard."
     }
   },
   "entity": {

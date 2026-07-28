@@ -296,6 +296,21 @@ purge_trips:
       selector:
         text:
 
+fix_speed_stats:
+  name: Fix speed stats
+  description: >-
+    Maintenance: clears avg_speed_kmh on any trip where it exceeds the
+    recorded max_speed_kmh — physically impossible, a sign the distance or
+    duration was corrupted (e.g. the stale-odometer-anchor bug fixed in
+    v0.8.3). One-time backfill for trips logged before that fix; new trips
+    are already guarded at close time.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Restrict the action to a specific config entry.
+      selector:
+        text:
+
 set_trip:
   name: Set trip
   description: >-
