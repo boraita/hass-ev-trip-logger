@@ -2944,6 +2944,93 @@ async def test_orphan_duration_capped_when_padded_by_downtime(
     assert new_row.odometer_end == pytest.approx(26829.0)
 
 
+async def test_orphan_trip_resolves_home_arrival_and_adopts_last_trip(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.5 — an orphan window that actually lands back at home must
+    close the journey and become last_trip, not silently hardcode
+    destination=None and leave last_trip stuck on the trip before it.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(hass, **{CONF_LOCATION: LOC})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    last = TripRecord(
+        started_at=now - timedelta(hours=2),
+        ended_at=now - timedelta(hours=3) + timedelta(hours=2, minutes=50),
+        duration_min=10.0, distance_km=6.0,
+        odometer_start=26818.0, odometer_end=26824.0,
+        soc_start=64.0, soc_end=60.0,
+        destination="work",
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    async def _empty_recover(*, since, until):
+        return 0
+
+    coordinator.async_recover_missing_trips_service = _empty_recover  # type: ignore[assignment]
+
+    # 5 km gap, 1% SoC drop — classifies 'orphan' (real missed drive).
+    await coordinator._async_insert_orphan_with_recovery(
+        last, now, 26829.0, 59.0, 5.0,
+    )
+    inserts_after = await coordinator.storage.async_recent_trips(50)
+    new_row = inserts_after[0]
+    assert new_row.confidence == "orphan"
+    assert new_row.destination == "home"
+    assert new_row.journey_id is not None
+    assert coordinator.last_completed_journey_id == new_row.journey_id
+    assert coordinator.current_journey_id is None
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.trip_id == new_row.trip_id
+
+
+async def test_disconnect_orphan_resolves_home_arrival_and_adopts_last_trip(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.5 — same fix for the disconnect-orphan path: a disconnect
+    gap that ended with the vehicle back home must resolve the real
+    destination, close the journey, and become last_trip — reproduces
+    the 2026-07-30 case where last_trip_* sensors stayed stuck on the
+    PREVIOUS trip after a disconnect-orphan closed more recently.
+    """
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    hass.states.async_set(LOC, "home")
+    entry = await _setup(hass, **{CONF_LOCATION: LOC})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    now = dt_util.now()
+    last = TripRecord(
+        started_at=now - timedelta(hours=3),
+        ended_at=now - timedelta(hours=2, minutes=20),
+        duration_min=10.0, distance_km=4.0,
+        odometer_start=28323.0, odometer_end=28327.0,
+        soc_start=36.0, soc_end=37.0,
+        destination="not_home",
+    )
+    last.trip_id = await coordinator.storage.async_insert(last)
+    coordinator.last_trip = last
+
+    await coordinator._async_insert_disconnect_orphan(
+        last.ended_at, now, 28327.0, 28344.0, 37.0, 55.0,
+    )
+    inserts_after = await coordinator.storage.async_recent_trips(50)
+    new_row = inserts_after[0]
+    assert new_row.confidence == "orphan_disconnect"
+    assert new_row.destination == "home"
+    # Origin ("not_home") wasn't home, but landing back at home still
+    # stitches a one-stage journey — same rule _async_close_trip uses.
+    assert new_row.journey_id is not None
+    assert coordinator.last_completed_journey_id == new_row.journey_id
+    assert coordinator.current_journey_id is None
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.trip_id == new_row.trip_id
+    assert coordinator.last_trip.destination == "home"
+
+
 def test_integrate_evse_from_recorder_masks_idle_windows() -> None:
     """v0.5.95 — backfill integrator masks samples to charge_sensor=on
     windows and converts W → kW transparently.

@@ -3929,6 +3929,25 @@ class EvTripLoggerCoordinator:
         if avg_speed is not None and avg_speed > 300:
             avg_speed = None
 
+        # v0.8.5 — same destination/journey resolution as the disconnect
+        # path below, and for the same reason: hardcoding destination=None
+        # meant an orphan window that actually landed back home never
+        # closed the journey, and this trip was never adopted as
+        # last_trip, so dashboards kept showing whatever trip predated it.
+        location_end = self._read_str(self._location) if self._location else None
+        origin_location = last_trip.destination
+        is_at_home_end = self._is_at_home(location_end)
+        started_from_home = self._is_at_home(origin_location)
+        journey_id: int | None
+        if self.current_journey_id is not None:
+            journey_id = self.current_journey_id
+        elif started_from_home:
+            journey_id = await self.storage.async_next_journey_id()
+        elif is_at_home_end:
+            journey_id = await self.storage.async_next_journey_id()
+        else:
+            journey_id = None
+
         record = TripRecord(
             started_at=orphan_started_at,
             ended_at=now,
@@ -3942,9 +3961,10 @@ class EvTripLoggerCoordinator:
             energy_kwh=energy_kwh,
             consumption_kwh_100km=consumption,
             avg_speed_kmh=avg_speed,
-            origin=last_trip.destination,
-            destination=None,
+            origin=origin_location,
+            destination=location_end,
             confidence=confidence,
+            journey_id=journey_id,
             # v0.5.44 — orphan windows are reconstructed too; pull the
             # driver from recorder history.
             driver=await self._async_driver_during(last_trip.ended_at, now),
@@ -3962,10 +3982,17 @@ class EvTripLoggerCoordinator:
             await self.storage.async_recompute_trip_costs_from_charges(
                 self._current_energy_price(),
             )
+        if is_at_home_end and journey_id is not None:
+            self.last_completed_journey_id = journey_id
+            self.current_journey_id = None
+        else:
+            self.current_journey_id = journey_id
+        self._adopt_last_trip(record)
         _LOGGER.info(
             "Orphan trip inserted (%s): %.2f km, soc %s→%s, duration %.1f min",
             confidence, km_gap, last_trip.soc_end, new_soc, duration_min,
         )
+        self._notify_listeners()
         self._notify_trip_log_listeners()
 
     async def _async_insert_disconnect_orphan(
@@ -3997,6 +4024,33 @@ class EvTripLoggerCoordinator:
             else None
         )
         duration_min = max(0.1, (now - prev_t).total_seconds() / 60.0)
+
+        # v0.8.5 — resolve the real end location instead of hardcoding
+        # None. The disconnect could easily have ended with the vehicle
+        # back home (the whole point of a "disconnect" gap is that we
+        # were blind while it happened), and getting this wrong meant
+        # dashboards read "Outside known zones" for a trip that actually
+        # ended at home, plus the home arrival never closed the journey.
+        location_end = self._read_str(self._location) if self._location else None
+        origin_location = self.last_trip.destination if self.last_trip else None
+        is_at_home_end = self._is_at_home(location_end)
+        started_from_home = self._is_at_home(origin_location)
+
+        # Journey membership — same rule as the live close path (v0.5.14):
+        # continue an already-open journey regardless of where this gap
+        # started; otherwise only open one if the previous trip's
+        # destination was home (this gap's implied origin), or stitch a
+        # one-stage journey if it lands back home now.
+        journey_id: int | None
+        if self.current_journey_id is not None:
+            journey_id = self.current_journey_id
+        elif started_from_home:
+            journey_id = await self.storage.async_next_journey_id()
+        elif is_at_home_end:
+            journey_id = await self.storage.async_next_journey_id()
+        else:
+            journey_id = None
+
         record = TripRecord(
             started_at=prev_t,
             ended_at=now,
@@ -4011,8 +4065,9 @@ class EvTripLoggerCoordinator:
             consumption_kwh_100km=consumption,
             confidence="orphan_disconnect",
             energy_source="soc" if energy_kwh is not None else None,
-            origin=self.last_trip.destination if self.last_trip else None,
-            destination=None,
+            origin=origin_location,
+            destination=location_end,
+            journey_id=journey_id,
         )
         try:
             trip_id = await self.storage.async_insert(record)
@@ -4025,10 +4080,22 @@ class EvTripLoggerCoordinator:
             await self.storage.async_recompute_trip_costs_from_charges(
                 self._current_energy_price(),
             )
+        if is_at_home_end and journey_id is not None:
+            self.last_completed_journey_id = journey_id
+            self.current_journey_id = None
+        else:
+            self.current_journey_id = journey_id
+        # v0.8.5 — this trip can be newer than whatever last_trip currently
+        # points to (it was inserted the moment connectivity returned, out
+        # of band from the normal live-close flow) — without this, every
+        # last_trip_* sensor stayed stuck on the trip BEFORE the gap until
+        # the next live trip closed.
+        self._adopt_last_trip(record)
         _LOGGER.info(
             "Disconnect-orphan inserted #%s: %.2f km / %.1f min (soc %s→%s)",
             trip_id, distance, duration_min, prev_soc, soc,
         )
+        self._notify_listeners()
         self._notify_trip_log_listeners()
 
     def _open_trip(self, now: datetime) -> None:
