@@ -57,6 +57,12 @@ from .const import (
     CONF_SPEED,
     CONF_RANGE_SENSOR,
     CONF_HEADING_SENSOR,
+    CONF_CABIN_TEMP_SENSOR,
+    CONF_HVAC_SETPOINT_SENSOR,
+    CONF_TIRE_PRESSURE_FL_SENSOR,
+    CONF_TIRE_PRESSURE_FR_SENSOR,
+    CONF_TIRE_PRESSURE_RL_SENSOR,
+    CONF_TIRE_PRESSURE_RR_SENSOR,
     CONF_DCFC_THRESHOLD_KW,
     DEFAULT_DCFC_THRESHOLD_KW,
     ABRP_MIN_SEND_INTERVAL_S,
@@ -226,6 +232,57 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_HEADING_SENSOR,
                 EntitySelector(EntitySelectorConfig(domain="sensor")),
             ): EntitySelector(EntitySelectorConfig(domain="sensor")),
+            # v0.8.7 — more ABRP-only extras: cabin temperature, HVAC
+            # setpoint, and the four tire pressures. All optional; each
+            # is dropped from the ABRP payload when unset/invalid.
+            _optional(
+                CONF_CABIN_TEMP_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="temperature")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="temperature")
+            ),
+            _optional(
+                CONF_HVAC_SETPOINT_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="temperature")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="temperature")
+            ),
+            _optional(
+                CONF_TIRE_PRESSURE_FL_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="pressure")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="pressure")
+            ),
+            _optional(
+                CONF_TIRE_PRESSURE_FR_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="pressure")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="pressure")
+            ),
+            _optional(
+                CONF_TIRE_PRESSURE_RL_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="pressure")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="pressure")
+            ),
+            _optional(
+                CONF_TIRE_PRESSURE_RR_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="pressure")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="pressure")
+            ),
             # v0.5.77 — vehicle-native per-trip energy + distance sensors.
             # When set, the logger uses these as ground truth (avoids
             # SoC quantization + regen-trapezoid noise). Generic by

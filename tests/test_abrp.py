@@ -56,6 +56,32 @@ def test_soe_omitted_without_capacity() -> None:
     assert "soe" not in _base(soc=55.0)
 
 
+def test_cabin_hvac_and_tire_fields_included_when_present() -> None:
+    """v0.8.7 — cabin temp, HVAC setpoint, and tire pressures (already
+    converted to kPa by the caller) pass through when supplied.
+    """
+    tlm = _base(
+        cabin_temp=22.3, hvac_setpoint=21.0,
+        tire_pressure_fl=220.5, tire_pressure_fr=219.8,
+        tire_pressure_rl=225.1, tire_pressure_rr=224.7,
+    )
+    assert tlm["cabin_temp"] == 22.3
+    assert tlm["hvac_setpoint"] == 21.0
+    assert tlm["tire_pressure_fl"] == 220.5
+    assert tlm["tire_pressure_fr"] == 219.8
+    assert tlm["tire_pressure_rl"] == 225.1
+    assert tlm["tire_pressure_rr"] == 224.7
+
+
+def test_cabin_hvac_and_tire_fields_dropped_when_none() -> None:
+    tlm = _base()
+    for k in (
+        "cabin_temp", "hvac_setpoint", "tire_pressure_fl",
+        "tire_pressure_fr", "tire_pressure_rl", "tire_pressure_rr",
+    ):
+        assert k not in tlm
+
+
 def test_power_sign_discharge_positive_charge_negative() -> None:
     """ABRP convention: +discharge / -charge. build_tlm's input is the
     opposite (-discharge / +charge) so it can negate once and land on

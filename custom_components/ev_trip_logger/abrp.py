@@ -60,6 +60,12 @@ def build_tlm(
     soh: float | None = None,
     capacity: float | None = None,
     kwh_charged: float | None = None,
+    cabin_temp: float | None = None,
+    hvac_setpoint: float | None = None,
+    tire_pressure_fl: float | None = None,
+    tire_pressure_fr: float | None = None,
+    tire_pressure_rl: float | None = None,
+    tire_pressure_rr: float | None = None,
 ) -> dict[str, Any]:
     """Build the ABRP ``tlm`` payload from primitives; ``None`` values dropped.
 
@@ -115,6 +121,21 @@ def build_tlm(
     # kwh_charged: energy added so far in the active charge session.
     if kwh_charged is not None and kwh_charged > 0:
         tlm["kwh_charged"] = round(float(kwh_charged), 2)
+    # v0.8.7 — cabin temp / HVAC setpoint (°C) and tire pressures (kPa,
+    # already converted by the caller from whatever unit the source
+    # sensor reports). All optional/car-dependent.
+    if cabin_temp is not None:
+        tlm["cabin_temp"] = round(float(cabin_temp), 1)
+    if hvac_setpoint is not None:
+        tlm["hvac_setpoint"] = round(float(hvac_setpoint), 1)
+    if tire_pressure_fl is not None:
+        tlm["tire_pressure_fl"] = round(float(tire_pressure_fl), 1)
+    if tire_pressure_fr is not None:
+        tlm["tire_pressure_fr"] = round(float(tire_pressure_fr), 1)
+    if tire_pressure_rl is not None:
+        tlm["tire_pressure_rl"] = round(float(tire_pressure_rl), 1)
+    if tire_pressure_rr is not None:
+        tlm["tire_pressure_rr"] = round(float(tire_pressure_rr), 1)
     if car_model:
         tlm["car_model"] = car_model
     return tlm

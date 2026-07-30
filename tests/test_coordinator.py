@@ -16,7 +16,9 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.ev_trip_logger.const import (
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
+    CONF_CABIN_TEMP_SENSOR,
     CONF_CHARGE_SENSOR,
+    CONF_HVAC_SETPOINT_SENSOR,
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
@@ -25,6 +27,10 @@ from custom_components.ev_trip_logger.const import (
     CONF_POWER,
     CONF_POWER_SIGN_INVERTED,
     CONF_SPEED,
+    CONF_TIRE_PRESSURE_FL_SENSOR,
+    CONF_TIRE_PRESSURE_FR_SENSOR,
+    CONF_TIRE_PRESSURE_RL_SENSOR,
+    CONF_TIRE_PRESSURE_RR_SENSOR,
     CONF_VEHICLE_ON,
     DOMAIN,
     SERVICE_DELETE_LAST_CHARGE,
@@ -1352,6 +1358,60 @@ async def test_abrp_push_sends_calibrated_soh_not_modelled_estimate(
     await coordinator._async_maybe_send_abrp()
     assert len(sent) == 1
     assert sent[0]["soh"] == pytest.approx(95.0)
+
+
+async def test_abrp_push_sends_cabin_hvac_and_tire_pressures(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.7 — cabin temp / HVAC setpoint pass through as-is (°C); tire
+    pressures are converted from the source sensor's own unit to kPa
+    (ABRP's unit) rather than assuming a fixed unit.
+    """
+    from types import SimpleNamespace
+
+    CABIN = "sensor.cabin_temp"
+    HVAC = "sensor.hvac_setpoint"
+    TFL = "sensor.tire_fl"
+    TFR = "sensor.tire_fr"
+    TRL = "sensor.tire_rl"
+    TRR = "sensor.tire_rr"
+
+    hass.states.async_set(CABIN, "22.5", {"unit_of_measurement": "°C"})
+    hass.states.async_set(HVAC, "21.0", {"unit_of_measurement": "°C"})
+    hass.states.async_set(TFL, "2.2", {"unit_of_measurement": "bar"})
+    hass.states.async_set(TFR, "31.9", {"unit_of_measurement": "psi"})
+    hass.states.async_set(TRL, "220.0", {"unit_of_measurement": "kPa"})
+    hass.states.async_set(TRR, "2200", {"unit_of_measurement": "hPa"})
+
+    entry = await _setup(hass, **{
+        CONF_CABIN_TEMP_SENSOR: CABIN,
+        CONF_HVAC_SETPOINT_SENSOR: HVAC,
+        CONF_TIRE_PRESSURE_FL_SENSOR: TFL,
+        CONF_TIRE_PRESSURE_FR_SENSOR: TFR,
+        CONF_TIRE_PRESSURE_RL_SENSOR: TRL,
+        CONF_TIRE_PRESSURE_RR_SENSOR: TRR,
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    sent: list[dict] = []
+
+    async def _fake_send(tlm):
+        sent.append(tlm)
+        return True
+
+    coordinator._abrp = SimpleNamespace(send=_fake_send)
+    coordinator.abrp_push_enabled = True
+    coordinator._abrp_last_send = 0.0
+    await coordinator._async_maybe_send_abrp()
+
+    assert len(sent) == 1
+    tlm = sent[0]
+    assert tlm["cabin_temp"] == pytest.approx(22.5)
+    assert tlm["hvac_setpoint"] == pytest.approx(21.0)
+    assert tlm["tire_pressure_fl"] == pytest.approx(220.0)  # 2.2 bar
+    assert tlm["tire_pressure_fr"] == pytest.approx(219.9, abs=0.5)  # 31.9 psi
+    assert tlm["tire_pressure_rl"] == pytest.approx(220.0)  # already kPa
+    assert tlm["tire_pressure_rr"] == pytest.approx(220.0)  # 2200 hPa
 
 
 async def test_purge_trips_service_deletes_in_range(hass: HomeAssistant) -> None:

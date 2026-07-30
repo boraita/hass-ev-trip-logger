@@ -55,6 +55,16 @@ CONF_SPEED: Final = "speed_sensor"
 # route matching. Both optional; dropped from the payload when unset/invalid.
 CONF_RANGE_SENSOR: Final = "range_sensor"
 CONF_HEADING_SENSOR: Final = "heading_sensor"
+# v0.8.7 — same ABRP-only pattern for four more fields ABRP's telemetry
+# API supports but this integration never sent, despite the data being
+# on the shelf for cars that expose it: cabin temperature, HVAC setpoint,
+# and the four tire pressures (converted bar/psi -> kPa, ABRP's unit).
+CONF_CABIN_TEMP_SENSOR: Final = "cabin_temp_sensor"
+CONF_HVAC_SETPOINT_SENSOR: Final = "hvac_setpoint_sensor"
+CONF_TIRE_PRESSURE_FL_SENSOR: Final = "tire_pressure_fl_sensor"
+CONF_TIRE_PRESSURE_FR_SENSOR: Final = "tire_pressure_fr_sensor"
+CONF_TIRE_PRESSURE_RL_SENSOR: Final = "tire_pressure_rl_sensor"
+CONF_TIRE_PRESSURE_RR_SENSOR: Final = "tire_pressure_rr_sensor"
 CONF_PLUG_SENSOR: Final = "plug_sensor"
 # v0.5.35 — optional polling-pause sensor (e.g. BYD's
 # switch.byd_sealion_7_disable_polling). When ON, the manufacturer

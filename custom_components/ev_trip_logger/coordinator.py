@@ -79,6 +79,12 @@ from .const import (
     CONF_SPEED,
     CONF_RANGE_SENSOR,
     CONF_HEADING_SENSOR,
+    CONF_CABIN_TEMP_SENSOR,
+    CONF_HVAC_SETPOINT_SENSOR,
+    CONF_TIRE_PRESSURE_FL_SENSOR,
+    CONF_TIRE_PRESSURE_FR_SENSOR,
+    CONF_TIRE_PRESSURE_RL_SENSOR,
+    CONF_TIRE_PRESSURE_RR_SENSOR,
     CONF_BATTERY_CHEMISTRY,
     CONF_TEMP,
     CONF_VEHICLE_FIRST_REGISTERED,
@@ -897,6 +903,12 @@ class EvTripLoggerCoordinator:
         # v0.8.0 — optional sensors fed to ABRP telemetry only.
         self._range = merged.get(CONF_RANGE_SENSOR)
         self._heading = merged.get(CONF_HEADING_SENSOR)
+        self._cabin_temp = merged.get(CONF_CABIN_TEMP_SENSOR)
+        self._hvac_setpoint = merged.get(CONF_HVAC_SETPOINT_SENSOR)
+        self._tire_fl = merged.get(CONF_TIRE_PRESSURE_FL_SENSOR)
+        self._tire_fr = merged.get(CONF_TIRE_PRESSURE_FR_SENSOR)
+        self._tire_rl = merged.get(CONF_TIRE_PRESSURE_RL_SENSOR)
+        self._tire_rr = merged.get(CONF_TIRE_PRESSURE_RR_SENSOR)
         # v0.5.43 — optional driver-identity sensor (BT connected device,
         # input_select, template sensor...). State == driver name.
         self._driver_sensor = merged.get(CONF_DRIVER_SENSOR)
@@ -3291,6 +3303,15 @@ class EvTripLoggerCoordinator:
         # v0.8.0 — extra fields when we have the data.
         est_range = self._read_float(self._range) if self._range else None
         heading = self._read_float(self._heading) if self._heading else None
+        # v0.8.7 — cabin temp, HVAC setpoint, tire pressures (bar/psi -> kPa).
+        cabin_temp = self._read_float(self._cabin_temp) if self._cabin_temp else None
+        hvac_setpoint = (
+            self._read_float(self._hvac_setpoint) if self._hvac_setpoint else None
+        )
+        tire_fl = self._read_pressure_kpa(self._tire_fl)
+        tire_fr = self._read_pressure_kpa(self._tire_fr)
+        tire_rl = self._read_pressure_kpa(self._tire_rl)
+        tire_rr = self._read_pressure_kpa(self._tire_rr)
         capacity = self.battery_capacity  # calibrated kWh (>0 → sent)
         # v0.8.5 — send the REAL calibrated SoH (same figure as
         # sensor.<D>_battery_soh: calibrated / baseline capacity), not
@@ -3326,6 +3347,12 @@ class EvTripLoggerCoordinator:
             soh=soh,
             capacity=capacity,
             kwh_charged=kwh_charged,
+            cabin_temp=cabin_temp,
+            hvac_setpoint=hvac_setpoint,
+            tire_pressure_fl=tire_fl,
+            tire_pressure_fr=tire_fr,
+            tire_pressure_rl=tire_rl,
+            tire_pressure_rr=tire_rr,
         )
         # Need at least SoC to be a useful sample.
         if tlm.get("soc") is None:
@@ -6089,6 +6116,40 @@ class EvTripLoggerCoordinator:
             return float(raw)
         except (TypeError, ValueError):
             return None
+
+    #: Multiplier to kPa from each `unit_of_measurement` HA's pressure
+    #: device_class may report (tire pressure sensors are commonly bar
+    #: or psi; ABRP's tire_pressure_* fields want kPa).
+    _PRESSURE_TO_KPA: dict[str, float] = {
+        "bar": 100.0,
+        "cbar": 1.0,
+        "mbar": 0.1,
+        "hpa": 0.1,
+        "kpa": 1.0,
+        "pa": 0.001,
+        "psi": 6.894757,
+    }
+
+    def _read_pressure_kpa(self, entity_id: str | None) -> float | None:
+        """Read a pressure sensor and convert its value to kPa.
+
+        Unit taken from the entity's own `unit_of_measurement` attribute
+        so it works regardless of which unit the source integration (or
+        HA's unit-system conversion) reports in. Unrecognised/missing
+        units are assumed to already be kPa rather than dropped, since a
+        wrong-but-present tire pressure is more useful to ABRP than none.
+        """
+        if not entity_id:
+            return None
+        value = self._read_float(entity_id)
+        if value is None:
+            return None
+        state = self.hass.states.get(entity_id)
+        unit = (
+            state.attributes.get("unit_of_measurement") if state else None
+        )
+        factor = self._PRESSURE_TO_KPA.get(str(unit).strip().lower(), 1.0)
+        return value * factor
 
     def _read_float_if_fresh(
         self, entity_id: str | None, now: datetime, max_age_s: float,
