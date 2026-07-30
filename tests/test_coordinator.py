@@ -1322,6 +1322,38 @@ async def test_abrp_push_respects_power_sign_inverted(hass: HomeAssistant) -> No
     assert sent[1]["power"] == pytest.approx(-8.0)
 
 
+async def test_abrp_push_sends_calibrated_soh_not_modelled_estimate(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.5 — ABRP's soh field must be the REAL calibrated SoH
+    (calibrated / baseline capacity), not the age/mileage/climate
+    *model* computed for the "expected vs actual" diagnostic sensor.
+    Sending the generic model to ABRP as this car's actual health would
+    misinform its range predictions with a number nobody measured.
+    """
+    from types import SimpleNamespace
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 80.0})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    sent: list[dict] = []
+
+    async def _fake_send(tlm):
+        sent.append(tlm)
+        return True
+
+    coordinator._abrp = SimpleNamespace(send=_fake_send)
+    coordinator.abrp_push_enabled = True
+
+    # 76 kWh observed vs 80 kWh declared baseline -> 95 % real SoH.
+    coordinator._battery_capacity_calibrated = 76.0
+
+    coordinator._abrp_last_send = 0.0
+    await coordinator._async_maybe_send_abrp()
+    assert len(sent) == 1
+    assert sent[0]["soh"] == pytest.approx(95.0)
+
+
 async def test_purge_trips_service_deletes_in_range(hass: HomeAssistant) -> None:
     """purge_trips deletes trips by started_at range; in-memory state refreshes."""
     from custom_components.ev_trip_logger.const import SERVICE_PURGE_TRIPS

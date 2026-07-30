@@ -897,9 +897,6 @@ class EvTripLoggerCoordinator:
         # v0.8.0 — optional sensors fed to ABRP telemetry only.
         self._range = merged.get(CONF_RANGE_SENSOR)
         self._heading = merged.get(CONF_HEADING_SENSOR)
-        # Latest modelled SoH %, cached by async_compute_expected_soh so the
-        # ABRP push can read it synchronously (see _async_maybe_send_abrp).
-        self._abrp_soh_cache: float | None = None
         # v0.5.43 — optional driver-identity sensor (BT connected device,
         # input_select, template sensor...). State == driver name.
         self._driver_sensor = merged.get(CONF_DRIVER_SENSOR)
@@ -1747,8 +1744,6 @@ class EvTripLoggerCoordinator:
         elif has_age or has_climate:
             confidence = "medium"
 
-        # Cache for the ABRP push (reads it synchronously, no await).
-        self._abrp_soh_cache = round(expected, 2)
         return {
             "expected_soh_pct": round(expected, 2),
             "factors": {k: round(v, 3) for k, v in factors.items()},
@@ -3297,7 +3292,20 @@ class EvTripLoggerCoordinator:
         est_range = self._read_float(self._range) if self._range else None
         heading = self._read_float(self._heading) if self._heading else None
         capacity = self.battery_capacity  # calibrated kWh (>0 → sent)
-        soh = self._abrp_soh_cache  # modelled, cached by the SoH sensor
+        # v0.8.5 — send the REAL calibrated SoH (same figure as
+        # sensor.<D>_battery_soh: calibrated / baseline capacity), not
+        # self._abrp_soh_cache (the age/mileage/climate *model* used only
+        # as a diagnostic "expected vs actual" comparison). Sending the
+        # generic model to ABRP as if it were this car's actual health
+        # would be misleading; the calibrated figure is grounded in this
+        # vehicle's own observed charge behaviour and gracefully reads
+        # 100 % before enough charges have accumulated to calibrate.
+        baseline = self.battery_capacity_baseline
+        soh = (
+            round(self.battery_capacity / baseline * 100.0, 2)
+            if baseline > 0
+            else None
+        )
         kwh_charged = (
             self.current_charge.energy_added_kwh
             if self.current_charge is not None
