@@ -66,6 +66,14 @@ This integration solves all of that with explicit state machines, **per-car self
 | **Battery health (SoH)** | Live `battery_soh` (% of declared capacity actually delivered). Plus `expected_battery_soh` modelled from your km / age / chemistry / climate / DCFC habits with constants from Geotab + Tesla + ADAC + NREL + BYD warranty (8 yr / 250 k km, ≥ 70 %). `battery_health_vs_expected` enum tells you if you're ahead/on-track/behind the curve. |
 | **Degradation tracking** | `capacity_history` table appends a snapshot whenever the calibrated capacity drifts ≥ 0.5 kWh — long-term degradation curve visible from day one. |
 
+### More recent (v0.8.0 – v0.8.9)
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list; headline changes since the table above:
+- Trip cost accounting rebuilt as a weighted-average battery pool instead of FIFO charge slices — see [How trip cost is computed](#how-trip-cost-is-computed).
+- Two trip-reconstruction paths (orphan / disconnect-orphan, used when `vehicle_on` misses a real transition) now resolve the real end location and journey membership, and correctly adopt the result as the latest trip — previously they could leave every `last_trip_*` sensor stuck on a stale trip.
+- ABRP telemetry gained `cabin_temp`, `hvac_setpoint`, and tire pressures, and its `soh` field now sends the calibrated (measured) SoH instead of the modelled/expected one.
+- New `fix_speed_stats` maintenance service; new `Tracked sensors` config option (see [Tracking arbitrary sensors](#tracking-arbitrary-sensors)).
+
 ---
 
 ## What you get (full feature set)
@@ -136,6 +144,15 @@ This integration solves all of that with explicit state machines, **per-car self
 - `switch.abrp_push` (RestoreEntity) — runtime kill switch your automations can toggle. Pushes immediately when turned on (no waiting for the next metric tick).
 - `abrp_push_interval_s` is user-configurable (5..600 s, default 30).
 - Sensor `<device>_abrp_next_charge_soc` reads ABRP's next-charge target every 2 min while a route is active.
+- **Fields sent** (each optional/car-dependent — dropped from the payload when unavailable): `utc`, `soc`, `power`, `speed`, `lat`/`lon`, `is_charging`, `is_dcfc`, `is_parked`, `ext_temp`, `est_battery_range` (needs `range_sensor`), `odometer`, `heading` (needs `heading_sensor`), `soh` (the calibrated `battery_soh`, not the modelled `expected_battery_soh` — see below), `capacity`, `soe` (derived from soc × capacity), `kwh_charged`, `cabin_temp` (needs `cabin_temp_sensor`), `hvac_setpoint` (needs `hvac_setpoint_sensor`), `tire_pressure_fl/fr/rl/rr` (needs the four tire pressure sensors), `car_model`.
+- ABRP's API also accepts `voltage`, `current`, `batt_temp` (separate from cabin), and `elevation` — not sent because this integration has no generic source for them; wire them yourself in `abrp.py`/`coordinator.py` if your car exposes matching sensors.
+- `soh` is deliberately the **calibrated** figure (`battery_capacity / battery_capacity_baseline × 100`, grounded in this car's own observed charge behaviour) rather than `expected_battery_soh` (an age/mileage/climate *model* meant only for the "ahead/on-track/behind" diagnostic comparison) — sending the generic model as if it were measured would mislead ABRP's range predictions.
+
+### Tracking arbitrary sensors
+- Configure any list of `sensor.*` entities as **Tracked sensors** and each gets two extra sensors: a 7-day and a 30-day rolling arithmetic mean (via HA's recorder), e.g. to compare several of your car integration's own consumption-estimate variants against each other.
+- Resulting entity_id: `sensor.<device>_<source-suffix>_avg_<7|30>d`, where `<source-suffix>` strips the `sensor.` prefix and the device's own title wherever it appears in the source entity_id (handles both a bare `sensor.<title>_foo` source and a car-integration-prefixed one like `sensor.byd_<title>_foo`).
+- Non-numeric samples (`unknown`/`unavailable`/strings) are dropped from the average; the unit follows the source sensor and stays sticky through a source's `unavailable` blips.
+- Housekeeping: if you added tracked sensors before v0.8.9, entities created against a car-integration-prefixed source may show a doubled device prefix in their name (e.g. `sensor.sealion_7_byd_sealion_7_energy_consumption_avg_30d`) — a slug-generation bug fixed in that release. The fix only prevents the doubling on newly-added tracked sensors; existing doubled entities need manual removal (Settings → Devices & services → Entities, filter by device) if you don't want them lingering.
 
 ### Recovery & corrections
 - **`recover_missing_trips`** — scans the recorder for odo growth not covered by any existing trip and inserts synth records. Never modifies existing rows.
@@ -176,16 +193,22 @@ The wizard asks for the entities the integration consumes. **Required** first, o
 | Outside temp sensor | optional | Per-trip avg temp + the historical `consumption_by_temp_bucket` sensor. |
 | Driver sensor | optional | Entity whose state names who is driving (e.g. car's bluetooth-connected-device sensor). Powers per-driver stats. |
 | Speed sensor | optional | Refines the idle watchdog + ABRP `speed`. |
+| Range sensor | optional | Estimated remaining range (km) — sent to ABRP as `est_battery_range` only, no other effect. |
+| Heading sensor | optional | GPS heading/course (°, 0-360) — sent to ABRP as `heading` only, improves its route matching. |
+| Cabin temperature sensor | optional | Interior temperature (°C) — sent to ABRP as `cabin_temp` only. |
+| HVAC setpoint sensor | optional | Climate target temperature (°C) — sent to ABRP as `hvac_setpoint` only. |
+| Tire pressure sensors (FL/FR/RL/RR) | optional | Any pressure `sensor.*`, any unit (bar/psi/kPa/hPa auto-converted) — sent to ABRP as `tire_pressure_fl/fr/rl/rr` (kPa) only. |
 | **Battery chemistry** | optional | `lfp` (default for packs ≥ 75 kWh — covers BYD Blade, Sealion 7, MG, Tesla SR), `nmc`, `nca`. Drives the `expected_battery_soh` model. |
 | **Vehicle first-registered date** | optional | ISO date (YYYY-MM-DD). Feeds the calendar-aging component of expected SoH. When missing, falls back to a `km / 15 000` proxy and lowers `confidence` to `medium`. |
 | Min trip distance | ✅ | Default 0.5 km. Trips under this are discarded (precon/climate, not real drives). |
 | Idle timeout | ✅ | Mid-trip stop tolerance (minutes). |
-| Energy price (€/kWh) | ✅ | Home tariff. Trip cost = energy × this price (NOT per-charge price — see [why](#why-trip-cost-is-the-home-tariff)). |
+| Energy price (€/kWh) | ✅ | Home tariff. Fallback price when the battery pool has no tracked charge history to draw from yet — see [how trip cost is computed](#how-trip-cost-is-computed). |
 | Energy price entity | optional | Live €/kWh tariff sensor (Octopus/Nordpool/PVPC…). When set, overrides the fixed price for trip/charge cost — read at trip/charge close, so it follows time-of-use periods. Falls back to the fixed price when unavailable or non-numeric. |
 | Currency | ✅ | "EUR", "USD", etc. |
 | Recent trips limit | ✅ | How many rows the `_recent_trips` attribute exposes (5..200, default 50). |
 | ABRP token / api_key / car_model | optional | Enables ABRP telemetry push. |
 | ABRP push interval (s) | optional | Throttle for outbound pushes (5..600, default 30). |
+| Tracked sensors | optional | Arbitrary extra `sensor.*` entities to compute rolling 7d/30d averages for. See [Tracking arbitrary sensors](#tracking-arbitrary-sensors). |
 
 ---
 
@@ -264,9 +287,17 @@ The companion dashboard at [hass-ev-trip-dashboard](https://github.com/boraita/h
 
 ---
 
-## Why trip cost is the home tariff
+## How trip cost is computed
 
-A charge at a €0.40/kWh public DC fast-charger is a one-off event; the energy already mixed with home-charged kWh in the battery. Trip cost is therefore modelled as `energy × home_tariff`. Each individual charge record keeps its **actual** price in its own row, visible in the AC / DC monthly averages.
+The battery is modelled as **one blended pool**, not separate discrete purchases: every charge dilutes/raises a single running €/kWh average, weighted by kWh, and every trip draws energy from that pool at whatever the blended average is at the moment it happens (weighted-average-cost accounting — the same method used for fungible inventory in general, not FIFO/LIFO lot tracking).
+
+Concretely: charge 30 kWh at your €0.07 home tariff, then a public DC-fast top-up adds 20 kWh at €0.40 → the pool's average becomes `(30×0.07 + 20×0.40) / 50 = €0.202/kWh`, and every trip until the next charge costs at that blended rate. A free/promotional charge dilutes the average down smoothly across whatever driving it covers instead of creating a "free until it runs out, then a sudden jump back to full price" discontinuity.
+
+`cost_basis_per_kwh` on each trip is the pool's blended average at that moment; `cost = energy_kwh × cost_basis_per_kwh`. Energy that predates any tracked charge (fresh install) or exceeds what's been tracked as charged falls back to the configured home tariff. Each individual charge record still keeps its own **actual** price in its own row regardless, visible in `recent_charges` and the AC/DC monthly averages — only the derived trip cost is pooled.
+
+`cost_at_avg_tariff` is a companion figure (`energy_kwh × recent_avg_tariff_per_kwh`, a trailing 30-day weighted average) that's always monotonic with kWh — useful for a "typical cost" comparison alongside the pool-accurate `cost`.
+
+The pool is replayed idempotently from the full charge + trip history — not a service you call directly, but it runs automatically on every integration startup and after `set_charge` / `set_last_charge_price`, so correcting a charge's price retroactively re-prices every trip that drew from it.
 
 ---
 
@@ -285,6 +316,7 @@ All services accept an optional `entry_id` to target a specific config entry whe
 | `delete_last_trip` / `delete_last_charge` | Drop the most recent row. |
 | `purge_trips(since, until)` | Bulk delete in a date range. |
 | `recover_missing_trips(since, until?)` | **Recovery mode** — scan recorder for odo growth not covered by any trip and insert synth rows. Existing trips are never modified. |
+| `fix_speed_stats` | Maintenance — clears `avg_speed_kmh` on any trip where it exceeds `max_speed_kmh` (a physically impossible reading; `set_trip` can't null a field, hence this dedicated service). Safe to run any time; only touches already-corrupted rows. |
 | `export_csv(path)` | Dump every trip to CSV. |
 
 ---
