@@ -1585,10 +1585,22 @@ class TrackedAvgSensor(_BaseTripSensor):
         # → we strip the "sensor." prefix and any device prefix that
         # matches the coordinator's entry title (lowercased). For
         # foreign devices we keep the full slug.
+        #
+        # v0.8.9 — a plain `.startswith()` only stripped the prefix when
+        # the device title was the FIRST token (e.g. title "sealion_7"
+        # against a bare "sealion_7_..." source). The common case is a
+        # car-integration prefix in front of it too (BYD's own
+        # "byd_sealion_7_..."), which never matched — producing doubled
+        # entity_ids like sensor.sealion_7_byd_sealion_7_energy_consumption.
+        # Search for the device prefix as a substring instead and strip
+        # everything up to and including it, wherever it falls.
         src_slug = source_entity.split(".", 1)[-1]
         device_prefix = (coordinator.entry.title or "").lower().replace(" ", "_")
-        if device_prefix and src_slug.startswith(device_prefix + "_"):
-            src_slug = src_slug[len(device_prefix) + 1:]
+        if device_prefix:
+            needle = device_prefix + "_"
+            idx = src_slug.find(needle)
+            if idx != -1:
+                src_slug = src_slug[idx + len(needle):]
         slug = f"{src_slug}_avg_{days}d"
         self.entity_description = SensorEntityDescription(
             key=slug,
