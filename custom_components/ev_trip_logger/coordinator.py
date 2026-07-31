@@ -1576,21 +1576,24 @@ class EvTripLoggerCoordinator:
         return float(self._energy_price)
 
     def _trip_cost_price_per_kwh(self) -> float:
-        """€/kWh fallback for trip cost when FIFO inventory is empty.
+        """€/kWh fallback for trip cost when the battery pool is empty.
 
-        v0.5.76 — Trip cost is now computed by the FIFO inventory
-        replay in `TripStorage._recompute_trip_costs_from_charges`:
-        each charge becomes a (kWh, price) slice consumed by later
-        trips in chronological order, so the trip's actual cost is the
-        weighted average of the charge prices its energy was drawn
-        from. The configured home tariff (returned here) is used:
+        v0.5.76, reworked v0.8.8 — Trip cost is computed by the
+        weighted-average-cost (WAC) pool replay in
+        `TripStorage._recompute_trip_costs_from_charges`: every charge
+        blends its (kWh, price) into one running battery average, and
+        each trip draws energy from that pool at whatever the blended
+        average currently is — so the trip's actual cost tracks the
+        real prices its energy was drawn from without discrete slices
+        that have to fully drain before the price can change. The
+        configured home tariff (returned here) is used:
 
           * as the seed `cost_basis_per_kwh` at insert time (before
             the post-insert recompute), so the live snapshot shows
             something sensible immediately;
           * as the price for any energy consumed before any charge
-            was logged (typical at fresh install) or when the
-            inventory queue runs dry mid-trip.
+            was logged (typical at fresh install) or when the pool
+            runs dry mid-trip.
         """
         return float(self._current_energy_price())
 
@@ -1602,10 +1605,10 @@ class EvTripLoggerCoordinator:
         the average is zero.
 
         Powers the dashboard-friendly `cost_at_avg_tariff` attribute
-        on trips. The default `cost` stays FIFO-correct (reflects
-        which inventory slice the trip actually ate); this property
-        gives a second view that is always monotonic with kWh so
-        side-by-side comparisons make sense.
+        on trips. The default `cost` reflects the real blended battery
+        price at the time of the trip (a free or DC-fast charge really
+        did change what driving cost); this property gives a second,
+        always-monotonic-with-kWh view for side-by-side comparisons.
 
         Refreshed by `_async_refresh_avg_tariff_cache`, which runs
         every _AVG_TARIFF_REFRESH and on every trip-log notification.
@@ -2859,8 +2862,8 @@ class EvTripLoggerCoordinator:
             # v0.5.44 — resolve driver from recorder history: the live
             # capture never ran for reconstructed trips.
             driver=await self._async_driver_during(started_at, ended_at),
-            # v0.5.76 — seed with the home tariff; post-insert FIFO
-            # recompute overwrites with the actual weighted-average.
+            # v0.5.76 — seed with the home tariff; post-insert WAC
+            # recompute overwrites with the actual blended average.
             cost_basis_per_kwh=price_per_kwh if cost is not None else None,
             # v0.5.86 — confidence band on the synth-derived consumption.
             **dict(zip(
@@ -2899,9 +2902,9 @@ class EvTripLoggerCoordinator:
         # the vehicle sensor isn't configured / auto-detected).
         self._schedule_vehicle_heal(trip_id)
 
-        # v0.5.76 — FIFO inventory replay so the new trip's cost
-        # reflects the actual charge prices its energy was drawn from
-        # (and earlier trips heal if their basis changed).
+        # v0.5.76 — WAC pool replay so the new trip's cost reflects the
+        # actual charge prices its energy was drawn from (and earlier
+        # trips heal if their basis changed).
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
                 self._current_energy_price(),
@@ -4012,7 +4015,7 @@ class EvTripLoggerCoordinator:
         record.trip_id = trip_id
         # v0.5.77 — schedule the vehicle-native energy heal.
         self._schedule_vehicle_heal(trip_id)
-        # v0.5.76 — keep FIFO inventory accounting consistent.
+        # v0.5.76 — keep the WAC pool accounting consistent.
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
                 self._current_energy_price(),
@@ -4863,9 +4866,9 @@ class EvTripLoggerCoordinator:
             # (None). They survive in the schema for backwards compat;
             # nothing new fills them.
             # v0.5.76 — initial cost-basis seed = home tariff. The
-            # post-insert recompute below replays the FIFO inventory
-            # and overwrites this with the weighted-average price the
-            # trip actually experienced.
+            # post-insert recompute below replays the WAC battery pool
+            # and overwrites this with the blended price the trip
+            # actually experienced.
             cost_basis_per_kwh=price_per_kwh if cost is not None else None,
             # v0.5.84 — battery-capacity calibration factor. K compares
             # the power-integration NET energy (real motor draw) to
@@ -4921,9 +4924,9 @@ class EvTripLoggerCoordinator:
         # v0.5.77 — vehicle-native energy heal scheduled here too.
         self._schedule_vehicle_heal(trip_id)
 
-        # v0.5.76 — FIFO inventory replay: trip cost reflects what
-        # the energy actually cost (charge prices in chronological
-        # order). Earlier trips may also heal if the queue shape
+        # v0.5.76 — WAC pool replay: trip cost reflects what the
+        # energy actually cost (the battery's blended average at that
+        # moment). Earlier trips may also heal if the pool shape
         # changed.
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
@@ -5109,7 +5112,7 @@ class EvTripLoggerCoordinator:
         record.charge_id = charge_id
         self.last_charge = record
 
-        # v0.5.76 — a new charge slice changes future FIFO cost basis;
+        # v0.5.76 — a new charge changes the WAC pool's blended price;
         # rebuild trip costs so everything stays consistent.
         await self.storage.async_recompute_trip_costs_from_charges(
             self._current_energy_price(),
@@ -6040,7 +6043,7 @@ class EvTripLoggerCoordinator:
         # immediately after the drive while the sensor is fresh).
         self._schedule_vehicle_heal(trip_id)
 
-        # v0.5.76 — FIFO cost replay so manual trips share the same
+        # v0.5.76 — WAC pool replay so manual trips share the same
         # accounting as live / synth ones.
         if record.energy_kwh is not None and record.energy_kwh > 0:
             await self.storage.async_recompute_trip_costs_from_charges(
@@ -6234,7 +6237,7 @@ class EvTripLoggerCoordinator:
         physical trip ends. We schedule the heal once per insert; if the
         sensor still hasn't refreshed when the callback fires, we leave
         the row alone (next trip's heal naturally re-checks the
-        previous row by reading the row before triggering FIFO).
+        previous row by reading the row before triggering the WAC replay).
         """
         if not self._last_trip_energy_sensor:
             return
@@ -6333,8 +6336,8 @@ class EvTripLoggerCoordinator:
             trip_id, old_energy or 0.0, vehicle_kwh,
             self._last_trip_energy_sensor, new_consumption,
         )
-        # Re-cost via FIFO so the trip's cost + basis reflect the new
-        # energy. Idempotent.
+        # Re-cost via the WAC pool so the trip's cost + basis reflect
+        # the new energy. Idempotent.
         await self.storage.async_recompute_trip_costs_from_charges(
             self._current_energy_price(),
         )

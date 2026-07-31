@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS trips (
     -- nobody was identified. Powers the per-driver km/hours stats.
     driver TEXT,
     -- v0.5.76: weighted-average €/kWh experienced by the trip after
-    -- the FIFO inventory replay. NULL when energy_kwh is missing.
+    -- the WAC pool replay. NULL when energy_kwh is missing.
     -- Equals cost / energy_kwh; useful for dashboards to surface the
     -- "what did this trip actually cost per kWh" answer (mixes home
     -- tariff and external charges).
@@ -281,7 +281,7 @@ class TripRecord:
     humidity_pct: float | None = None
     wind_kmh: float | None = None
     precipitation_mm: float | None = None
-    # v0.5.76: weighted-average €/kWh the FIFO inventory replay
+    # v0.5.76: weighted-average €/kWh the WAC pool replay
     # produced for this trip. Equals cost / energy_kwh once the
     # post-insert recompute has run; None until then.
     cost_basis_per_kwh: float | None = None
@@ -519,7 +519,7 @@ class TripStorage:
         # v0.5.43: per-trip driver identity.
         if "driver" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN driver TEXT")
-        # v0.5.76: weighted-average €/kWh from FIFO inventory replay.
+        # v0.5.76: weighted-average €/kWh from the WAC pool replay.
         if "cost_basis_per_kwh" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN cost_basis_per_kwh REAL")
         # v0.5.84: per-trip battery-capacity calibration factor.
@@ -2113,14 +2113,18 @@ class TripStorage:
     async def async_recompute_trip_costs_from_charges(
         self, default_price: float = 0.0
     ) -> int:
-        """Re-cost every trip at the configured home tariff (`default_price`).
+        """Re-cost every trip from the weighted-average battery pool.
 
-        Trip cost is **NOT** inherited from individual charges. External
-        one-off charges (free public charger, expensive DC-fast on a road
-        trip) should not change the cost basis for the trips that follow —
-        the user's home tariff is the right reference. Each charge keeps
-        its own actual price in its own record (visible in recent_charges
-        and the AC/DC averages).
+        Trip cost DOES reflect actual charge prices: the battery is
+        modelled as one blended pool whose €/kWh average dilutes toward
+        whatever price the most recent charge added, weighted by kWh —
+        a free public charger genuinely lowers what the following
+        driving cost, an expensive DC-fast genuinely raises it. Only
+        energy that predates any tracked charge (fresh install) or
+        exceeds what's been tracked as charged falls back to the
+        configured home tariff (`default_price`). Each charge still
+        keeps its own actual price in its own record regardless
+        (visible in recent_charges and the AC/DC averages).
 
         Idempotent. Called once on startup so historical €0 trips heal
         themselves when the user fixes a wrongly-configured CONF_ENERGY_PRICE.
@@ -2134,12 +2138,13 @@ class TripStorage:
         )
 
     def _recompute_trip_costs_from_charges(self, default_price: float) -> int:
-        """v0.5.76 — FIFO inventory replay.
+        """v0.8.8 — weighted-average-cost (WAC) battery pool replay.
 
-        Charges add (kWh, price) slices to an inventory queue (oldest first);
-        each trip withdraws energy_kwh from the queue and accumulates cost as
-        `sum(used × slice_price)`. When the inventory is empty the remainder
-        is priced at the configured home tariff (`default_price`). The
+        Charges blend (kWh, price) into a single running pool average
+        (weighted by kWh); each trip withdraws energy_kwh from the pool
+        at whatever that blended average currently is. When the pool
+        can't cover the full withdrawal the shortfall is priced at the
+        configured home tariff (`default_price`). The
         result is written back to `cost` and `cost_basis_per_kwh`.
         """
         from collections import deque
@@ -2200,13 +2205,19 @@ class TripStorage:
                     (avg_per_100, avg_per_100),
                 )
 
-            # Step 2 — FIFO inventory replay. Load all charges in
-            # chronological order (null started_at sorts as oldest, then
-            # by id), push their (kwh, €/kWh) onto a queue, and walk
-            # trips in started_at order, withdrawing energy from the
-            # oldest slices first. Cost = Σ(used × slice_price); when
-            # the queue empties before the trip is satisfied the
-            # remainder falls back to `default_price`.
+            # Step 2 — weighted-average-cost (WAC) battery pool replay.
+            # v0.8.8 — replaced the earlier FIFO-slice model. A real
+            # battery is one blended pool, not separable discrete lots:
+            # modelling it as FIFO meant a single free (or cheap) charge
+            # created a "slice" that had to be fully drained — 100% free
+            # driving for however many km that charge covered, then an
+            # abrupt full-price jump the instant it ran out. WAC instead
+            # tracks one running (pool_kwh, avg_price_per_kwh) for the
+            # whole battery: every charge dilutes/raises that single
+            # average (weighted by kWh), and every trip draws from the
+            # pool at whatever the blended average currently is — so a
+            # free charge lowers the cost per km smoothly across all the
+            # driving it covers instead of zeroing then snapping back.
             charge_rows = conn.execute(
                 """
                 SELECT ended_at, kwh, price_per_kwh
@@ -2244,7 +2255,8 @@ class TripStorage:
                 pp = float(r["price_per_kwh"] or 0.0)
                 pending_charges.append((ts, kwh, pp))
 
-            inventory: deque[tuple[float, float]] = deque()
+            pool_kwh = 0.0
+            pool_avg_price = 0.0
             trip_rows = conn.execute(
                 """
                 SELECT id, started_at, energy_kwh
@@ -2261,30 +2273,28 @@ class TripStorage:
                 trip_started = _as_utc(trow["started_at"])
                 if trip_started is None:
                     continue
-                # Advance: charges with ended_at <= trip_started become
-                # available inventory now.
+                # Advance: charges with ended_at <= trip_started blend
+                # into the pool now — new_avg is the kWh-weighted mean
+                # of what was already there and what just arrived.
                 while pending_charges and pending_charges[0][0] <= trip_started:
                     _ts, c_kwh, c_price = pending_charges.popleft()
-                    inventory.append((c_kwh, c_price))
+                    new_pool_kwh = pool_kwh + c_kwh
+                    pool_avg_price = (
+                        (pool_kwh * pool_avg_price + c_kwh * c_price) / new_pool_kwh
+                        if new_pool_kwh > 0 else c_price
+                    )
+                    pool_kwh = new_pool_kwh
 
-                remaining = float(energy)
-                cost_accum = 0.0
-                while remaining > 0 and inventory:
-                    slice_kwh, slice_price = inventory[0]
-                    if slice_kwh <= remaining:
-                        cost_accum += slice_kwh * slice_price
-                        remaining -= slice_kwh
-                        inventory.popleft()
-                    else:
-                        cost_accum += remaining * slice_price
-                        inventory[0] = (slice_kwh - remaining, slice_price)
-                        remaining = 0.0
-                if remaining > 0:
-                    # Fall back to home tariff for whatever the FIFO
-                    # inventory couldn't cover (typical at startup
-                    # before any charge was logged).
-                    cost_accum += remaining * price
-                basis = cost_accum / float(energy) if float(energy) > 0 else None
+                energy_f = float(energy)
+                from_pool = min(energy_f, pool_kwh)
+                from_fallback = energy_f - from_pool
+                # Fall back to home tariff for whatever the pool
+                # couldn't cover (typical at startup before any charge
+                # was logged, or if a trip's energy estimate outruns
+                # what's been tracked as charged).
+                cost_accum = from_pool * pool_avg_price + from_fallback * price
+                pool_kwh = max(0.0, pool_kwh - energy_f)
+                basis = cost_accum / energy_f if energy_f > 0 else None
                 cur = conn.execute(
                     "UPDATE trips SET cost = ?, cost_basis_per_kwh = ? "
                     "WHERE id = ?",

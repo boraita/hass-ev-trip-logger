@@ -76,10 +76,11 @@ _TRIP_FIELDS_EXTRA_LAST: dict[str, dict[str, Any]] = {
         "slug": "cost",
     },
     # v0.6.4 — `kwh × recent_avg_tariff_per_kwh`. Companion to `cost`
-    # that is always monotonic with kWh (the FIFO `cost` reads weirdly
-    # when a trip eats a free / off-peak inventory slice). The
-    # underlying value is computed by LastTripExtraSensor against the
-    # coordinator's cached avg tariff; precision matches `cost`.
+    # that is always monotonic with kWh (`cost` genuinely dips after a
+    # free / off-peak charge dilutes the WAC battery pool — see
+    # storage._recompute_trip_costs_from_charges). The underlying value
+    # is computed by LastTripExtraSensor against the coordinator's
+    # cached avg tariff; precision matches `cost`.
     "cost_at_avg_tariff": {
         "device_class": SensorDeviceClass.MONETARY,
         "state_class": None,
@@ -876,11 +877,12 @@ def _trip_to_attr(
     v0.6.4 — `avg_tariff_per_kwh` is the weighted-avg €/kWh across the
     user's recent charges (typically `coordinator.recent_avg_tariff_per_kwh`,
     fallback to the home tariff). Used to compute a companion
-    `cost_at_avg_tariff` value alongside the FIFO-correct `cost`: the
-    FIFO number reflects which inventory slice the trip ate (so it's
-    very low when the trip happened to consume a free / off-peak
-    slice) and is mathematically honest, while `cost_at_avg_tariff`
-    is always monotonic with kWh — useful for side-by-side trip
+    `cost_at_avg_tariff` value alongside `cost`: `cost` reflects the
+    real blended battery price at the time of the trip (v0.8.8 — a
+    weighted-average pool, so it's genuinely lower after a free /
+    off-peak charge, not just whichever slice happened to be next)
+    and is mathematically honest, while `cost_at_avg_tariff` is
+    always monotonic with kWh — useful for side-by-side trip
     comparisons. Dashboards pick whichever fits the card.
     """
     start_addr = getattr(trip, "start_address", None)
@@ -989,8 +991,8 @@ def _trip_to_attr(
         # v0.6.4 — companion to `cost` that's always monotonic with
         # kWh. Computed as kwh × the trailing-30d weighted-avg €/kWh
         # (or home tariff when no recent charges exist). Useful when
-        # the FIFO `cost` shows counter-intuitive jumps because a
-        # trip ate a free / off-peak inventory slice.
+        # `cost` dips because a free / off-peak charge diluted the
+        # battery's blended average (WAC pool, see storage.py).
         "cost_at_avg_tariff": (
             _r(trip.energy_kwh * avg_tariff_per_kwh, 2)
             if (
@@ -1049,7 +1051,7 @@ def _trip_to_attr(
         # v0.5.43 — who drove (state of the configured driver sensor,
         # e.g. the BT-connected phone). NULL when unidentified.
         "driver": getattr(trip, "driver", None),
-        # v0.5.76 — weighted-avg €/kWh after FIFO replay.
+        # v0.5.76 — weighted-avg €/kWh after the WAC pool replay.
         "cost_basis_per_kwh": _r(
             getattr(trip, "cost_basis_per_kwh", None), 3
         ),

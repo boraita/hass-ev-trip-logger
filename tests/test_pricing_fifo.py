@@ -1,13 +1,18 @@
-"""Tests for v0.5.76 FIFO inventory cost accounting.
+"""Tests for the weighted-average-cost (WAC) battery pool accounting.
 
-`async_recompute_trip_costs_from_charges(default_price)` is being refactored
-to consume kWh from a chronological FIFO queue of charges (oldest first),
-falling back to the home tariff (`default_price`) only when the inventory
-runs dry. Each trip's `cost_basis_per_kwh` is the weighted-average price
-of the slices it actually drew.
+`async_recompute_trip_costs_from_charges(default_price)` replays the whole
+charge/trip history and models the battery as ONE blended pool: every charge
+dilutes/raises a single running €/kWh average (weighted by kWh), and every
+trip withdraws energy from that pool at whatever the blended average
+currently is. Falls back to the home tariff (`default_price`) only when the
+pool can't cover the withdrawal.
 
-These tests are written against the spec; the implementation lands in the
-same release. They share the same fixture style as `test_storage.py`.
+v0.8.8 replaced the earlier FIFO-slice model (discrete per-charge lots
+drained oldest-first) with this pool model: a free/cheap charge should
+smoothly lower the cost of the driving it covers, not create a slice other
+energy has to wait behind before its price can change.
+
+These tests share the same fixture style as `test_storage.py`.
 """
 from __future__ import annotations
 
@@ -84,7 +89,7 @@ async def _trips_by_id(storage: TripStorage) -> dict[int, TripRecord]:
     return {t.trip_id: t for t in rows}
 
 
-async def test_fifo_single_charge_single_trip(storage: TripStorage) -> None:
+async def test_wac_single_charge_single_trip(storage: TripStorage) -> None:
     """1 charge of 50 kWh @ 0.07 fully covers a 5 kWh trip."""
     await storage.async_insert_charge(
         _charge(ended_at=T0, kwh=50.0, price_per_kwh=0.07)
@@ -103,8 +108,14 @@ async def test_fifo_single_charge_single_trip(storage: TripStorage) -> None:
     assert healed.cost_basis_per_kwh == pytest.approx(0.07)
 
 
-async def test_fifo_oldest_first(storage: TripStorage) -> None:
-    """Oldest charge is drained first: 10 kWh @ 0.50 then 5 kWh @ 0.10."""
+async def test_wac_two_charges_blend_into_one_average(
+    storage: TripStorage,
+) -> None:
+    """Both charges have ended by the time the trip runs, so they blend
+    into ONE pool average before the trip draws anything — unlike FIFO,
+    the trip doesn't drain the older charge first and only touch the
+    newer one once the older is exhausted.
+    """
     await storage.async_insert_charge(
         _charge(ended_at=T0, kwh=10.0, price_per_kwh=0.50)
     )
@@ -120,14 +131,18 @@ async def test_fifo_oldest_first(storage: TripStorage) -> None:
     await storage.async_recompute_trip_costs_from_charges(default_price=0.20)
 
     trip = (await _trips_by_id(storage))[trip_id]
-    # 10 * 0.50 + 5 * 0.10 = 5.50
-    assert trip.cost == pytest.approx(5.50)
-    # Weighted avg 5.50 / 15 ≈ 0.3667
-    assert trip.cost_basis_per_kwh == pytest.approx(5.50 / 15.0)
+    # Blended pool average: (10*0.50 + 20*0.10) / 30 = 7/30.
+    # Stored values are rounded (basis to 6dp, cost to 4dp) — allow for that.
+    avg = 7.0 / 30.0
+    assert trip.cost_basis_per_kwh == pytest.approx(avg, abs=1e-5)
+    assert trip.cost == pytest.approx(15.0 * avg, abs=1e-3)
 
 
-async def test_fifo_free_charge_mixed(storage: TripStorage) -> None:
-    """Free kWh from the newer charge averages down the cost basis."""
+async def test_wac_free_charge_dilutes_average(storage: TripStorage) -> None:
+    """A free charge dilutes the pool's blended average — it doesn't
+    create a separate free "slice" that has to fully drain before the
+    price can change.
+    """
     await storage.async_insert_charge(
         _charge(ended_at=T0, kwh=30.0, price_per_kwh=0.07)
     )
@@ -143,14 +158,18 @@ async def test_fifo_free_charge_mixed(storage: TripStorage) -> None:
     await storage.async_recompute_trip_costs_from_charges(default_price=0.20)
 
     trip = (await _trips_by_id(storage))[trip_id]
-    # 30 * 0.07 + 10 * 0.00 = 2.10
-    assert trip.cost == pytest.approx(2.10)
-    # 2.10 / 40 = 0.0525
-    assert trip.cost_basis_per_kwh == pytest.approx(0.0525)
+    # Blended average: (30*0.07 + 20*0.0) / 50 = 2.1/50 = 0.042.
+    avg = 2.1 / 50.0
+    assert trip.cost_basis_per_kwh == pytest.approx(avg)
+    assert trip.cost == pytest.approx(40.0 * avg)
 
 
-async def test_fifo_inventory_runs_dry(storage: TripStorage) -> None:
-    """When the queue empties, the remainder is billed at default_price."""
+async def test_wac_pool_runs_dry_falls_back_to_home_tariff(
+    storage: TripStorage,
+) -> None:
+    """When the pool can't cover the full withdrawal, the shortfall is
+    billed at default_price.
+    """
     await storage.async_insert_charge(
         _charge(ended_at=T0, kwh=5.0, price_per_kwh=0.07)
     )
@@ -168,7 +187,7 @@ async def test_fifo_inventory_runs_dry(storage: TripStorage) -> None:
     assert trip.cost_basis_per_kwh == pytest.approx(0.95 / 8.0)
 
 
-async def test_fifo_no_charges_fallback(storage: TripStorage) -> None:
+async def test_wac_no_charges_fallback(storage: TripStorage) -> None:
     """No charges at all → every kWh costs default_price."""
     trip_id = await storage.async_insert(_trip(
         started_at=T0 + timedelta(hours=1),
@@ -183,7 +202,7 @@ async def test_fifo_no_charges_fallback(storage: TripStorage) -> None:
     assert trip.cost_basis_per_kwh == pytest.approx(0.10)
 
 
-async def test_fifo_idempotent(storage: TripStorage) -> None:
+async def test_wac_idempotent(storage: TripStorage) -> None:
     """Recompute twice → no drift. The method rebuilds from charges every
     call, so running it again must not double-bill or mutate the result.
     """
@@ -211,6 +230,13 @@ async def test_fifo_idempotent(storage: TripStorage) -> None:
     basis_a1 = first[a].cost_basis_per_kwh
     basis_b1 = first[b].cost_basis_per_kwh
 
+    # Blended pool average before either trip: (30*0.12+20*0.20)/50 = 0.152.
+    avg = (30.0 * 0.12 + 20.0 * 0.20) / 50.0
+    assert basis_a1 == pytest.approx(avg)
+    assert cost_a1 == pytest.approx(10.0 * avg)
+    assert basis_b1 == pytest.approx(avg)
+    assert cost_b1 == pytest.approx(25.0 * avg)
+
     await storage.async_recompute_trip_costs_from_charges(default_price=0.30)
     second = await _trips_by_id(storage)
     assert second[a].cost == pytest.approx(cost_a1)
@@ -219,10 +245,10 @@ async def test_fifo_idempotent(storage: TripStorage) -> None:
     assert second[b].cost_basis_per_kwh == pytest.approx(basis_b1)
 
 
-async def test_fifo_skips_null_energy_trips(storage: TripStorage) -> None:
+async def test_wac_skips_null_energy_trips(storage: TripStorage) -> None:
     """A trip with energy_kwh=None AND distance_km=None must not crash the
-    recompute, must not consume inventory, and must keep cost = NULL (the
-    Step 1 healer can't backfill energy without distance, and the FIFO
+    recompute, must not draw from the pool, and must keep cost = NULL (the
+    Step 1 healer can't backfill energy without distance, and the WAC
     walker has nothing to bill it for).
     """
     await storage.async_insert_charge(
@@ -245,31 +271,30 @@ async def test_fifo_skips_null_energy_trips(storage: TripStorage) -> None:
     trips = await _trips_by_id(storage)
     # NULL-energy row left untouched.
     assert trips[null_id].cost is None
-    # Real trip got the full 10 kWh from the inventory (the null trip
-    # didn't deplete it), so cost = 10 * 0.10 = 1.00 at basis 0.10.
-    # If the null trip had consumed inventory, the real trip would have
-    # only seen 10 kWh available → cost would still be 1.00, BUT if it
-    # consumed 0 kWh (the correct behaviour), basis stays at 0.10.
+    # Real trip got the full 10 kWh from the pool (the null trip didn't
+    # draw from it), so cost = 10 * 0.10 = 1.00 at basis 0.10.
     assert trips[real_id].cost == pytest.approx(1.00)
     assert trips[real_id].cost_basis_per_kwh == pytest.approx(0.10)
 
 
-async def test_fifo_charge_before_first_trip_used_first(
+async def test_wac_three_charges_three_trips_blended(
     storage: TripStorage,
 ) -> None:
-    """3 charges interleaved with 3 trips — each trip's cost reflects ONLY
-    the charges that had ended by its own start. Inventory carries over
-    between trips (oldest leftovers consumed first).
+    """3 charges interleaved with 3 trips — each trip draws from the
+    pool's blended average AT THAT MOMENT (only charges that had ended by
+    its own start have blended in), and any leftover pool + price carries
+    over into the next charge's blend.
     """
     # Timeline (h offset from T0):
     #   h=0  charge A ends:   10 kWh @ 0.05
-    #   h=1  trip 1: 4 kWh   → A has 10 (>=4) → 4 * 0.05 = 0.20
+    #        pool = 10 kWh @ 0.05
+    #   h=1  trip 1: 4 kWh   → draws @ 0.05 → cost 0.20, pool = 6 @ 0.05
     #   h=2  charge B ends:   10 kWh @ 0.20
-    #   h=3  trip 2: 10 kWh  → A has 6 left, B has 10 →
-    #                            6 * 0.05 + 4 * 0.20 = 0.30 + 0.80 = 1.10
+    #        blend: (6*0.05 + 10*0.20) / 16 = 2.3/16 = 0.14375
+    #   h=3  trip 2: 10 kWh  → draws @ 0.14375 → cost 1.4375, pool = 6 @ 0.14375
     #   h=4  charge C ends:   10 kWh @ 0.50
-    #   h=5  trip 3: 8 kWh   → B has 6 left, C has 10 →
-    #                            6 * 0.20 + 2 * 0.50 = 1.20 + 1.00 = 2.20
+    #        blend: (6*0.14375 + 10*0.50) / 16 = 5.8625/16 = 0.36640625
+    #   h=5  trip 3: 8 kWh   → draws @ 0.36640625 → cost 2.93125
     await storage.async_insert_charge(
         _charge(ended_at=T0, kwh=10.0, price_per_kwh=0.05)
     )
@@ -298,19 +323,24 @@ async def test_fifo_charge_before_first_trip_used_first(
     await storage.async_recompute_trip_costs_from_charges(default_price=1.00)
 
     trips = await _trips_by_id(storage)
-    assert trips[t1].cost == pytest.approx(0.20)
     assert trips[t1].cost_basis_per_kwh == pytest.approx(0.05)
-    assert trips[t2].cost == pytest.approx(1.10)
-    assert trips[t2].cost_basis_per_kwh == pytest.approx(1.10 / 10.0)
-    assert trips[t3].cost == pytest.approx(2.20)
-    assert trips[t3].cost_basis_per_kwh == pytest.approx(2.20 / 8.0)
+    assert trips[t1].cost == pytest.approx(0.20)
+
+    avg2 = (6.0 * 0.05 + 10.0 * 0.20) / 16.0
+    assert trips[t2].cost_basis_per_kwh == pytest.approx(avg2)
+    assert trips[t2].cost == pytest.approx(10.0 * avg2)
+
+    pool_after_t2 = 16.0 - 10.0
+    avg3 = (pool_after_t2 * avg2 + 10.0 * 0.50) / (pool_after_t2 + 10.0)
+    assert trips[t3].cost_basis_per_kwh == pytest.approx(avg3, abs=1e-5)
+    assert trips[t3].cost == pytest.approx(8.0 * avg3, abs=1e-3)
 
 
-async def test_fifo_set_last_charge_price_propagates(
+async def test_wac_set_last_charge_price_propagates(
     storage: TripStorage,
 ) -> None:
     """Correcting the only charge's price retroactively re-prices every
-    trip that consumed from it on the next recompute pass.
+    trip that drew from it on the next recompute pass.
     """
     await storage.async_insert_charge(
         _charge(ended_at=T0, kwh=100.0, price_per_kwh=0.07)
@@ -339,14 +369,14 @@ async def test_fifo_set_last_charge_price_propagates(
         assert after[tid].cost_basis_per_kwh == pytest.approx(0.40)
 
 
-async def test_fifo_charge_after_trip_does_not_pollute(
+async def test_wac_charge_after_trip_does_not_pollute(
     storage: TripStorage,
 ) -> None:
     """A charge that ended AFTER a trip started must not contribute to
     that trip's cost — only to subsequent ones.
     """
     # Trip at h=1 (5 kWh). Charge ends at h=2, AFTER the trip started.
-    # With zero prior inventory, the trip is fully billed at default_price.
+    # With zero prior pool, the trip is fully billed at default_price.
     trip_id = await storage.async_insert(_trip(
         started_at=T0 + timedelta(hours=1),
         ended_at=T0 + timedelta(hours=1, minutes=30),
@@ -356,7 +386,7 @@ async def test_fifo_charge_after_trip_does_not_pollute(
         _charge(ended_at=T0 + timedelta(hours=2), kwh=20.0, price_per_kwh=0.05)
     )
     # Later trip at h=3 — by now the late charge has ended, so it's
-    # available in the FIFO inventory.
+    # available in the pool.
     later_id = await storage.async_insert(_trip(
         started_at=T0 + timedelta(hours=3),
         ended_at=T0 + timedelta(hours=3, minutes=30),
@@ -366,7 +396,7 @@ async def test_fifo_charge_after_trip_does_not_pollute(
     await storage.async_recompute_trip_costs_from_charges(default_price=0.30)
 
     trips = await _trips_by_id(storage)
-    # First trip: inventory empty when it started → all 5 kWh @ 0.30.
+    # First trip: pool empty when it started → all 5 kWh @ 0.30.
     assert trips[trip_id].cost == pytest.approx(1.50)
     assert trips[trip_id].cost_basis_per_kwh == pytest.approx(0.30)
     # Later trip pulls cleanly from the (now-available) charge.
