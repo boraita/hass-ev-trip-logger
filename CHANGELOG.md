@@ -2,6 +2,9 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.10 — 2026-08-02
+**Feature — secondary home locations.** A second house, holiday home, etc. can now close/open a journey exactly like the primary `home_zone`. Two new optional config fields: `secondary_home_zones` (pick any number of existing `zone.*` entities) and `secondary_home_coords` (free-typed `lat,lon[,radius_m][,label]`, one per line, for a place you don't want a permanent HA zone for). Wired into every journey-membership decision point (live trip close, both orphan-reconstruction paths, manual trip logging, late-zone-arrival amendment) and the storage-level open-journey/orphan-absorption queries.
+
 ## v0.8.9 — 2026-07-31
 **Fix.** `CONF_TRACKED_SENSORS`' entity-id slug generation only stripped the device title as an exact prefix match. A car-integration source entity puts its own prefix in front of the title (e.g. BYD's `sensor.byd_sealion_7_energy_consumption`), so the check never matched, producing doubled ids like `sensor.sealion_7_byd_sealion_7_energy_consumption_avg_30d`. Now searches for the device title as a substring wherever it falls.
 

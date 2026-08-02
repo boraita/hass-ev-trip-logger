@@ -23,6 +23,7 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
     SelectSelectorMode,
     TextSelector,
+    TextSelectorConfig,
 )
 
 from .const import (
@@ -34,6 +35,8 @@ from .const import (
     CONF_ENERGY_PRICE,
     CONF_ENERGY_PRICE_ENTITY,
     CONF_HOME_ZONE,
+    CONF_SECONDARY_HOME_ZONES,
+    CONF_SECONDARY_HOME_COORDS,
     CONF_IDLE_TIMEOUT,
     CONF_IDLE_TRIP_TIMEOUT_MIN,
     CONF_LOCATION,
@@ -490,6 +493,19 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 CONF_HOME_ZONE,
                 default=defaults.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE),
             ): EntitySelector(EntitySelectorConfig(domain="zone")),
+            # v0.8.10 — secondary "home" locations (second house, holiday
+            # home, …): arriving there closes/opens a journey exactly like
+            # home_zone. Pick any number of existing zones, and/or paste
+            # raw coordinates for a place you don't want a permanent HA
+            # zone for — one "lat,lon" or "lat,lon,radius_m" per line.
+            _optional(
+                CONF_SECONDARY_HOME_ZONES,
+                EntitySelector(EntitySelectorConfig(domain="zone", multiple=True)),
+            ): EntitySelector(EntitySelectorConfig(domain="zone", multiple=True)),
+            _optional(
+                CONF_SECONDARY_HOME_COORDS,
+                TextSelector(TextSelectorConfig(multiline=True)),
+            ): TextSelector(TextSelectorConfig(multiline=True)),
             vol.Required(
                 CONF_RECENT_LIMIT,
                 default=defaults.get(CONF_RECENT_LIMIT, DEFAULT_RECENT_LIMIT),

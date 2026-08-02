@@ -32,6 +32,8 @@
           "energy_price_entity": "Entidad de precio de carga (opcional — sustituye el precio fijo por un sensor de tarifa dinámica, p.ej. Octopus/Nordpool/PVPC)",
           "currency": "Moneda",
           "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)",
+          "secondary_home_zones": "Zonas de segunda casa (casa de vacaciones, segunda vivienda… — cierran/abren journeys igual que la zona casa)",
+          "secondary_home_coords": "Coordenadas de segunda casa (una línea \"lat,lon[,radio_m][,etiqueta]\" por ubicación — para sitios sin una zona de HA permanente)",
           "recent_trips_limit": "Viajes recientes a guardar en listas"
         }
       },
@@ -71,6 +73,8 @@
           "energy_price_entity": "Entidad de precio de carga (opcional — sustituye el precio fijo por un sensor de tarifa dinámica, p.ej. Octopus/Nordpool/PVPC)",
           "currency": "Moneda",
           "home_zone": "Zona casa (cierra journeys cuando el device tracker entra)",
+          "secondary_home_zones": "Zonas de segunda casa (casa de vacaciones, segunda vivienda… — cierran/abren journeys igual que la zona casa)",
+          "secondary_home_coords": "Coordenadas de segunda casa (una línea \"lat,lon[,radio_m][,etiqueta]\" por ubicación — para sitios sin una zona de HA permanente)",
           "recent_trips_limit": "Viajes recientes a guardar en listas"
         }
       }

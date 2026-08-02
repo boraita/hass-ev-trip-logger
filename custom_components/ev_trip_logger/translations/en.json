@@ -37,6 +37,8 @@
           "energy_price_entity": "Home charge price entity (optional — overrides the fixed price with a live tariff sensor, e.g. Octopus/Nordpool/PVPC)",
           "currency": "Currency",
           "home_zone": "Home zone (closes journeys when device tracker enters)",
+          "secondary_home_zones": "Secondary home zones (second house, holiday home, … — closes/opens journeys like the home zone)",
+          "secondary_home_coords": "Secondary home coordinates (one \"lat,lon[,radius_m][,label]\" per line — for places without a permanent HA zone)",
           "recent_trips_limit": "Recent trips to keep in lists"
         }
       },
@@ -79,6 +81,8 @@
           "energy_price_entity": "Home charge price entity (optional — overrides the fixed price with a live tariff sensor, e.g. Octopus/Nordpool/PVPC)",
           "currency": "Currency",
           "home_zone": "Home zone (closes journeys when device tracker enters)",
+          "secondary_home_zones": "Secondary home zones (second house, holiday home, … — closes/opens journeys like the home zone)",
+          "secondary_home_coords": "Secondary home coordinates (one \"lat,lon[,radius_m][,label]\" per line — for places without a permanent HA zone)",
           "recent_trips_limit": "Recent trips to keep in lists"
         }
       }

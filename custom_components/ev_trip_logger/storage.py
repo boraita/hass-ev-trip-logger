@@ -1196,7 +1196,8 @@ class TripStorage:
         return float(total_kwh) / float(total_km) * 100.0
 
     async def async_absorb_orphans_into_journey(
-        self, journey_id: int, home_zone: str
+        self, journey_id: int, home_zone: str,
+        secondary_home_zones: "Sequence[str] | None" = None,
     ) -> int:
         """Retro-assign journey_id to orphan trips since the last home arrival.
 
@@ -1213,30 +1214,37 @@ class TripStorage:
         (journey_id IS NULL) in that window with the new id, so the
         whole casa→…→casa chain ends up grouped.
 
+        `secondary_home_zones` (v0.8.10): second house / holiday home
+        labels count as a home arrival too when bounding the window.
+
         Returns the number of trips updated (excluding the one already
         carrying `journey_id`).
         """
         return await self._hass.async_add_executor_job(
             self._absorb_orphans_into_journey, journey_id, home_zone,
+            secondary_home_zones,
         )
 
     def _absorb_orphans_into_journey(
-        self, journey_id: int, home_zone: str
+        self, journey_id: int, home_zone: str,
+        secondary_home_zones: "Sequence[str] | None" = None,
     ) -> int:
-        slug = (home_zone or "home").strip().casefold()
+        slugs = [(home_zone or "home").strip().casefold()]
+        slugs += [s.strip().casefold() for s in (secondary_home_zones or []) if s]
+        placeholders = ",".join("?" for _ in slugs)
         with self._connect() as conn:
             # The "window start" is the most recent trip BEFORE this
             # journey's leg whose destination was home. If there's no
             # such trip, the window starts at the beginning of history.
             row = conn.execute(
-                """
+                f"""
                 SELECT COALESCE(MAX(id), 0) FROM trips
-                WHERE LOWER(destination) = ?
+                WHERE LOWER(destination) IN ({placeholders})
                   AND id < (
                       SELECT MIN(id) FROM trips WHERE journey_id = ?
                   )
                 """,
-                (slug, journey_id),
+                (*slugs, journey_id),
             ).fetchone()
             anchor_id = int(row[0]) if row and row[0] else 0
             cur = conn.execute(
@@ -1253,7 +1261,7 @@ class TripStorage:
             return int(cur.rowcount or 0)
 
     async def async_resolve_open_journey_id(
-        self, home_zone: str
+        self, home_zone: str, secondary_home_zones: "Sequence[str] | None" = None
     ) -> int | None:
         """Return the journey_id of the currently-open journey, if any.
 
@@ -1264,14 +1272,20 @@ class TripStorage:
         by a subsequent home arrival), returns None.
 
         Comparison is case-insensitive against `home_zone` (the
-        configured device_tracker home slug, e.g. `home`).
+        configured device_tracker home slug, e.g. `home`) OR any of
+        `secondary_home_zones` (v0.8.10 — second house / holiday home
+        labels, which close a journey exactly like the primary home).
         """
         return await self._hass.async_add_executor_job(
-            self._resolve_open_journey_id, home_zone
+            self._resolve_open_journey_id, home_zone, secondary_home_zones
         )
 
-    def _resolve_open_journey_id(self, home_zone: str) -> int | None:
-        slug = (home_zone or "home").strip().casefold()
+    def _resolve_open_journey_id(
+        self, home_zone: str, secondary_home_zones: "Sequence[str] | None" = None
+    ) -> int | None:
+        slugs = [(home_zone or "home").strip().casefold()]
+        slugs += [s.strip().casefold() for s in (secondary_home_zones or []) if s]
+        placeholders = ",".join("?" for _ in slugs)
         with self._connect() as conn:
             # v0.5.16 — DESC: if storage somehow has multiple distinct
             # journey_ids past the last home-arrival (a partial purge,
@@ -1280,15 +1294,15 @@ class TripStorage:
             # stages into a stale journey. Log a warning when ambiguity
             # is observed so the inconsistency is visible.
             rows = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT journey_id FROM trips
                 WHERE journey_id IS NOT NULL
                   AND id > COALESCE(
                       (SELECT MAX(id) FROM trips
-                       WHERE LOWER(destination) = ?),
+                       WHERE LOWER(destination) IN ({placeholders})),
                       0)
                 """,
-                (slug,),
+                slugs,
             ).fetchall()
             if not rows:
                 return None

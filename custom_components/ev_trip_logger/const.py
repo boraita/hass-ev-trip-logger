@@ -171,6 +171,16 @@ CONF_ENERGY_PRICE: Final = "energy_price_kwh"
 CONF_ENERGY_PRICE_ENTITY: Final = "energy_price_entity"
 CONF_CURRENCY: Final = "currency"
 CONF_HOME_ZONE: Final = "home_zone"
+# v0.8.10 — secondary "home" locations (second house, holiday home, …):
+# a trip ending there closes/opens a journey exactly like the primary
+# home_zone. Two ways to define one: pick from existing zone.* entities,
+# or paste raw "lat,lon[,radius_m]" pairs (one per line) for a place you
+# don't want to create a permanent HA zone for.
+CONF_SECONDARY_HOME_ZONES: Final = "secondary_home_zones"
+CONF_SECONDARY_HOME_COORDS: Final = "secondary_home_coords"
+#: Default radius (metres) for a secondary-home coordinate pair that
+#: doesn't specify its own — matches HA's own default zone radius.
+DEFAULT_SECONDARY_HOME_RADIUS_M: Final = 100.0
 CONF_RECENT_LIMIT: Final = "recent_trips_limit"
 
 DEFAULT_BATTERY_CAPACITY: Final = 75.0

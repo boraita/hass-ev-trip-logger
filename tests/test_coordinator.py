@@ -902,6 +902,120 @@ async def test_home_zone_accepts_legacy_plain_string(hass: HomeAssistant) -> Non
     assert coordinator.home_zone == "home"
 
 
+async def test_secondary_home_zone_closes_and_opens_journey(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.10 — a configured secondary home (second house, holiday
+    home, …) closes a journey on arrival and opens one on departure,
+    exactly like the primary home_zone.
+    """
+    from custom_components.ev_trip_logger.const import CONF_SECONDARY_HOME_ZONES
+
+    hass.states.async_set(LOC, "casa_playa")
+    entry = await _setup(hass, **{
+        CONF_LOCATION: LOC,
+        CONF_SECONDARY_HOME_ZONES: ["zone.casa_playa"],
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Departing the secondary home opens a journey.
+    await _run_stage(hass, odo_start=1000, odo_end=1020, soc_end=75, location_end="not_home")
+    j_id = coordinator.current_journey_id
+    assert j_id is not None
+
+    # Arriving back at the secondary home closes it.
+    hass.states.async_set(LOC, "not_home")
+    await _run_stage(hass, odo_start=1020, odo_end=1040, soc_end=65, location_end="casa_playa")
+    assert coordinator.last_completed_journey_id == j_id
+    assert coordinator.current_journey_id is None
+
+
+async def test_secondary_home_zone_resolves_friendly_name(
+    hass: HomeAssistant,
+) -> None:
+    """A secondary home zone can show up as either its slug (the normal
+    device_tracker convention) or its friendly_name (what
+    `_zone_from_coords`'s non-home branch returns) — both must match.
+    """
+    from custom_components.ev_trip_logger.const import CONF_SECONDARY_HOME_ZONES
+
+    hass.states.async_set(
+        "zone.casa_playa", "0",
+        {"friendly_name": "Casa de la Playa", "latitude": 36.5, "longitude": -4.5},
+    )
+    entry = await _setup(hass, **{
+        CONF_SECONDARY_HOME_ZONES: ["zone.casa_playa"],
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    assert coordinator._is_at_any_home("casa_playa")  # slug
+    assert coordinator._is_at_any_home("Casa de la Playa")  # friendly_name
+    assert coordinator._is_at_any_home("CASA_PLAYA")  # case-insensitive
+    assert not coordinator._is_at_any_home("work")
+    assert not coordinator._is_at_any_home(None)
+
+
+async def test_secondary_home_coords_parsed_correctly() -> None:
+    """CONF_SECONDARY_HOME_COORDS free text: one 'lat,lon[,radius][,label]'
+    per line; radius defaults, label defaults to a stable auto-generated
+    name; blank lines / comments / malformed lines are skipped.
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        _parse_secondary_home_coords,
+    )
+    from custom_components.ev_trip_logger.const import (
+        DEFAULT_SECONDARY_HOME_RADIUS_M,
+    )
+
+    raw = """
+    # holiday home, default radius + auto label
+    36.5,-4.5
+
+    40.0,-3.0,250,Casa de la playa
+    not,a,coord
+    """
+    parsed = _parse_secondary_home_coords(raw)
+    assert len(parsed) == 2
+    assert parsed[0] == (36.5, -4.5, DEFAULT_SECONDARY_HOME_RADIUS_M, "secondary_home_1")
+    assert parsed[1] == (40.0, -3.0, 250.0, "Casa de la playa")
+
+
+async def test_secondary_home_coords_parsed_empty_for_blank_input() -> None:
+    from custom_components.ev_trip_logger.coordinator import (
+        _parse_secondary_home_coords,
+    )
+
+    assert _parse_secondary_home_coords(None) == []
+    assert _parse_secondary_home_coords("") == []
+    assert _parse_secondary_home_coords("   \n  # just a comment\n") == []
+
+
+async def test_secondary_home_coord_label_matches_within_radius(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.10 — free-typed coordinates (no registered HA zone) resolve
+    to their label within radius, and None outside it or with nothing
+    configured. This is the path used when the tracker names no zone
+    and HA's own zone-matching (`_zone_from_coords`) finds nothing.
+    """
+    from custom_components.ev_trip_logger.const import CONF_SECONDARY_HOME_COORDS
+
+    entry = await _setup(hass, **{
+        CONF_SECONDARY_HOME_COORDS: "36.5,-4.5,200,Casa de la playa",
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Well within the 200 m radius (~50 m away).
+    assert coordinator._secondary_home_coord_label(36.5004, -4.5) == "Casa de la playa"
+    # Far outside (~11 km away).
+    assert coordinator._secondary_home_coord_label(36.6, -4.5) is None
+    # Missing coordinates.
+    assert coordinator._secondary_home_coord_label(None, None) is None
+    # The label is also recognised by _is_at_any_home for journey checks.
+    assert coordinator._is_at_any_home("Casa de la playa")
+    assert coordinator._is_at_any_home("casa de la playa")  # case-insensitive
+
+
 async def test_journey_zone_is_configurable(hass: HomeAssistant) -> None:
     """A custom home zone name closes journeys instead of literal 'home'."""
     from custom_components.ev_trip_logger.const import CONF_HOME_ZONE

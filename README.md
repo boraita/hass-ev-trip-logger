@@ -119,6 +119,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list; headline changes since the t
 - A journey opens iff a trip starts at home and ends away; closes iff a trip ends at home. Time gaps between intermediate trips are irrelevant.
 - Auto-stitch: a trip ending at home with no open journey mints a fresh id AND absorbs orphan trips since the last home-arrival into it, so the full `casa → … → casa` chain renders as one row.
 - Resume on restart via SQL (not in-memory state), so a mid-trip reload never loses the open journey.
+- **Secondary home zones (v0.8.10)** — a second house, holiday home, etc. Configure any number of existing `zone.*` entities as **Secondary home zones**, and/or paste raw `lat,lon[,radius_m][,label]` coordinates (one per line) as **Secondary home coordinates** for a place you don't want a permanent HA zone for. Arriving there closes a journey and starting from there opens one, exactly like the primary `home_zone` — a coordinate match gets its own label (auto-numbered `secondary_home_N` if you didn't set one) so the trip's destination reads something meaningful instead of `not_home`.
 
 ### Charges
 - Auto-detected from your `charge_sensor`. Plug-sensor wired ⇒ multiple charging pulses inside one plugged interval merge into a single session.
@@ -182,6 +183,8 @@ The wizard asks for the entities the integration consumes. **Required** first, o
 | **Vehicle-on binary sensor** | ✅ | `binary_sensor.…_vehicle_on`. Primary trip trigger. |
 | **Battery capacity (kWh)** | ✅ | E.g. 82.5 for a Sealion 7 Extended Range. Used as the **declared** capacity; the integration auto-calibrates the effective capacity from charges. |
 | **Home zone** | ✅ | Usually `zone.home`. Journey logic uses it. |
+| Secondary home zones | optional | Any number of existing `zone.*` entities that count as "home" for journeys (second house, holiday home, …). |
+| Secondary home coordinates | optional | Free text, one `lat,lon[,radius_m][,label]` per line, for a home-equivalent place you don't want a permanent HA zone for. |
 | Power sensor | optional | kW, +discharge/-charge. Enables regen + power-integration backup + ABRP push. If your car reports the opposite convention (e.g. some BYD cloud entities are -discharge/+charge), toggle **Power sign inverted**. |
 | Power sign inverted | optional | Default off (positive = discharge). Flip ON when your car's `power_sensor` reports the inverse — telltale sign: persistent `regen_kwh` higher than `energy_kwh` even on flat trips. Auto-detected sensors that need this: BYD cloud-API `*_power`. |
 | **EVSE power sensor** | optional | Any wallbox or socket-meter power entity (W or kW auto-detected). Enables AC-side energy + AC→DC efficiency measurement. Works with V2C Trydan, Shelly Pro/EM, Wallbox Pulsar/Quasar, Tesla Wall Connector, Easee, Zappi, Smartfox, OpenEVSE, generic Shelly relays. See [Wallbox examples](#wallbox-examples). |

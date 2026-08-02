@@ -61,6 +61,9 @@ from .const import (
     CONF_ENERGY_PRICE,
     CONF_ENERGY_PRICE_ENTITY,
     CONF_HOME_ZONE,
+    CONF_SECONDARY_HOME_ZONES,
+    CONF_SECONDARY_HOME_COORDS,
+    DEFAULT_SECONDARY_HOME_RADIUS_M,
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
@@ -482,6 +485,41 @@ def _haversine_km(
     dlam = radians(lon2 - lon1)
     a = sin(dphi / 2) ** 2 + cos(r1) * cos(r2) * sin(dlam / 2) ** 2
     return 2 * 6371.0 * atan2(sqrt(a), sqrt(1 - a))
+
+
+def _parse_secondary_home_coords(
+    raw: str | None,
+) -> list[tuple[float, float, float, str]]:
+    """Parse CONF_SECONDARY_HOME_COORDS free text into (lat, lon, radius_m, label).
+
+    One entry per line (blank lines / '#' comments ignored):
+    "lat,lon", "lat,lon,radius_m", or "lat,lon,radius_m,label". Radius
+    defaults to DEFAULT_SECONDARY_HOME_RADIUS_M when omitted; label
+    defaults to "secondary_home_<n>" (n = 1-based line position among
+    valid entries) so a coordinate-matched trip still gets a real
+    destination string instead of staying "not_home". Malformed lines
+    are skipped rather than raising, since this is user-typed free text
+    with no schema validation.
+    """
+    if not raw:
+        return []
+    out: list[tuple[float, float, float, str]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            lat = float(parts[0])
+            lon = float(parts[1])
+            radius = float(parts[2]) if len(parts) >= 3 and parts[2] else DEFAULT_SECONDARY_HOME_RADIUS_M
+        except (TypeError, ValueError):
+            continue
+        label = parts[3] if len(parts) >= 4 and parts[3] else f"secondary_home_{len(out) + 1}"
+        out.append((lat, lon, radius, label))
+    return out
 
 
 def _route_distance_km(
@@ -994,6 +1032,17 @@ class EvTripLoggerCoordinator:
         self._energy_price_entity = merged.get(CONF_ENERGY_PRICE_ENTITY) or None
         self._currency = merged.get(CONF_CURRENCY, DEFAULT_CURRENCY)
         self._home_zone = merged.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE)
+        # v0.8.10 — secondary "home" locations (second house, holiday
+        # home, …). Zone entities: raw entity_ids, slug resolved lazily
+        # via secondary_home_zone_slugs (mirrors home_zone's own
+        # slug-from-entity_id logic). Coordinates: parsed once here since
+        # they're free text, not an entity reference.
+        self._secondary_home_zones: list[str] = list(
+            merged.get(CONF_SECONDARY_HOME_ZONES) or []
+        )
+        self._secondary_home_coords: list[tuple[float, float, float]] = (
+            _parse_secondary_home_coords(merged.get(CONF_SECONDARY_HOME_COORDS))
+        )
 
         self.current: TripInProgress | None = None
         self.last_trip: TripRecord | None = None
@@ -1132,6 +1181,59 @@ class EvTripLoggerCoordinator:
         if location is None:
             return False
         return location.strip().casefold() == self.home_zone.strip().casefold()
+
+    def _secondary_home_labels(self) -> set[str]:
+        """v0.8.10 — every string a configured secondary home could show
+        up as in a location field: a zone's slug (what device_tracker
+        normally reports) AND its current friendly_name (what
+        `_zone_from_coords`'s non-home branch returns — see that
+        docstring), since either can reach the comparison depending on
+        which path resolved the location; plus every free-typed
+        coordinate entry's label. Resolved fresh each call (cheap: a
+        handful of entries at most) so a renamed/added zone takes effect
+        without a coordinator restart. Also the set storage-level journey
+        queries (open-journey resolution, orphan absorption) treat as
+        home-equivalent alongside `home_zone`.
+        """
+        labels: set[str] = set()
+        for entity_id in self._secondary_home_zones:
+            slug = entity_id[len("zone."):] if entity_id.startswith("zone.") else entity_id
+            labels.add(slug.strip().casefold())
+            state = self.hass.states.get(entity_id)
+            if state is not None and state.name:
+                labels.add(state.name.strip().casefold())
+        for _lat, _lon, _radius, label in self._secondary_home_coords:
+            labels.add(label.strip().casefold())
+        return labels
+
+    def _is_at_any_home(self, location: str | None) -> bool:
+        """Like `_is_at_home`, but also true for any configured secondary
+        home (second house, holiday home, …) — arriving there closes a
+        journey, and starting from there opens one, exactly like the
+        primary home_zone.
+        """
+        if self._is_at_home(location):
+            return True
+        if location is None:
+            return False
+        return location.strip().casefold() in self._secondary_home_labels()
+
+    def _secondary_home_coord_label(
+        self, lat: float | None, lon: float | None
+    ) -> str | None:
+        """v0.8.10 — resolve free-typed secondary-home coordinates
+        (CONF_SECONDARY_HOME_COORDS) to their label, or None outside every
+        configured radius. These aren't registered HA zones, so HA's own
+        zone-matching (`_zone_from_coords`) never sees them; this is the
+        dedicated check for that case. Also usable as a truthy "is near
+        any secondary-home coordinate" test.
+        """
+        if lat is None or lon is None or not self._secondary_home_coords:
+            return None
+        for home_lat, home_lon, radius_m, label in self._secondary_home_coords:
+            if _haversine_km(lat, lon, home_lat, home_lon) * 1000.0 <= radius_m:
+                return label
+        return None
 
     def _zone_from_coords(
         self, lat: float | None, lon: float | None
@@ -1969,7 +2071,7 @@ class EvTripLoggerCoordinator:
         # tagged trip after the most recent home-arrival; if any, that
         # journey is still open.
         self.current_journey_id = await self.storage.async_resolve_open_journey_id(
-            self.home_zone
+            self.home_zone, self._secondary_home_labels()
         )
         # Seed the odo-jump snapshot from the last trip if available so we can
         # detect missed trips that happened while HA was down.
@@ -2549,7 +2651,7 @@ class EvTripLoggerCoordinator:
                     self.last_trip.trip_id, location
                 )
                 self.last_trip = replace(self.last_trip, destination=location)
-                amended_to_home = self._is_at_home(location)
+                amended_to_home = self._is_at_any_home(location)
         if amended_to_home and self.current_journey_id is not None:
             self.last_completed_journey_id = self.current_journey_id
             self.current_journey_id = None
@@ -2793,6 +2895,10 @@ class EvTripLoggerCoordinator:
             # No-route case: end coords came from the tracker's CURRENT
             # position at finalize time, which is fresh by construction.
             zone_end = self._zone_from_coords(end_lat, end_lon)
+            if zone_end is None:
+                # v0.8.10 — not a registered HA zone; check free-typed
+                # secondary-home coordinates instead.
+                zone_end = self._secondary_home_coord_label(end_lat, end_lon)
             if zone_end is not None:
                 location_end = zone_end
         if (
@@ -2802,10 +2908,12 @@ class EvTripLoggerCoordinator:
             and route[0][0] >= started_at - _ZONE_FALLBACK_MAX_AGE
         ):
             zone_start = self._zone_from_coords(start_lat, start_lon)
+            if zone_start is None:
+                zone_start = self._secondary_home_coord_label(start_lat, start_lon)
             if zone_start is not None:
                 location_start = zone_start
-        started_from_home = self._is_at_home(location_start)
-        is_at_home_end = self._is_at_home(location_end)
+        started_from_home = self._is_at_any_home(location_start)
+        is_at_home_end = self._is_at_any_home(location_end)
         # Same invariant as _async_close_trip — open journeys absorb
         # every stage until a home arrival closes them. No retroactive
         # closures (the band-aid that conflated GPS noise with real
@@ -3973,9 +4081,23 @@ class EvTripLoggerCoordinator:
         # closed the journey, and this trip was never adopted as
         # last_trip, so dashboards kept showing whatever trip predated it.
         location_end = self._read_str(self._location) if self._location else None
+        # v0.8.10 — no GPS route in this reconstruction path, but the
+        # tracker's CURRENT coords are still worth a free-typed
+        # secondary-home check when the state itself names no zone.
+        if _is_zoneless(location_end) and self._location:
+            loc_state = self.hass.states.get(self._location)
+            if loc_state is not None:
+                try:
+                    cur_lat = float(loc_state.attributes.get("latitude"))
+                    cur_lon = float(loc_state.attributes.get("longitude"))
+                except (TypeError, ValueError):
+                    cur_lat = cur_lon = None
+                coord_label = self._secondary_home_coord_label(cur_lat, cur_lon)
+                if coord_label is not None:
+                    location_end = coord_label
         origin_location = last_trip.destination
-        is_at_home_end = self._is_at_home(location_end)
-        started_from_home = self._is_at_home(origin_location)
+        is_at_home_end = self._is_at_any_home(location_end)
+        started_from_home = self._is_at_any_home(origin_location)
         journey_id: int | None
         if self.current_journey_id is not None:
             journey_id = self.current_journey_id
@@ -4070,9 +4192,23 @@ class EvTripLoggerCoordinator:
         # dashboards read "Outside known zones" for a trip that actually
         # ended at home, plus the home arrival never closed the journey.
         location_end = self._read_str(self._location) if self._location else None
+        # v0.8.10 — no GPS route in this reconstruction path, but the
+        # tracker's CURRENT coords are still worth a free-typed
+        # secondary-home check when the state itself names no zone.
+        if _is_zoneless(location_end) and self._location:
+            loc_state = self.hass.states.get(self._location)
+            if loc_state is not None:
+                try:
+                    cur_lat = float(loc_state.attributes.get("latitude"))
+                    cur_lon = float(loc_state.attributes.get("longitude"))
+                except (TypeError, ValueError):
+                    cur_lat = cur_lon = None
+                coord_label = self._secondary_home_coord_label(cur_lat, cur_lon)
+                if coord_label is not None:
+                    location_end = coord_label
         origin_location = self.last_trip.destination if self.last_trip else None
-        is_at_home_end = self._is_at_home(location_end)
-        started_from_home = self._is_at_home(origin_location)
+        is_at_home_end = self._is_at_any_home(location_end)
+        started_from_home = self._is_at_any_home(origin_location)
 
         # Journey membership — same rule as the live close path (v0.5.14):
         # continue an already-open journey regardless of where this gap
@@ -4540,6 +4676,12 @@ class EvTripLoggerCoordinator:
             zone_end = self._zone_from_coords(
                 active.gps_samples[-1][1], active.gps_samples[-1][2]
             )
+            if zone_end is None:
+                # v0.8.10 — not a registered HA zone; check free-typed
+                # secondary-home coordinates instead.
+                zone_end = self._secondary_home_coord_label(
+                    active.gps_samples[-1][1], active.gps_samples[-1][2]
+                )
             if zone_end is not None:
                 location_end = zone_end
 
@@ -4752,8 +4894,8 @@ class EvTripLoggerCoordinator:
         #     with legitimate home arrivals.
         #   - Reliance on last_trip.destination at restart (handled in
         #     async_start via storage.async_resolve_open_journey_id).
-        is_at_home_end = self._is_at_home(location_end)
-        started_from_home = self._is_at_home(active.location_start)
+        is_at_home_end = self._is_at_any_home(location_end)
+        started_from_home = self._is_at_any_home(active.location_start)
         journey_id: int | None
         stitched_orphan_home = False
         if self.current_journey_id is not None:
@@ -4940,7 +5082,7 @@ class EvTripLoggerCoordinator:
         # chain instead of showing as a single-row 1-stage journey.
         if stitched_orphan_home and journey_id is not None:
             absorbed = await self.storage.async_absorb_orphans_into_journey(
-                journey_id, self.home_zone,
+                journey_id, self.home_zone, self._secondary_home_labels(),
             )
             if absorbed:
                 _LOGGER.info(
@@ -5230,7 +5372,7 @@ class EvTripLoggerCoordinator:
         # Also re-resolve the open journey: if the user changed
         # journey_id or destination, the resume may now be different.
         self.current_journey_id = await self.storage.async_resolve_open_journey_id(
-            self.home_zone
+            self.home_zone, self._secondary_home_labels()
         )
         self.last_completed_journey_id = (
             await self.storage.async_last_completed_journey_id(self.current_journey_id)
@@ -5998,8 +6140,8 @@ class EvTripLoggerCoordinator:
         # ungrouped and let the NEXT trip's auto-stitch include the
         # whole orphan range — corrupting today's journey with
         # yesterday's leg.
-        is_at_home_end = self._is_at_home(destination)
-        started_from_home = self._is_at_home(origin)
+        is_at_home_end = self._is_at_any_home(destination)
+        started_from_home = self._is_at_any_home(origin)
         journey_id: int | None
         stitched_orphan_home = False
         if self.current_journey_id is not None:
@@ -6052,7 +6194,7 @@ class EvTripLoggerCoordinator:
 
         if stitched_orphan_home and journey_id is not None:
             await self.storage.async_absorb_orphans_into_journey(
-                journey_id, self.home_zone,
+                journey_id, self.home_zone, self._secondary_home_labels(),
             )
         # Update journey state mirror.
         if is_at_home_end and journey_id is not None:
