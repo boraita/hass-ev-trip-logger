@@ -29,6 +29,7 @@ from homeassistant.core import (
     HomeAssistant,
     callback,
 )
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
@@ -45,6 +46,7 @@ from .elevation import (
 )
 from .const import (
     ABRP_MIN_SEND_INTERVAL_S,
+    DOMAIN,
     CONF_ABRP_API_KEY,
     CONF_ABRP_CAR_MODEL,
     CONF_ABRP_PUSH_INTERVAL_S,
@@ -6485,6 +6487,20 @@ class EvTripLoggerCoordinator:
         )
         self._notify_trip_log_listeners()
 
+    def _is_own_entity(self, entity_id: str) -> bool:
+        """v0.8.11 — True if `entity_id` was registered by this
+        integration itself (`platform == DOMAIN`). When the vehicle
+        integration's slug collides with the logger's own device slug
+        (e.g. both named "relampago"), the prefix-walk in
+        `_auto_detect_vehicle_sensor`/`_auto_detect_temp_sensor` can
+        otherwise land on `sensor.<prefix>_last_trip_energy` — the
+        logger's own output sensor — and adopt it as its own vehicle
+        source, healing trips from data it just wrote itself.
+        """
+        reg = er.async_get(self.hass)
+        entry = reg.async_get(entity_id)
+        return entry is not None and entry.platform == DOMAIN
+
     def _auto_detect_vehicle_sensor(
         self, suffixes: tuple[str, ...], label: str
     ) -> str | None:
@@ -6498,6 +6514,8 @@ class EvTripLoggerCoordinator:
         for suffix in suffixes:
             candidate = f"sensor.{prefix}{suffix}"
             if self.hass.states.get(candidate) is not None:
+                if self._is_own_entity(candidate):
+                    continue
                 _LOGGER.warning(
                     "Auto-detected %s sensor: %s.",
                     label, candidate,
@@ -6532,6 +6550,8 @@ class EvTripLoggerCoordinator:
         ):
             candidate = f"sensor.{prefix}{suffix}"
             if self.hass.states.get(candidate) is not None:
+                if self._is_own_entity(candidate):
+                    continue
                 # WARNING level so it surfaces in `system_log/list` and
                 # the HA UI's Logs panel without needing custom logger
                 # config. Cosmetic but the user wants to KNOW we wired

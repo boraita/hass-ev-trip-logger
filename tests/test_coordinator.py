@@ -2636,6 +2636,52 @@ async def test_vehicle_heal_skipped_on_distance_mismatch(hass: HomeAssistant) ->
     assert after.energy_source == "power_integration"
 
 
+async def test_auto_detect_vehicle_sensor_skips_own_entities(hass: HomeAssistant) -> None:
+    """Issue #12 — when the vehicle integration's device slug collides
+    with the logger's own device slug (e.g. both named "relampago"),
+    `sensor.<prefix>_last_trip_energy` can be the LOGGER'S OWN output
+    sensor rather than the vehicle's. Auto-detect must not adopt it —
+    that would heal trips from data the logger just wrote itself.
+    """
+    ODO2 = "sensor.relampago_odometer"
+    hass.states.async_set(ODO2, "1000.0")
+    entry = await _setup(hass, **{CONF_ODOMETER: ODO2})
+    c = hass.data[DOMAIN][entry.entry_id]
+
+    collide = "sensor.relampago_last_trip_energy"
+    registry = er.async_get(hass)
+    registry.async_get_or_create(
+        "sensor", DOMAIN, "fake_own_last_trip_energy",
+        suggested_object_id="relampago_last_trip_energy",
+        config_entry=entry,
+    )
+    hass.states.async_set(collide, "0.75")
+
+    assert c._auto_detect_vehicle_sensor(
+        ("_last_trip_energy", "_last_trip_kwh", "_trip_energy"),
+        "last-trip energy",
+    ) is None
+
+
+async def test_auto_detect_temp_sensor_skips_own_entities(hass: HomeAssistant) -> None:
+    """Same guard for the exterior-temp auto-detect prefix walk."""
+    ODO2 = "sensor.relampago_odometer"
+    hass.states.async_set(ODO2, "1000.0")
+    entry = await _setup(hass, **{CONF_ODOMETER: ODO2})
+    c = hass.data[DOMAIN][entry.entry_id]
+
+    collide = "sensor.relampago_exterior_temperature"
+    registry = er.async_get(hass)
+    registry.async_get_or_create(
+        "sensor", DOMAIN, "fake_own_exterior_temp",
+        suggested_object_id="relampago_exterior_temperature",
+        config_entry=entry,
+    )
+    hass.states.async_set(collide, "21.0")
+
+    assert c._auto_detect_temp_sensor() is None
+
+
 def test_speed_stats_v95_and_highway_ratio() -> None:
     """v0.7.3 — `_speed_stats` returns nearest-rank V95 + fraction
     of samples ≥ threshold. Empty/all-None → (None, None).

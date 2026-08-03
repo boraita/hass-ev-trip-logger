@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from custom_components.ev_trip_logger.elevation import (
+    _build_payload,
     compute_elevation_stats,
     downsample_route,
 )
@@ -65,3 +66,37 @@ def test_downsample_route_dedups_consecutive_identical_hits() -> None:
     # No two consecutive entries should be equal.
     for a, b in zip(sampled, sampled[1:]):
         assert a != b
+
+
+def test_build_payload_open_elevation_uses_list_of_dicts() -> None:
+    """#11 — open-elevation's shape is untouched by the per-provider fix."""
+    points = [(41.453365, 2.242997), (41.438114, 2.242548)]
+    payload = _build_payload("open-elevation", points)
+    assert payload == {
+        "locations": [
+            {"latitude": 41.453365, "longitude": 2.242997},
+            {"latitude": 41.438114, "longitude": 2.242548},
+        ],
+    }
+
+
+@pytest.mark.parametrize("provider", ["opentopodata-eudem", "opentopodata-srtm"])
+def test_build_payload_opentopodata_uses_pipe_delimited_string(provider: str) -> None:
+    """#11 — v0.8.4 sent open-elevation's list-of-dicts shape to
+    OpenTopoData and got HTTP 400 on every request; it wants a single
+    "lat,lon|lat,lon|..." string instead.
+    """
+    points = [(41.453365, 2.242997), (41.438114, 2.242548), (41.4455, 2.2405)]
+    payload = _build_payload(provider, points)
+    assert payload == {
+        "locations": "41.453365,2.242997|41.438114,2.242548|41.4455,2.2405",
+    }
+
+
+def test_build_payload_opentopodata_pipe_format_regardless_of_self_hosted_url() -> None:
+    """A self-hosted OpenTopoData instance (reached via `provider_url`)
+    still speaks the OpenTopoData request shape — the decision is keyed
+    off the `provider` select, not the resolved URL.
+    """
+    payload = _build_payload("opentopodata-eudem", [(1.0, 2.0)])
+    assert payload == {"locations": "1.0,2.0"}

@@ -24,10 +24,12 @@ from aiohttp import ClientError, ClientSession, ClientTimeout
 
 _LOGGER = logging.getLogger(__name__)
 
-# Free public endpoints. Both accept POSTed JSON of
-# `{"locations": [{"latitude": lat, "longitude": lon}, ...]}` and
-# return `{"results": [{"elevation": m, ...}, ...]}`. Compatible on
-# purpose — pick whichever has better latency for you or self-host.
+# Free public endpoints. All return `{"results": [{"elevation": m, ...},
+# ...]}` in input order, but the REQUEST shape differs: open-elevation
+# wants a list of {"latitude", "longitude"} dicts, OpenTopoData wants a
+# single pipe-delimited "lat,lon|lat,lon|..." string (see
+# `_build_payload` below) — sending the open-elevation shape to
+# OpenTopoData gets a 400 `INVALID_REQUEST` on every request (#11).
 _PROVIDER_URLS: dict[str, str] = {
     "open-elevation": "https://api.open-elevation.com/api/v1/lookup",
     "opentopodata-eudem": "https://api.opentopodata.org/v1/eudem25m",
@@ -54,6 +56,26 @@ def _resolve_provider_url(
     if override_url:
         return override_url
     return _PROVIDER_URLS.get(provider)
+
+
+def _build_payload(
+    provider: str, points: list[tuple[float, float]],
+) -> dict[str, Any]:
+    """Per-provider request body (#11). OpenTopoData — including a
+    self-hosted instance reached via `provider_url`, since the
+    `provider` select still says which API shape it speaks — takes a
+    single pipe-delimited "lat,lon|lat,lon|..." string; every other
+    provider (open-elevation) takes the list-of-dicts shape.
+    """
+    if provider.startswith("opentopodata"):
+        return {
+            "locations": "|".join(f"{lat},{lon}" for lat, lon in points),
+        }
+    return {
+        "locations": [
+            {"latitude": lat, "longitude": lon} for lat, lon in points
+        ],
+    }
 
 
 def downsample_route(
@@ -103,17 +125,19 @@ async def fetch_elevations(
     url = _resolve_provider_url(provider, provider_url)
     if not url or not points:
         return None
-    payload = {
-        "locations": [
-            {"latitude": lat, "longitude": lon} for lat, lon in points
-        ],
-    }
+    payload = _build_payload(provider, points)
     try:
         async with session.post(
             url, json=payload, timeout=_HTTP_TIMEOUT,
         ) as resp:
             if resp.status != 200:
-                _LOGGER.info(
+                # v0.8.11 — a 4xx is a config/request-shape bug, not a
+                # transient failure, and repeats on every trip close
+                # forever (#11's opentopodata payload mismatch went
+                # unnoticed for a month at INFO level). WARNING so it
+                # surfaces without custom logger config.
+                log = _LOGGER.warning if 400 <= resp.status < 500 else _LOGGER.info
+                log(
                     "Elevation provider %s returned HTTP %s; skipping",
                     provider, resp.status,
                 )

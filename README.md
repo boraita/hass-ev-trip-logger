@@ -62,7 +62,7 @@ This integration solves all of that with explicit state machines, **per-car self
 | **Trip detection** | Live-open retry chain when odometer lags `vehicle_on=on` flanco (BYD cloud poll 6 min off-edge protection). 180 s off-grace so a red-light / pickup stop no longer closes the trip. Synthetic finalize cancelled when ignition returns. |
 | **Score calibration** | The 10/10 anchor is the car's own **P5 historical consumption** (over trips ≥ 5 km, ≥ 10 trips). Falls back to 14.5 kWh/100 km — the calibration can only RAISE the bar, never lower it. Configurable battery chemistry. |
 | **Energy precision** | Effective battery capacity auto-calibrated from real charges (median of `kwh / ΔSoC × 100` over recent charges ≥ 30 % ΔSoC). Heals all historical SoC-derived trips when calibration shifts. |
-| **Weather correlation** | Optional `weather.*` entity captures temperature / condition / humidity / wind / precipitation at trip open + close. Three new bucket sensors: consumption-by-season, by-time-of-day, by-temperature. |
+| **Seasonal & temperature analytics** | Three bucket sensors: consumption-by-season and by-time-of-day (no extra config needed), plus by-temperature (needs the optional outside temp sensor). |
 | **Battery health (SoH)** | Live `battery_soh` (% of declared capacity actually delivered). Plus `expected_battery_soh` modelled from your km / age / chemistry / climate / DCFC habits with constants from Geotab + Tesla + ADAC + NREL + BYD warranty (8 yr / 250 k km, ≥ 70 %). `battery_health_vs_expected` enum tells you if you're ahead/on-track/behind the curve. |
 | **Degradation tracking** | `capacity_history` table appends a snapshot whenever the calibrated capacity drifts ≥ 0.5 kWh — long-term degradation curve visible from day one. |
 
@@ -109,11 +109,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list; headline changes since the t
   - `nmc` (Tesla LR, BMW iX, VW ID, most 2018+)
   - `nca` (older Tesla Model S/X)
 
-### Weather & seasonal analytics (v0.5.54)
-- Optional `weather.*` entity is sampled at trip open and close; averages persisted on the trip row as `ambient_temp_c`, `weather_condition`, `humidity_pct`, `wind_kmh`, `precipitation_mm`.
-- **`sensor.<device>_consumption_by_season`** — winter / spring / summer / autumn (Northern hemisphere). State = current season; attributes carry all four.
-- **`sensor.<device>_consumption_by_time_of_day`** — night (22-06) / morning (06-12) / midday (12-15) / afternoon (15-19) / evening (19-22).
-- **`sensor.<device>_consumption_by_temp_bucket`** — < 5 / 5-15 / 15-25 / 25-35 / ≥ 35 °C (uses the optional `exterior_temp_sensor`).
+### Seasonal & time-of-day analytics (v0.5.54)
+- **`sensor.<device>_consumption_by_season`** — winter / spring / summer / autumn (Northern hemisphere). State = current season; attributes carry all four. No extra config needed.
+- **`sensor.<device>_consumption_by_time_of_day`** — night (22-06) / morning (06-12) / midday (12-15) / afternoon (15-19) / evening (19-22). No extra config needed.
+- **`sensor.<device>_consumption_by_temp_bucket`** — < 5 / 5-15 / 15-25 / 25-35 / ≥ 35 °C. Needs the optional **Outside temp sensor** (`avg_temp_c` is sampled from it directly during each trip — there's no `weather.*` integration involved; a `weather_entity` config field exists only for backwards compatibility with entries created before v0.5.68 and has no effect).
 
 ### Journeys
 - A journey opens iff a trip starts at home and ends away; closes iff a trip ends at home. Time gaps between intermediate trips are irrelevant.
@@ -192,8 +191,7 @@ The wizard asks for the entities the integration consumes. **Required** first, o
 | Plug binary sensor | optional | Lets multi-pulse plugged sessions merge into one charge row. |
 | Polling-paused sensor | optional | A switch or binary_sensor that goes ON when the manufacturer integration sleeps. Synth trips in that window get tagged `reconstructed_polling_paused`. |
 | Location tracker | optional | `device_tracker.…_location`. Drives origin/destination + route map. |
-| **Weather entity** | optional | Any `weather.*` (AEMET, Met.no, OpenWeatherMap…). Enables the season / temperature / time-of-day buckets. See [Get the most out of it](#get-the-most-out-of-it). |
-| Outside temp sensor | optional | Per-trip avg temp + the historical `consumption_by_temp_bucket` sensor. |
+| Outside temp sensor | optional | Per-trip avg temp + the historical `consumption_by_temp_bucket` sensor. See [Get the most out of it](#get-the-most-out-of-it). A `weather_entity` field also exists but is dead since v0.5.68 (backwards-compat only, ignored) — don't configure it. |
 | Driver sensor | optional | Entity whose state names who is driving (e.g. car's bluetooth-connected-device sensor). Powers per-driver stats. |
 | Speed sensor | optional | Refines the idle watchdog + ABRP `speed`. |
 | Range sensor | optional | Estimated remaining range (km) — sent to ABRP as `est_battery_range` only, no other effect. |
@@ -212,6 +210,7 @@ The wizard asks for the entities the integration consumes. **Required** first, o
 | ABRP token / api_key / car_model | optional | Enables ABRP telemetry push. |
 | ABRP push interval (s) | optional | Throttle for outbound pushes (5..600, default 30). |
 | Tracked sensors | optional | Arbitrary extra `sensor.*` entities to compute rolling 7d/30d averages for. See [Tracking arbitrary sensors](#tracking-arbitrary-sensors). |
+| Elevation provider | optional | `none` (default), `open-elevation`, `opentopodata-eudem`, `opentopodata-srtm`, or `custom` (paired with **Elevation provider URL** for a self-hosted instance). Populates `elevation_gain_m` / `elevation_loss_m` / `elevation_variance_m2` per trip from the route's GPS points — off by default because it sends those points to an external service. Leaving it at `none` is why those three fields read `unknown`/blank on any dashboard card that shows them; it isn't a bug, just unconfigured. |
 
 ---
 
@@ -250,20 +249,14 @@ The integration auto-detects the unit (`W` → divides by 1000 internally). Pick
 
 The integration works with just the 6 required fields, but **enabling the optionals unlocks the analytics that make the dashboard useful**. Here's the minimum-effort path to full tracking:
 
-### 1. Add a `weather.*` integration to HA (5 minutes, free)
+### 1. Configure the outside temperature sensor (2 minutes, free)
 
-Any one of these:
-- **AEMET OpenData** (Spain): Settings → Devices → Add Integration → AEMET OpenData → request a free token at `opendata.aemet.es`. Produces `weather.casa`.
-- **Met.no**: built-in HA integration, no API key. Just add the integration.
-- **OpenWeatherMap**: free tier, requires API key.
+`sensor.<device>_consumption_by_season` and `_by_time_of_day` work out of the box, no config needed. Two things need a temperature reading, though:
 
-Then in EV Trip Logger → Configure → set **Weather entity** = `weather.casa` (or whatever yours is called).
+- `sensor.<device>_consumption_by_temp_bucket`
+- The `climate_hot` factor in the expected-SoH model (raises your `confidence` from `medium` to `high`)
 
-This unlocks:
-- `ambient_temp_c`, `humidity_pct`, `wind_kmh`, `precipitation_mm`, `weather_condition` on every new trip
-- `sensor.<device>_consumption_by_season` (state = current season's avg consumption)
-- `sensor.<device>_consumption_by_time_of_day` (night vs morning vs ...)
-- The `climate_hot` factor in the expected-SoH model gets real input (raising your `confidence` from `medium` to `high`)
+In EV Trip Logger → Configure → set **Outside temp sensor** to any `sensor.*` reporting outside/ambient temperature — your car's own exterior-temp sensor if it has one (many EV integrations expose this already), otherwise any local weather-station or `weather.*`-integration temperature sensor works too, since it just needs a plain numeric °C entity. If your odometer entity is named `sensor.<prefix>_odometer`, the logger also auto-detects `sensor.<prefix>_exterior_temperature` / `_outside_temperature` / `_ambient_temperature` on startup — check the log for an "Auto-detected exterior temp sensor" line before configuring this by hand.
 
 ### 2. Set battery chemistry + first-registered date
 
@@ -434,7 +427,7 @@ For dashboards / analytics to make full use of the integration, every box should
 - [ ] **Charge binary sensor** wired so charges are auto-detected
 - [ ] **Power sensor** wired so regen / max_power / power-integration backup work
 - [ ] **Location tracker** wired so origin/destination + route map work
-- [ ] **`weather.*` entity** configured (unlocks season / temp / time-of-day buckets and the climate factor of the SoH model)
+- [ ] **Outside temp sensor** configured (unlocks the by-temperature bucket and the climate factor of the SoH model — season/time-of-day buckets work without it)
 - [ ] **Battery chemistry** set explicitly (`lfp` / `nmc` / `nca`)
 - [ ] **Vehicle first-registered date** set (raises SoH model confidence to `high`)
 - [ ] **Driver sensor** configured if multiple drivers (BT-connected device entity or input_select)
