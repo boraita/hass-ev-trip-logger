@@ -768,6 +768,14 @@ class AggregateSensor(_BaseTripSensor):
             ("week", "distance_km"),
             ("year", "distance_km"),
         }
+        state_class = self._STATE_CLASS_BY_KEY[key]
+        if period == "30d" and state_class == SensorStateClass.TOTAL_INCREASING:
+            # "30d" is a rolling lookback (now - 30 days), not a
+            # calendar-boundary reset like today/week/month/year — the
+            # sum can legitimately drop as old high-value days age out
+            # of the window. TOTAL_INCREASING assumes only-up-or-reset,
+            # so the recorder flags every rolling decrease as invalid.
+            state_class = SensorStateClass.MEASUREMENT
         self.entity_description = SensorEntityDescription(
             key=f"total_{slug}",
             translation_key=f"total_{slug}",
@@ -775,7 +783,7 @@ class AggregateSensor(_BaseTripSensor):
                 unit if key != "cost" else coordinator.currency
             ),
             device_class=device_class,
-            state_class=self._STATE_CLASS_BY_KEY[key],
+            state_class=state_class,
             icon=icon,
             suggested_display_precision=0 if key == "count" else 1,
             entity_category=EntityCategory.DIAGNOSTIC if is_diagnostic else None,

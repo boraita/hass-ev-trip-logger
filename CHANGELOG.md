@@ -2,6 +2,9 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.12 — 2026-08-04
+**Fix — `regen_kwh`/`discharge_kwh` 30d sensors flagged as "not strictly increasing".** The `30d` period is a rolling lookback (`now - 30 days`), not a calendar-boundary reset like `today`/`week`/`month`/`year` — the sum can legitimately drop as a high-value day ages out of the window. Both sensors were declared `state_class: total_increasing`, which only tolerates an increase or a reset-to-~0; every ordinary rolling decrease got logged by the recorder as an invalid state. `AggregateSensor` now forces `measurement` for any `total_increasing` key at the `30d` period (`avg_consumption_kwh_100km` and `regen_ratio` were already `measurement` there and are unaffected). `ChargesAggregateSensor` has no `total_increasing` key paired with `30d` today, so it needed no change — but the same rule would apply if one is added later.
+
 ## v0.8.11 — 2026-08-03
 **Fix (#12) — auto-detect could adopt the logger's own sensors.** When the vehicle integration's device slug collides with the logger's own device slug (e.g. both named "relampago"), the prefix-walk used by the last-trip-energy/distance and exterior-temp auto-detects could land on `sensor.<prefix>_last_trip_energy` — the logger's OWN output sensor — and adopt it as a "vehicle-native" source. That healed trips from data the logger just wrote itself, mislabelling SoC-derived estimates as vehicle-native with a confidence band they hadn't earned, on every reload. Both auto-detects now skip any candidate entity registered under this integration's own platform.
 
