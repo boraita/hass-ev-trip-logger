@@ -1362,8 +1362,15 @@ class TripStorage:
     def _recent_trips(self, limit: int) -> list[TripRecord]:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
+            # v0.8.13 — order by ended_at, NOT id. `recover_missing_trips`/
+            # `log_manual_trip` insert historical rows that get a fresh
+            # (high) autoincrement id despite an old `ended_at` — ordering
+            # by id let a bulk backfill bump genuinely recent live trips
+            # clean out of this window. `ended_at DESC` matches the
+            # convention already used by `async_get_last`.
             rows = conn.execute(
-                "SELECT * FROM trips ORDER BY id DESC LIMIT ?", (limit,)
+                "SELECT * FROM trips ORDER BY ended_at DESC, id DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [_row_to_record(r) for r in rows]
 
@@ -1649,8 +1656,12 @@ class TripStorage:
     def _recent_charges(self, limit: int) -> list[ChargeRecord]:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
+            # v0.8.13 — same fix as _recent_trips: order by ended_at, not
+            # id, so a historical backfill can't bump genuinely recent
+            # charges out of this window.
             rows = conn.execute(
-                "SELECT * FROM charges ORDER BY id DESC LIMIT ?", (limit,)
+                "SELECT * FROM charges ORDER BY ended_at DESC, id DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [_row_to_charge(r) for r in rows]
 

@@ -230,6 +230,52 @@ async def test_recent_trips_respects_limit(storage: TripStorage) -> None:
     assert len(await storage.async_recent_trips(100)) == 6
 
 
+async def test_recent_trips_orders_by_date_not_insertion_id(
+    storage: TripStorage,
+) -> None:
+    """A historical backfill (recover_missing_trips, log_manual_trip) can
+    insert an OLD trip after a NEWER one already exists — it gets a
+    higher autoincrement id despite an earlier ended_at. `recent_trips`
+    must still rank it behind the genuinely more recent trip, not in
+    front of it (the pre-v0.8.13 bug: `ORDER BY id DESC` let a bulk
+    backfill evict real recent trips from the window entirely).
+    """
+    now = dt_util.now()
+    await storage.async_insert(
+        _trip(
+            started_at=now - timedelta(days=1, hours=1),
+            ended_at=now - timedelta(days=1),
+            distance_km=20.0,
+        )
+    )
+    # Inserted SECOND (higher id) but chronologically much OLDER —
+    # simulates a recover_missing_trips backfill for a week-old gap.
+    await storage.async_insert(
+        _trip(
+            started_at=now - timedelta(days=7, hours=1),
+            ended_at=now - timedelta(days=7),
+            distance_km=3.0,
+        )
+    )
+    recent = await storage.async_recent_trips(2)
+    assert [t.distance_km for t in recent] == [20.0, 3.0]
+
+
+async def test_recent_charges_orders_by_date_not_insertion_id(
+    storage: TripStorage,
+) -> None:
+    """Same fix as recent_trips, for charges."""
+    now = dt_util.now()
+    await storage.async_insert_charge(
+        _charge(ended_at=now - timedelta(days=1), kwh=20.0)
+    )
+    await storage.async_insert_charge(
+        _charge(ended_at=now - timedelta(days=7), kwh=3.0)
+    )
+    recent = await storage.async_recent_charges(2)
+    assert [c.kwh for c in recent] == [20.0, 3.0]
+
+
 async def test_export_csv_writes_all_rows(
     storage: TripStorage, tmp_path: Path
 ) -> None:
