@@ -393,6 +393,18 @@ _CAPACITY_MIN_DELTA_PCT = 30.0
 _CAPACITY_MIN_CHARGES = 5
 _CAPACITY_BOUNDS_RATIO: tuple[float, float] = (0.5, 1.5)
 _CAPACITY_CHARGE_WINDOW = 30  # last N eligible charges
+# v0.8.14 — coverage-aware trust for the power-integration kWh estimate.
+# A public/DCFC session often gets only a handful of cloud-relayed power
+# samples clustered near the start (BYD-class cloud cadence is coarse
+# relative to a 20-40 min fast charge), so ∫|P|·dt can silently miss the
+# high-SoC taper or the whole back half of the curve. Being numerically
+# close to the SoC-delta guess in that case is coincidence, not
+# agreement — so before trusting the integral at all we require it to
+# have actually seen most of the session. Only once that coverage bar is
+# cleared do we widen the acceptance band past the old fixed ±30 %.
+_CHARGE_ENERGY_MIN_SAMPLES = 3
+_CHARGE_ENERGY_MIN_COVERAGE_RATIO = 0.5
+_CHARGE_ENERGY_TOLERANCE = 0.4
 # v0.5.54 — degradation tracking. Persist a new row in `capacity_history`
 # whenever the calibrated value moves by more than this threshold. Smaller
 # drifts just update n_charges on the latest row (more samples, same
@@ -787,6 +799,14 @@ class ChargeInProgress:
     energy_added_kwh: float = 0.0
     _last_power_kw_signed: float | None = None
     _last_power_ts: datetime | None = None
+    # v0.8.14 — coverage tracking for `energy_added_kwh`. A count of the
+    # trapezoid segments actually integrated, plus the timestamp of the
+    # first one, so at close we can tell "3 samples spanning the whole
+    # session" (trust it) apart from "1 sample near the start" (a public
+    # DCFC session where the cloud only reported the initial power spike
+    # would otherwise look numerically fine and still be very wrong).
+    _power_sample_count: int = 0
+    _first_charge_power_ts: datetime | None = None
     # v0.5.89 — same integral but from the EVSE / wallbox side
     # (`CONF_EVSE_POWER_SENSOR`). Charger output is typically 5-15 %
     # higher than what the battery receives — AC→DC conversion losses
@@ -3111,6 +3131,9 @@ class EvTripLoggerCoordinator:
                         self.current_charge.energy_added_kwh += (
                             (-prev_kw + -value) / 2.0 * dt_h
                         )
+                        if self.current_charge._first_charge_power_ts is None:
+                            self.current_charge._first_charge_power_ts = prev_ts
+                        self.current_charge._power_sample_count += 1
             self.current_charge._last_power_kw_signed = value
             self.current_charge._last_power_ts = now
             self._notify_listeners()
@@ -3623,28 +3646,70 @@ class EvTripLoggerCoordinator:
                 return
 
         kwh_soc = (soc_end - active.soc_start) / 100.0 * self.battery_capacity
-        # v0.5.89 — prefer the power-integration measurement when it
-        # exists and is within reasonable bounds of the SoC delta.
-        # The integral covers the FULL charge curve (incl. taper at
-        # high SoC where 1 % covers more time than 1 % at low SoC),
-        # so it's a more accurate estimate than `(Δ% × nominal_cap)`
-        # which assumes uniform energy-per-percent.
+        # v0.5.89 / v0.8.14 — prefer the power-integration measurement
+        # over the SoC-delta guess, but only once it's earned trust by
+        # actually covering the session. The integral covers the FULL
+        # charge curve (incl. taper at high SoC where 1 % covers more
+        # time than 1 % at low SoC), so a well-covered integral beats
+        # `(Δ% × nominal_cap)`, which assumes uniform energy-per-percent
+        # and is dominated by ±1 % SoC quantization on short/top-up
+        # charges — exactly the away-from-home DCFC case where SoC-delta
+        # is least reliable. But a sparse integral (few cloud-reported
+        # power samples, or samples clustered near the start) can miss
+        # the whole back half of a fast charge and land close to
+        # kwh_soc by coincidence, not agreement — so coverage is
+        # checked BEFORE the tolerance band, not folded into it.
         kwh = kwh_soc
-        if (
-            active.energy_added_kwh > 0
-            and 0.7 * kwh_soc <= active.energy_added_kwh <= 1.3 * kwh_soc
-        ):
-            kwh = round(active.energy_added_kwh, 3)
-            _LOGGER.info(
-                "Charge kWh: using power-integration %.2f (SoC said %.2f, "
-                "delta %.0f %%)",
-                kwh, kwh_soc, (kwh - kwh_soc) / kwh_soc * 100.0,
-            )
+        energy_source = "soc_delta"
+        session_duration_h = (
+            (now - active.started_at).total_seconds() / 3600.0
+            if active.started_at else 0.0
+        )
+        # v0.8.14 — span between the FIRST and LAST power sample, not
+        # first-sample-to-close-time. A charge that gets one early
+        # sample and then goes quiet (cloud dropout mid-DCFC-session)
+        # must not look "covered" just because it started promptly.
+        covered_h = (
+            (active._last_power_ts - active._first_charge_power_ts).total_seconds()
+            / 3600.0
+            if active._first_charge_power_ts and active._last_power_ts
+            else 0.0
+        )
+        good_coverage = (
+            active._power_sample_count >= _CHARGE_ENERGY_MIN_SAMPLES
+            and session_duration_h > 0
+            and covered_h / session_duration_h >= _CHARGE_ENERGY_MIN_COVERAGE_RATIO
+        )
+        if active.energy_added_kwh > 0 and good_coverage:
+            lo = (1.0 - _CHARGE_ENERGY_TOLERANCE) * kwh_soc
+            hi = (1.0 + _CHARGE_ENERGY_TOLERANCE) * kwh_soc
+            if lo <= active.energy_added_kwh <= hi:
+                kwh = round(active.energy_added_kwh, 3)
+                energy_source = "power_integration"
+                _LOGGER.info(
+                    "Charge kWh: using power-integration %.2f (SoC said "
+                    "%.2f, delta %.0f %%, %d samples over %.0f %% of the "
+                    "session)",
+                    kwh, kwh_soc, (kwh - kwh_soc) / kwh_soc * 100.0,
+                    active._power_sample_count,
+                    covered_h / session_duration_h * 100.0,
+                )
+            else:
+                _LOGGER.info(
+                    "Charge kWh: power-integration %.2f outside ±%.0f %% "
+                    "of SoC (%.2f kWh) despite good coverage — falling "
+                    "back to SoC math.",
+                    active.energy_added_kwh,
+                    _CHARGE_ENERGY_TOLERANCE * 100.0, kwh_soc,
+                )
         elif active.energy_added_kwh > 0:
             _LOGGER.info(
-                "Charge kWh: power-integration %.2f outside ±30 %% of SoC "
-                "(%.2f kWh) — falling back to SoC math.",
-                active.energy_added_kwh, kwh_soc,
+                "Charge kWh: power-integration %.2f has weak coverage "
+                "(%d samples over %.0f %% of the session) — falling back "
+                "to SoC math (%.2f kWh) regardless of proximity.",
+                active.energy_added_kwh, active._power_sample_count,
+                covered_h / session_duration_h * 100.0 if session_duration_h > 0 else 0.0,
+                kwh_soc,
             )
         # v0.5.89 — log the EVSE/wallbox side delivery + implied
         # AC→DC efficiency. Stored in attributes later; for now the
@@ -3702,6 +3767,7 @@ class EvTripLoggerCoordinator:
             notes=f"auto-detected from {self._charge_sensor}",
             started_at=active.started_at,
             soc_start=active.soc_start,
+            energy_source=energy_source,
             evse_energy_kwh=(
                 active.evse_energy_kwh if active.evse_energy_kwh > 0 else None
             ),
@@ -5173,6 +5239,7 @@ class EvTripLoggerCoordinator:
         evse_energy_kwh: float | None = None,
         peak_charge_power_kw: float | None = None,
         temperature_c: float | None = None,
+        energy_source: str | None = None,
     ) -> ChargeRecord:
         """Persist a charge session.
 
@@ -5226,6 +5293,7 @@ class EvTripLoggerCoordinator:
             location=location,
             notes=notes,
             is_dcfc=is_dcfc,
+            energy_source=energy_source,
             evse_energy_kwh=(
                 round(evse_energy_kwh, 3)
                 if evse_energy_kwh is not None and evse_energy_kwh > 0

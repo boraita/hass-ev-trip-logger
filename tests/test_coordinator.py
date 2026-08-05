@@ -578,6 +578,101 @@ async def test_auto_detect_charge_records_session(hass: HomeAssistant) -> None:
     assert "auto-detected" in (coordinator.last_charge.notes or "")
 
 
+async def test_charge_energy_prefers_power_integration_with_good_coverage(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.14 — a power-integration reading that disagrees with the old
+    fixed ±30 % band should still win once it's earned trust via good
+    sample coverage across the session.
+
+    SoC 20%→25% at 75 kWh nominal capacity implies 3.75 kWh (kwh_soc).
+    The car's power sensor reports a steady 10 kW draw for 30 min
+    (3 contributing samples spanning the whole charging window) →
+    5.0 kWh, 33 % above kwh_soc — outside the old fixed ±30 % band but
+    inside the new coverage-earned ±40 % band.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(POW, "0")
+        hass.states.async_set(CHG, STATE_OFF)
+        entry = await _setup(
+            hass, bat=20.0, **{CONF_CHARGE_SENSOR: CHG, CONF_POWER: POW},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+        assert coordinator.current_charge.soc_start == 20.0
+
+        hass.states.async_set(POW, "-10", force_update=True)
+        await hass.async_block_till_done()
+
+        for _ in range(3):
+            frozen.tick(timedelta(minutes=10))
+            hass.states.async_set(POW, "-10", force_update=True)
+            await hass.async_block_till_done()
+
+        hass.states.async_set(BAT, "25")
+        await hass.async_block_till_done()
+
+        frozen.tick(timedelta(minutes=5))
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+    assert coordinator.last_charge is not None
+    assert coordinator.last_charge.kwh == pytest.approx(5.0, abs=0.01)
+    assert coordinator.last_charge.energy_source == "power_integration"
+
+
+async def test_charge_energy_distrusts_sparse_power_samples(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.14 — a plausible-looking power-integration number must NOT be
+    trusted when it's built from samples that only cover a fraction of
+    the session (cloud dropout mid-DCFC-charge is common away from
+    home). Even though the sparse reading lands close enough to
+    kwh_soc to have passed the OLD ±30 % check, coverage now gates it
+    out before that comparison ever runs.
+
+    SoC 20%→25% at 75 kWh → kwh_soc = 3.75 kWh. 3 power samples all
+    land in the first 5 minutes of a 40-minute session (~3.33 kWh
+    integrated) then the sensor goes quiet for the remaining 35 min.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(POW, "0")
+        hass.states.async_set(CHG, STATE_OFF)
+        entry = await _setup(
+            hass, bat=20.0, **{CONF_CHARGE_SENSOR: CHG, CONF_POWER: POW},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+
+        hass.states.async_set(POW, "-40", force_update=True)
+        await hass.async_block_till_done()
+
+        for minutes in (2, 2, 1):
+            frozen.tick(timedelta(minutes=minutes))
+            hass.states.async_set(POW, "-40", force_update=True)
+            await hass.async_block_till_done()
+
+        # Cloud goes quiet — no more power samples for the rest of the
+        # session, even though it stays open another 35 minutes.
+        frozen.tick(timedelta(minutes=35))
+        hass.states.async_set(BAT, "25")
+        await hass.async_block_till_done()
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+    assert coordinator.last_charge is not None
+    assert coordinator.last_charge.kwh == pytest.approx(3.75, abs=0.01)
+    assert coordinator.last_charge.energy_source == "soc_delta"
+
+
 async def test_auto_detect_skips_when_recent_manual_charge_exists(
     hass: HomeAssistant,
 ) -> None:

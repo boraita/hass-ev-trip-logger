@@ -213,7 +213,19 @@ CREATE TABLE IF NOT EXISTS charges (
     -- ΔSoC↔ΔkWh samples (BMS reserves a bigger buffer when cold,
     -- fast-charging derates when hot) so they're excluded from the
     -- capacity median. NULL when no temperature sensor is wired.
-    temperature_c REAL
+    temperature_c REAL,
+    -- v0.8.14: how `kwh` was derived, mirroring trips.energy_source.
+    --   'power_integration' → ∫|P| dt during the session, only used
+    --                         once it covered most of the session
+    --                         (see coordinator._CHARGE_ENERGY_MIN_*)
+    --   'soc_delta'         → (soc_end - soc_start) × capacity
+    --   NULL                → manually logged (log_charge service /
+    --                         historical rows from before this field)
+    -- Lets the capacity self-calibration prefer grounded, directly-
+    -- measured samples over the SoC-delta guess it's meant to correct
+    -- (previously circular: most calibration inputs WERE the SoC-delta
+    -- estimate). See _effective_capacity_kwh.
+    energy_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_charges_ended_at ON charges(ended_at);
 
@@ -418,6 +430,9 @@ class ChargeRecord:
     # v0.6.5: ambient temperature at close, drives the SoH sample-gate.
     # None when no exterior-temp sensor is wired.
     temperature_c: float | None = None
+    # v0.8.14: 'power_integration' | 'soc_delta' | None (manual entry /
+    # pre-v0.8.14 row). See _SCHEMA header comment for the full story.
+    energy_source: str | None = None
     charge_id: int | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -628,6 +643,9 @@ class TripStorage:
         # v0.6.5: ambient temperature at charge close (SoH sample gate).
         if "temperature_c" not in charge_cols:
             conn.execute("ALTER TABLE charges ADD COLUMN temperature_c REAL")
+        # v0.8.14: which method produced `kwh` — see header comment above.
+        if "energy_source" not in charge_cols:
+            conn.execute("ALTER TABLE charges ADD COLUMN energy_source TEXT")
         # v0.5.0: trip_positions table for route-map drilldown.
         conn.execute(
             """
@@ -1470,14 +1488,55 @@ class TripStorage:
         temp_min_c: float | None,
         temp_max_c: float | None,
     ) -> tuple[float | None, int, dict[str, int]]:
+        # v0.8.14 — try grounded-only samples first (charges whose kwh
+        # came from the power-integration measurement, not the SoC-delta
+        # guess this calibration exists to correct — the original query
+        # was circular, since most of its input WAS that same guess).
+        # Only fall back to every eligible charge (pre-v0.8.14 behaviour)
+        # when there aren't yet enough grounded ones, so existing users
+        # don't lose calibration on upgrade while it accrues.
+        grounded = self._effective_capacity_kwh_query(
+            min_delta_pct, window, min_kwh, temp_min_c, temp_max_c,
+            energy_source="power_integration",
+        )
+        if grounded[1] >= min_charges:
+            return grounded
+        median, n, rejects = self._effective_capacity_kwh_query(
+            min_delta_pct, window, min_kwh, temp_min_c, temp_max_c,
+            energy_source=None,
+        )
+        if n < min_charges:
+            return (None, n, rejects)
+        return (median, n, rejects)
+
+    def _effective_capacity_kwh_query(
+        self,
+        min_delta_pct: float,
+        window: int,
+        min_kwh: float,
+        temp_min_c: float | None,
+        temp_max_c: float | None,
+        *,
+        energy_source: str | None,
+    ) -> tuple[float | None, int, dict[str, int]]:
+        source_clause = " AND energy_source = ? " if energy_source else ""
+        params: tuple[Any, ...] = (
+            (min_delta_pct, energy_source, window)
+            if energy_source else (min_delta_pct, window)
+        )
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT kwh, soc_start, soc_end, temperature_c FROM charges "
                 "WHERE kwh IS NOT NULL AND kwh > 0 "
                 "  AND soc_start IS NOT NULL AND soc_end IS NOT NULL "
                 "  AND (soc_end - soc_start) >= ? "
-                "ORDER BY id DESC LIMIT ?",
-                (min_delta_pct, window),
+                + source_clause +
+                # v0.8.13 — chronological order, not insertion id (a
+                # backfilled/reconstructed charge gets a fresh high id
+                # despite an old ended_at and would otherwise crowd out
+                # genuinely recent charges from this capped window).
+                "ORDER BY ended_at DESC, id DESC LIMIT ?",
+                params,
             ).fetchall()
         samples: list[float] = []
         rejects = {
@@ -1514,7 +1573,7 @@ class TripStorage:
                     pass
             samples.append(kwh_f / delta * 100.0)
         n = len(samples)
-        if n < min_charges:
+        if n < 1:
             return (None, n, rejects)
         samples.sort()
         mid = n // 2
@@ -1712,8 +1771,8 @@ class TripStorage:
                     started_at, ended_at, kwh, price_per_kwh, total_cost,
                     currency, soc_start, soc_end, location, notes, is_dcfc,
                     evse_energy_kwh, charging_efficiency_pct,
-                    peak_charge_power_kw, temperature_c
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    peak_charge_power_kw, temperature_c, energy_source
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.started_at.isoformat() if record.started_at else None,
@@ -1731,6 +1790,7 @@ class TripStorage:
                     record.charging_efficiency_pct,
                     record.peak_charge_power_kw,
                     record.temperature_c,
+                    record.energy_source,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -1825,6 +1885,14 @@ class TripStorage:
                 clean[k] = v
         if not clean:
             return None
+        # v0.8.14 — a hand-corrected kwh is no longer the value the
+        # auto-detect measured (power integration or SoC math); tag it
+        # 'manual' so a stale 'power_integration' label doesn't keep
+        # claiming grounded-measurement status for the capacity
+        # calibration (see _effective_capacity_kwh) after the user has
+        # overridden it.
+        if "kwh" in clean:
+            clean["energy_source"] = "manual"
         cols = ", ".join(f"{k} = ?" for k in clean)
         params = list(clean.values()) + [charge_id]
         with self._connect() as conn:
@@ -1938,8 +2006,9 @@ class TripStorage:
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
+            # v0.8.14 — chronological order, not insertion id (see v0.8.13).
             row = conn.execute(
-                "SELECT * FROM charges ORDER BY id DESC LIMIT 1"
+                "SELECT * FROM charges ORDER BY ended_at DESC, id DESC LIMIT 1"
             ).fetchone()
             if not row:
                 return None
@@ -2366,8 +2435,11 @@ class TripStorage:
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
+            # v0.8.13-style fix — chronological order, not insertion id
+            # (a backfilled row could otherwise outrank the session this
+            # pulse actually belongs to).
             row = conn.execute(
-                "SELECT * FROM charges ORDER BY id DESC LIMIT 1"
+                "SELECT * FROM charges ORDER BY ended_at DESC, id DESC LIMIT 1"
             ).fetchone()
             if not row:
                 return None
@@ -2429,7 +2501,10 @@ class TripStorage:
 
     def _delete_last_charge(self) -> bool:
         with self._connect() as conn:
-            cur = conn.execute("SELECT id FROM charges ORDER BY id DESC LIMIT 1")
+            # v0.8.14 — chronological order, not insertion id (see v0.8.13).
+            cur = conn.execute(
+                "SELECT id FROM charges ORDER BY ended_at DESC, id DESC LIMIT 1"
+            )
             row = cur.fetchone()
             if not row:
                 return False
@@ -3542,6 +3617,10 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
         temperature_c=(
             row["temperature_c"]
             if "temperature_c" in row.keys() else None
+        ),
+        energy_source=(
+            row["energy_source"]
+            if "energy_source" in row.keys() else None
         ),
     )
 

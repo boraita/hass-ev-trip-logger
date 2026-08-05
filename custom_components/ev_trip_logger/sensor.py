@@ -1104,6 +1104,10 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         "charging_efficiency_pct": _r(
             getattr(charge, "charging_efficiency_pct", None), 1
         ),
+        # v0.8.14 — 'power_integration' | 'soc_delta' | 'manual' | None.
+        # Lets a dashboard flag "this figure is a SoC estimate" instead
+        # of presenting every kwh value with the same implied precision.
+        "energy_source": getattr(charge, "energy_source", None),
     }
 
 

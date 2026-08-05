@@ -699,7 +699,9 @@ async def test_patch_charge_evse_recomputes_efficiency(
     auto-compute charging_efficiency_pct = kwh / evse × 100 so the
     dashboard can render both numbers without a separate write.
     """
-    cid = await storage.async_insert_charge(_charge(kwh=10.0))
+    cid = await storage.async_insert_charge(
+        _charge(kwh=10.0, energy_source="power_integration")
+    )
     patched = await storage.async_patch_charge(
         cid, {"evse_energy_kwh": 11.5},
     )
@@ -713,6 +715,11 @@ async def test_patch_charge_evse_recomputes_efficiency(
     assert patched2 is not None
     assert patched2.kwh == pytest.approx(9.2)
     assert patched2.charging_efficiency_pct == pytest.approx(80.0, abs=0.1)
+    # v0.8.14 — a hand-corrected kwh is no longer a grounded measurement;
+    # the stale 'power_integration' tag must not survive the correction
+    # (it would otherwise keep counting toward capacity calibration as
+    # if it were still directly measured).
+    assert patched2.energy_source == "manual"
 
 
 async def test_extend_last_charge_uses_absolute_soc_end(
@@ -864,6 +871,73 @@ async def test_effective_capacity_filters_small_top_ups(
     )
     assert n == 5
     assert cap == pytest.approx(66.67, abs=0.05)
+
+
+async def test_effective_capacity_prefers_power_integration_samples(
+    storage: TripStorage,
+) -> None:
+    """v0.8.14 — once enough power-integration-sourced charges exist,
+    calibration should use ONLY those (grounded measurements), not the
+    SoC-delta-sourced rows it exists to correct — the pre-v0.8.14 query
+    was circular: most of its own input WAS the SoC-delta guess.
+
+    5 power_integration charges imply 70 kWh; 5 soc_delta charges (that
+    would otherwise dominate the same window) imply 90 kWh. The result
+    must be 70, and only the 5 grounded charges should be counted.
+    """
+    for _ in range(5):
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=1),
+            ended_at=dt_util.now(),
+            kwh=35.0, price_per_kwh=0.2, total_cost=7.0,
+            soc_start=20.0, soc_end=70.0,  # 50 % Δ → 70 kWh
+            energy_source="power_integration",
+        ))
+    for _ in range(5):
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=1),
+            ended_at=dt_util.now(),
+            kwh=45.0, price_per_kwh=0.2, total_cost=9.0,
+            soc_start=20.0, soc_end=70.0,  # 50 % Δ → 90 kWh
+            energy_source="soc_delta",
+        ))
+    cap, n, _rejects = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5,
+    )
+    assert n == 5
+    assert cap == pytest.approx(70.0)
+
+
+async def test_effective_capacity_falls_back_when_not_enough_grounded_samples(
+    storage: TripStorage,
+) -> None:
+    """v0.8.14 — with fewer than `min_charges` power_integration-sourced
+    charges, fall back to the pre-v0.8.14 behaviour (every eligible
+    charge regardless of source) rather than reporting no calibration
+    at all — preserves existing users' calibration immediately after
+    upgrade, while it accrues grounded samples over time.
+    """
+    for _ in range(2):
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=1),
+            ended_at=dt_util.now(),
+            kwh=35.0, price_per_kwh=0.2, total_cost=7.0,
+            soc_start=20.0, soc_end=70.0,  # 50 % Δ → 70 kWh
+            energy_source="power_integration",
+        ))
+    for _ in range(3):
+        await storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=1),
+            ended_at=dt_util.now(),
+            kwh=35.0, price_per_kwh=0.2, total_cost=7.0,
+            soc_start=20.0, soc_end=70.0,  # 50 % Δ → 70 kWh
+            energy_source=None,
+        ))
+    cap, n, _rejects = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5,
+    )
+    assert n == 5
+    assert cap == pytest.approx(70.0)
 
 
 async def test_recompute_energy_from_capacity_rewrites_soc_trips(
