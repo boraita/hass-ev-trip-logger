@@ -2,6 +2,14 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.16 — 2026-08-17
+**Feature — invoice kWh for away charges.** `set_last_charge_price` now accepts an optional `evse_energy_kwh`, so a public charge (no EVSE sensor) can get the operator's invoice kWh entered after the fact and have `charging_efficiency_pct` computed from it (`kwh / evse_energy_kwh × 100`) — the same field/formula home charges already fill live from the EVSE integral. Home charges don't need this: the EVSE sensor already gives the exact figure.
+
+## v0.8.15 — 2026-08-08
+**Fix — disconnect-orphan trips could report physically-impossible consumption (e.g. 5 km / 19 h read as ~50 kWh/100km).** Reported case: several short drives below `min_trip_distance_km` got correctly discarded through the day (each one individually not worth logging), but discarding a short trip never refreshed the internal odometer/SoC checkpoint used to detect real connectivity gaps — it stayed pinned to the previous night's last *persisted* trip. A routine HA restart then re-seeded that checkpoint from the same stale value, and the very next update folded the entire ~19 h span — a handful of real short drives plus a full day of parked/standby drain — into one `orphan_disconnect` row, dividing the day's whole SoC drop by only the day's few actual kilometres.
+
+Two changes: (1) `_async_close_trip` now advances the checkpoint to the discarded trip's own observed end-state instead of leaving it frozen, so a run of correctly-discarded short trips no longer erodes gap-detection accuracy while the coordinator keeps running; (2) `_async_insert_disconnect_orphan` now checks the reconstructed window's own implied average speed, and suppresses `consumption_kwh_100km` (keeping the raw `energy_kwh`, which is still a real quantity) whenever that speed is under 3 km/h — a reliable sign the window was overwhelmingly parked, not driven, so a per-km consumption figure can't mean anything. This narrows but doesn't fully close the gap: a restart occurring while the checkpoint is stale can still misattribute a mix of real driving and standby drain into one row — the suppression in (2) is what stops that row from ever showing a nonsensical number.
+
 ## v0.8.14 — 2026-08-05
 **Improvement — coverage-aware charge energy, and calibration no longer partly circular.** Reported case: a public charge cost €5.23 but was recorded as 17.43 kWh (≈€0.30/kWh) — a number that didn't reconcile, and turned out to trace back to the SoC-delta estimate (`Δ% × nominal_capacity`) being trusted more than it should on an away-from-home top-up, where ±1 % SoC quantization is a big share of the total.
 

@@ -1830,6 +1830,7 @@ class TripStorage:
         total_cost: float | None = None,
         location: str | None = None,
         notes: str | None = None,
+        evse_energy_kwh: float | None = None,
     ) -> ChargeRecord | None:
         """Update a specific charge by id. Same semantics as
         update_last_charge but targets the given row instead of the
@@ -1839,7 +1840,7 @@ class TripStorage:
         """
         return await self._hass.async_add_executor_job(
             self._update_charge_by_id, charge_id, price_per_kwh, total_cost,
-            location, notes,
+            location, notes, evse_energy_kwh,
         )
 
     # Columns the user can correct via the extended set_charge service.
@@ -1948,6 +1949,7 @@ class TripStorage:
         total_cost: float | None,
         location: str | None,
         notes: str | None,
+        evse_energy_kwh: float | None = None,
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -1971,13 +1973,24 @@ class TripStorage:
             price_locked = (
                 1 if (price_per_kwh is not None or total_cost is not None) else None
             )
+            new_evse_kwh = (
+                float(evse_energy_kwh)
+                if evse_energy_kwh is not None
+                else row["evse_energy_kwh"]
+            )
+            new_eff = (
+                round(kwh / new_evse_kwh * 100.0, 1)
+                if new_evse_kwh is not None and kwh and float(new_evse_kwh) > 0
+                else row["charging_efficiency_pct"]
+            )
             conn.execute(
                 "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
-                "location = ?, notes = ?, "
+                "location = ?, notes = ?, evse_energy_kwh = ?, "
+                "charging_efficiency_pct = ?, "
                 "price_locked = COALESCE(?, price_locked) WHERE id = ?",
                 (
                     new_price, new_total, new_location, new_notes,
-                    price_locked, charge_id,
+                    new_evse_kwh, new_eff, price_locked, charge_id,
                 ),
             )
             updated = conn.execute(
@@ -1992,9 +2005,11 @@ class TripStorage:
         total_cost: float | None = None,
         location: str | None = None,
         notes: str | None = None,
+        evse_energy_kwh: float | None = None,
     ) -> ChargeRecord | None:
         return await self._hass.async_add_executor_job(
-            self._update_last_charge, price_per_kwh, total_cost, location, notes
+            self._update_last_charge, price_per_kwh, total_cost, location, notes,
+            evse_energy_kwh,
         )
 
     def _update_last_charge(
@@ -2003,6 +2018,7 @@ class TripStorage:
         total_cost: float | None,
         location: str | None,
         notes: str | None,
+        evse_energy_kwh: float | None = None,
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -2030,13 +2046,27 @@ class TripStorage:
             price_locked = (
                 1 if (price_per_kwh is not None or total_cost is not None) else None
             )
+            # evse_energy_kwh from an invoice — same field/formula the home
+            # EVSE-sensor integral fills; lets an away charge get an
+            # efficiency chip too.
+            new_evse_kwh = (
+                float(evse_energy_kwh)
+                if evse_energy_kwh is not None
+                else row["evse_energy_kwh"]
+            )
+            new_eff = (
+                round(kwh / new_evse_kwh * 100.0, 1)
+                if new_evse_kwh is not None and kwh and float(new_evse_kwh) > 0
+                else row["charging_efficiency_pct"]
+            )
             conn.execute(
                 "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
-                "location = ?, notes = ?, price_locked = COALESCE(?, price_locked) "
-                "WHERE id = ?",
+                "location = ?, notes = ?, evse_energy_kwh = ?, "
+                "charging_efficiency_pct = ?, "
+                "price_locked = COALESCE(?, price_locked) WHERE id = ?",
                 (
                     new_price, new_total, new_location, new_notes,
-                    price_locked, row["id"],
+                    new_evse_kwh, new_eff, price_locked, row["id"],
                 ),
             )
             updated = conn.execute(

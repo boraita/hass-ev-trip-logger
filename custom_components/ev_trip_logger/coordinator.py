@@ -344,6 +344,18 @@ _TELEMETRY_SILENCE_TIMEOUT_S = 480.0  # 8 min
 # keeping us from inserting stale trips after an install pause or HA
 # downtime that spans multiple days.
 _ORPHAN_DISCONNECT_MAX_AGE = timedelta(hours=24)
+# v0.8.15 — a disconnect-orphan's SoC delta covers the ENTIRE silent
+# window, not just the time actually spent driving: a car parked for
+# hours between two short moves still loses SoC to standby/thermal
+# drain the whole time, and this path has no way to split that from
+# genuine driving consumption. Dividing all of it by the tiny distance
+# driven produces physically-impossible consumption (e.g. 5 km / 19 h
+# reading as ~50 kWh/100km). If the window's own distance/duration
+# implies an average speed slower than a brisk walk, the window was
+# overwhelmingly idle — suppress the derived kWh/100km (keep the raw
+# energy_kwh; it's still a real quantity, just not attributable to
+# this trip's distance) rather than publish a number nobody can trust.
+_ORPHAN_DISCONNECT_MIN_AVG_SPEED_KMH = 3.0
 # v0.5.49 — live-path retry on the vehicle_on=on edge. Cloud-polled
 # integrations (BYD, Tesla Fleet) often raise vehicle_on a poll-cycle
 # before the odometer entity catches up to the fresh value. Previously
@@ -4246,12 +4258,28 @@ class EvTripLoggerCoordinator:
             soc_used = float(prev_soc) - float(soc)
             energy_kwh = soc_used / 100.0 * self.battery_capacity
         distance = float(odo) - float(prev_odo)
+        duration_min = max(0.1, (now - prev_t).total_seconds() / 60.0)
+        avg_speed_kmh = distance / (duration_min / 60.0) if duration_min > 0 else None
+        low_confidence: bool | None = None
         consumption = (
             (energy_kwh / distance * 100.0)
             if energy_kwh is not None and distance > 0
             else None
         )
-        duration_min = max(0.1, (now - prev_t).total_seconds() / 60.0)
+        if (
+            consumption is not None
+            and avg_speed_kmh is not None
+            and avg_speed_kmh < _ORPHAN_DISCONNECT_MIN_AVG_SPEED_KMH
+        ):
+            _LOGGER.info(
+                "Disconnect-orphan: suppressing consumption_kwh_100km "
+                "(%.1f) — implied avg speed %.2f km/h over %.1f min means "
+                "the window was mostly parked, not driven; energy_kwh "
+                "(%.2f) is kept but not attributable to the %.2f km moved.",
+                consumption, avg_speed_kmh, duration_min, energy_kwh, distance,
+            )
+            consumption = None
+            low_confidence = True
 
         # v0.8.5 — resolve the real end location instead of hardcoding
         # None. The disconnect could easily have ended with the vehicle
@@ -4310,6 +4338,7 @@ class EvTripLoggerCoordinator:
             origin=origin_location,
             destination=location_end,
             journey_id=journey_id,
+            low_confidence=low_confidence,
         )
         try:
             trip_id = await self.storage.async_insert(record)
@@ -4775,6 +4804,26 @@ class EvTripLoggerCoordinator:
                 active.soc_start, soc_end, duration_min,
             )
             self.current = None
+            # v0.8.15 — a discarded trip still really happened: it has a
+            # real odometer/SoC end-state observed just now. Without
+            # advancing `_last_idle_odo` here, this checkpoint stays
+            # pinned to whatever it was BEFORE this trip opened (`_open_trip`
+            # never touches it), so a string of sub-threshold vehicle_on/off
+            # cycles — each individually and correctly discarded — leaves
+            # the checkpoint further and further behind reality. If HA
+            # (or the coordinator) then restarts, `async_start` reseeds
+            # `_last_idle_odo` from the DB's `last_trip`, which is equally
+            # stale since none of these discards were ever persisted. The
+            # next state update then finds the checkpoint hours stale and
+            # `_async_check_odo_jump` folds the ENTIRE gap — real driving
+            # AND parked/standby drain mixed together — into one
+            # 'orphan_disconnect' row, producing physically-impossible
+            # consumption (e.g. 5 km / 19 h attributed ~50 kWh/100km).
+            # Advancing the checkpoint to this trip's own observed end
+            # matches what the successful-close path already does below
+            # (see the `_last_idle_odo` update after a persisted trip).
+            if odometer_end is not None:
+                self._last_idle_odo = (now, odometer_end, soc_end)
             self._notify_listeners()
             return
 
@@ -5350,6 +5399,7 @@ class EvTripLoggerCoordinator:
         location: str | None = None,
         notes: str | None = None,
         charge_id: int | None = None,
+        evse_energy_kwh: float | None = None,
     ) -> ChargeRecord | None:
         """Override price / location of a charge already in storage.
 
@@ -5361,6 +5411,10 @@ class EvTripLoggerCoordinator:
         you actually paid a public-charger rate. Pass price_per_kwh or
         total_cost (one of them) and the kWh + timestamp stay; price + cost
         are recomputed.
+
+        `evse_energy_kwh` lets an away charge (no EVSE sensor) get its
+        AC→DC efficiency from the operator's invoice, same field/formula
+        home auto-detect fills from the live EVSE integral.
         """
         if charge_id is not None:
             updated = await self.storage.async_update_charge_by_id(
@@ -5369,6 +5423,7 @@ class EvTripLoggerCoordinator:
                 total_cost=total_cost,
                 location=location,
                 notes=notes,
+                evse_energy_kwh=evse_energy_kwh,
             )
         else:
             updated = await self.storage.async_update_last_charge(
@@ -5376,6 +5431,7 @@ class EvTripLoggerCoordinator:
                 total_cost=total_cost,
                 location=location,
                 notes=notes,
+                evse_energy_kwh=evse_energy_kwh,
             )
         if updated is None:
             _LOGGER.warning("set_last_charge_price: no charge in storage to update")
