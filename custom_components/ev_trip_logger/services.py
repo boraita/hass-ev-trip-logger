@@ -413,6 +413,7 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_RECOVER_MISSING_TRIPS,
         SERVICE_BACKFILL_CHARGE_EVSE,
         SERVICE_FIX_SPEED_STATS,
+        SERVICE_HEAL_HISTORY,
     ):
         if hass.services.has_service(DOMAIN, name):
             hass.services.async_remove(DOMAIN, name)

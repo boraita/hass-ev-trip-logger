@@ -1182,20 +1182,25 @@ class EvTripLoggerCoordinator:
         SoC→kWh conversion routes through this property, so a single
         fix here propagates to energy_kwh, consumption, cost and score.
         """
-        capacity = (
+        return (
             self._battery_capacity_calibrated
             if self._battery_capacity_calibrated is not None
             else self._battery_capacity_declared
         )
-        # v0.8.17 — the WAC replay lives in storage and needs the same
-        # number to re-anchor its pool to the physical battery. Publish
-        # it here rather than threading a parameter through the twelve
-        # call sites of `async_recompute_trip_costs_from_charges`; this
-        # property is read on every SoC→kWh conversion, so the hint can
-        # never go stale. Storage falls back to its old additive pool
-        # when the hint is unset.
-        self.storage.capacity_hint_kwh = capacity
-        return capacity
+
+    def _publish_capacity_hint(self) -> None:
+        """Give storage the capacity its WAC replay re-anchors against.
+
+        v0.8.17 — this started life as a side effect of *reading* the
+        `battery_capacity` property, which was wrong: nothing reads it
+        before the startup cost heal, so that replay ran with no
+        capacity, fell back to the old purely-additive pool, and wrote
+        costs that the next replay (after the first trip closed)
+        immediately overwrote with different numbers. Trip costs visibly
+        changed after every restart. Published explicitly at setup and
+        whenever the calibration moves instead.
+        """
+        self.storage.capacity_hint_kwh = self.battery_capacity
 
     @property
     def battery_capacity_baseline(self) -> float:
@@ -1972,6 +1977,7 @@ class EvTripLoggerCoordinator:
                 and abs(new_value - prev) > 0.2)
         )
         self._battery_capacity_calibrated = new_value
+        self._publish_capacity_hint()
         if changed:
             shown = new_value if new_value is not None else self._battery_capacity_declared
             _LOGGER.info(
@@ -2155,6 +2161,9 @@ class EvTripLoggerCoordinator:
         # price. Catches users whose CONF_ENERGY_PRICE was 0 at trip-close
         # time, or whose set_last_charge_price corrections never
         # propagated. Idempotent and cheap.
+        # v0.8.17 — before the first replay of the session, so the pool
+        # re-anchors to the real pack instead of silently falling back.
+        self._publish_capacity_hint()
         try:
             healed = await self.storage.async_recompute_trip_costs_from_charges(
                 default_price=self._current_energy_price()
@@ -3101,6 +3110,19 @@ class EvTripLoggerCoordinator:
                 record.consumption_kwh_100km = (
                     round(corrected / distance * 100.0, 1) if distance > 0 else None
                 )
+                if distance > 0:
+                    # v0.8.17 — keep the band around the new value.
+                    (
+                        record.consumption_lower_kwh_100km,
+                        record.consumption_upper_kwh_100km,
+                        record.low_confidence,
+                    ) = self._compute_consumption_band(
+                        distance_km=distance,
+                        energy_kwh=record.energy_kwh,
+                        consumption=record.consumption_kwh_100km,
+                        energy_source=record.energy_source,
+                        soc_used_pct=soc_used,
+                    )
                 _LOGGER.info(
                     "Synth trip had %.2f kWh charged inside its window; "
                     "energy -> %.2f kWh.",
@@ -5439,6 +5461,22 @@ class EvTripLoggerCoordinator:
                     record.consumption_kwh_100km = round(
                         corrected / float(record.distance_km) * 100.0, 1
                     )
+                    # v0.8.17 — resize the band too. It was computed from
+                    # the pre-correction consumption, so leaving it alone
+                    # published a band that no longer contained the
+                    # published value (6.9 -> 15.2 with a band around
+                    # 6.9).
+                    (
+                        record.consumption_lower_kwh_100km,
+                        record.consumption_upper_kwh_100km,
+                        record.low_confidence,
+                    ) = self._compute_consumption_band(
+                        distance_km=float(record.distance_km),
+                        energy_kwh=record.energy_kwh,
+                        consumption=record.consumption_kwh_100km,
+                        energy_source=record.energy_source,
+                        soc_used_pct=record.soc_used_pct,
+                    )
 
         # v0.8.17 — SoC ROSE across the trip and no charge falls inside
         # its window: the two measurements contradict each other. Real
@@ -7371,11 +7409,15 @@ class EvTripLoggerCoordinator:
             return False
         started_odo = self.current_charge.odometer_at_start
         odo_now = self._read_float(self._odometer)
-        if (
-            started_odo is not None
-            and odo_now is not None
-            and odo_now - started_odo >= 1.0
-        ):
+        if started_odo is None or odo_now is None:
+            # v0.8.17 — without an odometer reference the ≥1 km escape
+            # hatch below is dead, so deferring would be unbounded: a
+            # charge sensor stuck 'on' (the exact cloud failure this
+            # guard exists for) would strand the trip forever, since the
+            # metric-arrival path is gated too. No reference means no
+            # deferral — fall back to the old close-then-open behaviour.
+            return False
+        if odo_now - started_odo >= 1.0:
             return False
         return True
 

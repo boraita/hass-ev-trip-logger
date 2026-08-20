@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1217,3 +1217,71 @@ async def test_heal_history_reanchors_an_unexplained_soc_rise(
     # 2 points of 82.5 kWh, not 4 — the other two were never the trip's
     assert healed.energy_kwh == pytest.approx(1.65)
     assert healed.consumption_kwh_100km == pytest.approx(3.3)
+
+
+async def test_trip_overlaps_matches_locally_stored_rows_from_utc_bounds(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 regression — the recovery dedup must still see its own rows.
+
+    Trips are written as local ISO since v0.8.17, but the recovery sweep
+    asks this question with the recorder's UTC stamps. Comparing those as
+    TEXT ('…+02:00' rows against '…+00:00' bounds) made the guard miss
+    the very rows the sweep had just inserted, so every run re-inserted
+    them — and the sweep is also fired automatically after a telemetry
+    silence, so they would pile up unattended.
+    """
+    local_start = dt_util.now() - timedelta(hours=5)
+    local_end = local_start + timedelta(hours=1)
+    await storage.async_insert(TripRecord(
+        started_at=local_start, ended_at=local_end,
+        duration_min=60.0, distance_km=80.0,
+    ))
+
+    # Same instants, expressed in UTC, as the recorder hands them back.
+    assert await storage.async_trip_overlaps(
+        local_start.astimezone(timezone.utc),
+        local_end.astimezone(timezone.utc),
+    ) is True
+
+    # A genuinely different window must still report no overlap.
+    far = local_start - timedelta(days=3)
+    assert await storage.async_trip_overlaps(
+        far.astimezone(timezone.utc),
+        (far + timedelta(hours=1)).astimezone(timezone.utc),
+    ) is False
+
+
+async def test_heal_history_ignores_a_charge_that_outlives_the_trip(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 regression — the heal must match the close path exactly.
+
+    `async_charges_in_window` counts a charge that ENDED inside the trip's
+    window. Interval overlap would also catch one that merely started
+    inside and ran on afterwards — the plug-in-at-the-end case — and then
+    fold its whole kWh into the trip, turning a correct row into a
+    physically impossible one.
+    """
+    base = dt_util.now() - timedelta(days=4)
+    trip_id = await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(hours=1, minutes=10),
+        duration_min=70.0, distance_km=60.0, soc_start=70.0, soc_end=55.0,
+        soc_used_pct=15.0, energy_kwh=12.38, consumption_kwh_100km=20.6,
+        energy_source="soc",
+    ))
+    # Plugged in five minutes before the trip closed; session runs on for
+    # another 40 minutes after it.
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=base + timedelta(hours=1, minutes=5),
+        ended_at=base + timedelta(hours=1, minutes=50),
+        kwh=30.0, price_per_kwh=0.50, total_cost=15.0, currency="EUR",
+        soc_start=55.0, soc_end=91.0,
+    ))
+
+    await storage.async_heal_history(battery_capacity_kwh=82.5)
+
+    healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip_id]
+    assert healed.kwh_charged_during is None, "charge ended after the trip"
+    assert healed.energy_kwh == pytest.approx(12.38, abs=0.01)
+    assert healed.energy_source == "soc"

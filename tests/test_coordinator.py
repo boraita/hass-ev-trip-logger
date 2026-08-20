@@ -3951,3 +3951,72 @@ async def test_regen_trapezoid_is_clamped_like_the_gross_term(
         await hass.async_block_till_done()
 
         assert coordinator.current.regen_kwh <= 5.0
+
+
+async def test_heal_history_service_is_wired(hass: HomeAssistant) -> None:
+    """v0.8.17 — the new action must be callable through HA, not just as
+    a storage method: schema, registration and coordinator plumbing.
+    """
+    from custom_components.ev_trip_logger.const import SERVICE_HEAL_HISTORY
+
+    entry = await _setup(hass, bat=80.0)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1040")
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 4)
+    assert coordinator.last_trip is not None
+
+    assert hass.services.has_service(DOMAIN, SERVICE_HEAL_HISTORY)
+    await hass.services.async_call(
+        DOMAIN, SERVICE_HEAL_HISTORY, {}, blocking=True,
+    )
+
+    # Idempotent: a second pass must not move anything.
+    before = (await coordinator.storage.async_recent_trips(1))[0]
+    await hass.services.async_call(
+        DOMAIN, SERVICE_HEAL_HISTORY, {}, blocking=True,
+    )
+    after = (await coordinator.storage.async_recent_trips(1))[0]
+    assert after.energy_kwh == before.energy_kwh
+    assert after.soc_start == before.soc_start
+    assert after.cost == before.cost
+
+
+async def test_capacity_hint_is_published_before_the_startup_cost_heal(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 regression — the WAC re-anchor must not be off at startup.
+
+    The hint started out as a side effect of reading the
+    `battery_capacity` property, and nothing reads it before the startup
+    cost heal: that replay ran with no capacity, fell back to the old
+    additive pool, and wrote costs the next replay overwrote with
+    different numbers — so trip costs moved after every restart.
+    """
+    entry = await _setup(hass, bat=80.0)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    assert coordinator.storage.capacity_hint_kwh == pytest.approx(75.0)
+
+    # And a replay is stable across repeats now that it is set.
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1060")
+    hass.states.async_set(BAT, "65")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 4)
+
+    first = (await coordinator.storage.async_recent_trips(1))[0].cost
+    await coordinator.storage.async_recompute_trip_costs_from_charges(
+        default_price=coordinator._current_energy_price(),
+    )
+    second = (await coordinator.storage.async_recent_trips(1))[0].cost
+    assert second == pytest.approx(first)

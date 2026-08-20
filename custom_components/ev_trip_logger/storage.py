@@ -961,8 +961,15 @@ class TripStorage:
         self, start: datetime, end: datetime, tolerance_s: int
     ) -> bool:
         # Overlap if existing.started_at < end+tol AND existing.ended_at > start-tol
-        lo = (start - timedelta(seconds=tolerance_s)).isoformat()
-        hi = (end + timedelta(seconds=tolerance_s)).isoformat()
+        #
+        # v0.8.17 — normalise the bounds the same way the rows are
+        # written. Rows now go in as local ISO (`_iso_local`) while the
+        # recovery sweep hands this method the recorder's UTC stamps, so
+        # a bare .isoformat() compared '…+02:00' rows against '…+00:00'
+        # bounds as TEXT and the guard stopped matching the very rows the
+        # sweep had just inserted — every run re-inserted them.
+        lo = _iso_local(start - timedelta(seconds=tolerance_s))
+        hi = _iso_local(end + timedelta(seconds=tolerance_s))
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -2469,6 +2476,13 @@ class TripStorage:
                     WHERE (energy_kwh IS NULL OR energy_kwh <= 0)
                       AND distance_km IS NOT NULL AND distance_km > 0
                       AND COALESCE(confidence, '') != 'orphan_odo_only'
+                      -- v0.8.17 — never overwrite measured provenance. A
+                      -- row that genuinely measured 0 kWh via power
+                      -- integration or the vehicle's own sensor would
+                      -- otherwise be relabelled 'estimated' and given a
+                      -- fabricated distance-based energy.
+                      AND (energy_source IS NULL
+                           OR energy_source IN ('soc', 'estimated'))
                     """,
                     (avg_per_100, avg_per_100),
                 )
@@ -2528,7 +2542,9 @@ class TripStorage:
                     ts = ts.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
                 return ts
 
-            parsed_charges: list[tuple[datetime, float, float, float | None]] = []
+            parsed_charges: list[
+                tuple[datetime, float, float, float | None, float | None]
+            ] = []
             for r in charge_rows:
                 ts = _as_utc(r["ended_at"])
                 if ts is None:
@@ -2772,7 +2788,7 @@ class TripStorage:
                 "peak_charge_power_kw = ? "
                 "WHERE id = ?",
                 (
-                    new_kwh, new_total, ended_at.isoformat(), new_soc_end,
+                    new_kwh, new_total, _iso_local(ended_at), new_soc_end,
                     new_evse, new_eff, new_peak, row["id"],
                 ),
             )
@@ -3053,9 +3069,15 @@ class TripStorage:
                 updates: dict[str, Any] = {}
 
                 # --- charge attribution, from the charges that exist now
+                # v0.8.17 — same semantics as the close path
+                # (`async_charges_in_window`): a charge counts when it
+                # ENDED inside the trip's window. Interval overlap would
+                # additionally catch a session that merely started inside
+                # and ran on afterwards, then fold its WHOLE kWh into the
+                # trip — turning a correct 60 km row into >80 kWh/100km.
                 during = sum(
-                    kwh for c_start, c_end, kwh in charges
-                    if c_end >= start and c_start <= end
+                    kwh for _c_start, c_end, kwh in charges
+                    if start <= c_end <= end
                 )
                 before = 0.0
                 if prev_end_ts is not None and prev_end_ts < start:
@@ -3114,7 +3136,17 @@ class TripStorage:
                             updates["energy_kwh"] = energy
                             updates["energy_source"] = source
                             counts["energy_recomputed"] += 1
-                        if distance and float(distance) > 0:
+                        # v0.8.17 — a NULL consumption is a deliberate
+                        # suppression (v0.8.15 parked orphans, v0.8.17
+                        # SoC-rose rows). Recomputing one here would
+                        # republish the very figure those paths refused
+                        # to publish, so only refresh a value that was
+                        # already there.
+                        if (
+                            distance
+                            and float(distance) > 0
+                            and row["consumption_kwh_100km"] is not None
+                        ):
                             updates["consumption_kwh_100km"] = round(
                                 energy / float(distance) * 100.0, 1
                             )
@@ -3137,8 +3169,13 @@ class TripStorage:
                     )
 
                 prev_end_ts = end
+                # v0.8.17 — carry the SoC anchor WITH its timestamp. If
+                # this row has no soc_end, keeping an older one while the
+                # "was anything charged in between?" window only covers
+                # the last gap would let the re-anchor fire against a
+                # value tens of percent stale.
                 prev_soc_end = (
-                    float(soc_end) if soc_end is not None else prev_soc_end
+                    float(soc_end) if soc_end is not None else None
                 )
         return counts
 

@@ -1702,23 +1702,34 @@ class TrackedAvgSensor(_BaseTripSensor):
         # average power" of 49.98 kW; the honest figure is
         # 50 × 20/720 = 1.39 kW. Each sample now weighs the time it was
         # actually in force.
-        samples: list[tuple[Any, float]] = []
+        # Keep EVERY state, numeric or not, so a value's span ends at the
+        # next reported state rather than at the next parseable one.
+        # v0.8.17 — crediting an `unavailable` gap to the last numeric
+        # sample would be the same bug in reverse: a cloud dropout that
+        # begins while the sensor reads 50 kW would let that one sample
+        # weigh hours of no data, and `covered_hours` would count time
+        # the recorder never had.
+        timeline: list[tuple[Any, float | None]] = []
         for st in states:
-            try:
-                v = float(st.state)
-            except (TypeError, ValueError):
-                continue
             ts = getattr(st, "last_changed", None) or getattr(
                 st, "last_updated", None
             )
             if ts is None:
                 continue
-            samples.append((ts, v))
-        samples.sort(key=lambda item: item[0])
+            try:
+                value: float | None = float(st.state)
+            except (TypeError, ValueError):
+                value = None
+            timeline.append((ts, value))
+        timeline.sort(key=lambda item: item[0])
         weighted_sum = 0.0
         total_seconds = 0.0
-        for idx, (ts, value) in enumerate(samples):
-            next_ts = samples[idx + 1][0] if idx + 1 < len(samples) else end
+        numeric_samples = 0
+        for idx, (ts, value) in enumerate(timeline):
+            if value is None:
+                continue
+            numeric_samples += 1
+            next_ts = timeline[idx + 1][0] if idx + 1 < len(timeline) else end
             seconds = (next_ts - ts).total_seconds()
             if seconds <= 0:
                 continue
@@ -1726,7 +1737,7 @@ class TrackedAvgSensor(_BaseTripSensor):
             total_seconds += seconds
         if total_seconds > 0:
             self._mean = weighted_sum / total_seconds
-            self._samples = len(samples)
+            self._samples = numeric_samples
             # How much of the advertised window the recorder could
             # actually cover. `window_start` claims N days even when
             # retention is far shorter, which made a 3-day mean look
