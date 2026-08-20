@@ -526,3 +526,23 @@ backfill_charge_evse:
       name: Entry ID
       selector:
         text:
+
+heal_history:
+  name: Heal history
+  description: >-
+    Re-derive historical trips from the data as it stands today. Two
+    things change under a trip after it is written: charges recovered
+    later (kwh_charged_before / _during are computed once, at close, so a
+    charge inserted afterwards is invisible to the trips around it), and
+    the v0.8.17 bound on the post-charge SoC anchor (older rows can carry
+    a soc_start ABOVE the previous trip's soc_end with no charge in
+    between, which cannot happen while parked). Nothing is modelled: a
+    SoC rise that a real charge explains is left alone, and a trip whose
+    energy came from an independent measurement keeps it. Re-costs every
+    trip afterwards. Safe to run more than once.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Restrict the action to a specific config entry.
+      selector:
+        text:

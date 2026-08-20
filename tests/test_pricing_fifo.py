@@ -164,11 +164,23 @@ async def test_wac_free_charge_dilutes_average(storage: TripStorage) -> None:
     assert trip.cost == pytest.approx(40.0 * avg)
 
 
-async def test_wac_pool_runs_dry_falls_back_to_home_tariff(
+async def test_wac_pool_runs_dry_uses_the_blend_seen_so_far(
     storage: TripStorage,
 ) -> None:
-    """When the pool can't cover the full withdrawal, the shortfall is
-    billed at default_price.
+    """v0.8.17 — the shortfall is priced at the blend already seen, not
+    at the configured home tariff.
+
+    A shortfall means the car consumed more than we tracked charging, so
+    the missing energy came from somewhere untracked. The best available
+    estimate of what it cost is what this car's energy has cost so far —
+    not a tariff that may have nothing to do with it. On a road trip the
+    old behaviour was systematically optimistic: every kWh the pool
+    couldn't cover was billed at the cheapest number in the config while
+    every real charge was DC.
+
+    It stays causal: only charges that already happened feed the average,
+    so a charge logged tomorrow can never re-price today's driving (see
+    `test_wac_charge_after_trip_does_not_pollute`).
     """
     await storage.async_insert_charge(
         _charge(ended_at=T0, kwh=5.0, price_per_kwh=0.07)
@@ -182,9 +194,121 @@ async def test_wac_pool_runs_dry_falls_back_to_home_tariff(
     await storage.async_recompute_trip_costs_from_charges(default_price=0.20)
 
     trip = (await _trips_by_id(storage))[trip_id]
-    # 5 * 0.07 + 3 * 0.20 = 0.35 + 0.60 = 0.95
-    assert trip.cost == pytest.approx(0.95)
-    assert trip.cost_basis_per_kwh == pytest.approx(0.95 / 8.0)
+    # 5 kWh from the pool @0.07 + 3 kWh of shortfall at that same 0.07
+    assert trip.cost == pytest.approx(0.56)
+    assert trip.cost_basis_per_kwh == pytest.approx(0.07)
+
+
+async def test_wac_long_charge_does_not_block_later_ones(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 — head-of-line blocking used to drop charges entirely.
+
+    The queue was ordered by `started_at` but consumed on `ended_at`, and
+    the loop stopped at the head. A session that starts early and ends
+    late therefore stalled every charge that ended in between — those
+    kWh reached no trip at all and the trip fell to the fallback price.
+    """
+    # Starts first, ends much later — the blocker.
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=T0,
+        ended_at=T0 + timedelta(hours=50),
+        kwh=40.0, price_per_kwh=0.07, total_cost=2.8, currency="EUR",
+    ))
+    # Starts after it, but ends long before it.
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=T0 + timedelta(hours=1),
+        ended_at=T0 + timedelta(hours=2),
+        kwh=30.0, price_per_kwh=0.45, total_cost=13.5, currency="EUR",
+    ))
+    trip_id = await storage.async_insert(_trip(
+        started_at=T0 + timedelta(hours=3),
+        ended_at=T0 + timedelta(hours=4),
+        energy_kwh=20.0,
+    ))
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.99)
+
+    trip = (await _trips_by_id(storage))[trip_id]
+    # The 30 kWh @0.45 session had ended an hour earlier, so the trip
+    # draws from it — not from the 0.99 fallback.
+    assert trip.cost == pytest.approx(9.0)
+    assert trip.cost_basis_per_kwh == pytest.approx(0.45)
+
+
+async def test_wac_pool_is_reanchored_to_real_soc_after_each_charge(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 — the pool tracks price; the battery decides quantity.
+
+    The additive pool had no sink for energy that leaves the battery
+    without being a trip (standby drain, preconditioning) and no opening
+    inventory, so it drifted free of the physical pack — on the reporter's
+    car it was able to hold more kWh than the battery can physically
+    store. After a charge closes, `soc_end` states the real content
+    exactly, so the pool is re-anchored to it and the drift is dropped.
+    """
+    storage.capacity_hint_kwh = 100.0  # 1 % = 1 kWh, keeps the maths obvious
+
+    # Two charges totalling 90 kWh, but the pack ends at 50 % = 50 kWh:
+    # 40 kWh left the battery without ever being a trip.
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=T0 - timedelta(hours=2), ended_at=T0 - timedelta(hours=1),
+        kwh=45.0, price_per_kwh=0.10, total_cost=4.5, currency="EUR",
+        soc_start=5.0, soc_end=50.0,
+    ))
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=T0, ended_at=T0 + timedelta(minutes=30),
+        kwh=45.0, price_per_kwh=0.50, total_cost=22.5, currency="EUR",
+        soc_start=5.0, soc_end=50.0,
+    ))
+    trip_id = await storage.async_insert(_trip(
+        started_at=T0 + timedelta(hours=1),
+        ended_at=T0 + timedelta(hours=2),
+        energy_kwh=60.0,
+    ))
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.99)
+
+    trip = (await _trips_by_id(storage))[trip_id]
+    # At the second cable-in the pack held 5 kWh left over at 0.10, and
+    # 45 kWh arrived at 0.50: (5*0.10 + 45*0.50)/50 = 0.46. The 45 kWh
+    # that vanished between the two sessions is NOT credited — with the
+    # old additive pool it was, and it dragged the price down to 0.289.
+    # Of the 60 kWh withdrawn, 50 were physically there; the remaining
+    # 10 is a shortfall priced at the same blend.
+    assert trip.cost_basis_per_kwh == pytest.approx(0.46)
+    assert trip.cost == pytest.approx(27.6)
+
+
+async def test_wac_prices_the_invoice_not_the_battery_side_kwh(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 — money paid is the input; €/kWh is derived from it.
+
+    A public tariff is billed on the charger-side kWh, which is 5-15 %
+    above what reaches the battery. Pricing the pool off `price_per_kwh`
+    against the battery-side `kwh` silently drops the charging losses, so
+    energy that was genuinely paid for reached no trip.
+    """
+    # 30 kWh metered and invoiced at €16.50; 27 kWh actually stored.
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=T0 - timedelta(hours=1), ended_at=T0,
+        kwh=27.0, price_per_kwh=0.55, total_cost=16.50, currency="EUR",
+    ))
+    trip_id = await storage.async_insert(_trip(
+        started_at=T0 + timedelta(hours=1),
+        ended_at=T0 + timedelta(hours=2),
+        energy_kwh=27.0,
+    ))
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.07)
+
+    trip = (await _trips_by_id(storage))[trip_id]
+    # The whole invoice reaches the driving: 16.50 / 27 = 0.6111 per
+    # battery-kWh, not the 0.55 charger-side rate.
+    assert trip.cost == pytest.approx(16.50)
+    assert trip.cost_basis_per_kwh == pytest.approx(16.50 / 27.0)
 
 
 async def test_wac_no_charges_fallback(storage: TripStorage) -> None:

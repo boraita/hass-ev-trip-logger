@@ -233,6 +233,13 @@ _PRE_ON_LOOKBACK = timedelta(minutes=5)
 # either sat too long or someone discharged it externally).
 _POST_CHARGE_ANCHOR_WINDOW = timedelta(hours=12)
 _POST_CHARGE_DRAIN_BUDGET_PCT = 2.0
+# v0.8.17 — the anchor may never absorb more than ONE integer SoC step.
+# A drop bigger than the sensor's own resolution is not staleness, it is
+# real parked drain, and parked drain belongs to no trip. Beyond
+# `_QUANTIZATION_ANCHOR_WINDOW` even one step is more likely to be drain
+# than a stale reading, so the anchor stops correcting altogether.
+_SOC_QUANTIZATION_STEP_PCT = 1.0
+_QUANTIZATION_ANCHOR_WINDOW = timedelta(hours=3)
 # v0.5.40 — snap-on-short-park. When the previous trip ended very
 # recently and no charge has happened since, anchor the new trip's
 # soc_start to the previous trip's soc_end IF the apparent gap is
@@ -242,7 +249,7 @@ _POST_CHARGE_DRAIN_BUDGET_PCT = 2.0
 # pack relaxes; no real drain). Beyond 30 min parked, real vampire
 # drain becomes plausible, so we don't snap.
 _SHORT_PARK_SNAP_WINDOW = timedelta(minutes=30)
-_SHORT_PARK_SNAP_GAP_PCT = 2.0
+_SHORT_PARK_SNAP_GAP_PCT = 1.0  # v0.8.17 — one integer step, not two
 # v0.5.41 — orphan-trip detection between consecutive trips. When a
 # new trip opens and the captured odometer_start is materially larger
 # than the previous trip's odometer_end, a real drive was missed (a
@@ -798,6 +805,11 @@ class ChargeInProgress:
     started_at: datetime
     soc_start: float | None
     last_seen_soc: float | None = None
+    # v0.8.17 — odometer at the moment the session opened. Used as the
+    # escape hatch for `_charge_still_delivering`: if the car has
+    # actually covered ground since the charge opened, the charge
+    # sensor is lying (stuck 'on') and a trip must be allowed to open.
+    odometer_at_start: float | None = None
     # Most-recent absolute power reading from the configured power sensor,
     # surfaced by the current_charge_* sensors so the dashboard can show
     # "charging at 7.2 kW right now". Captured even when no trip is active.
@@ -1170,11 +1182,20 @@ class EvTripLoggerCoordinator:
         SoC→kWh conversion routes through this property, so a single
         fix here propagates to energy_kwh, consumption, cost and score.
         """
-        return (
+        capacity = (
             self._battery_capacity_calibrated
             if self._battery_capacity_calibrated is not None
             else self._battery_capacity_declared
         )
+        # v0.8.17 — the WAC replay lives in storage and needs the same
+        # number to re-anchor its pool to the physical battery. Publish
+        # it here rather than threading a parameter through the twelve
+        # call sites of `async_recompute_trip_costs_from_charges`; this
+        # property is read on every SoC→kWh conversion, so the hint can
+        # never go stale. Storage falls back to its old additive pool
+        # when the hint is unset.
+        self.storage.capacity_hint_kwh = capacity
+        return capacity
 
     @property
     def battery_capacity_baseline(self) -> float:
@@ -2302,7 +2323,8 @@ class EvTripLoggerCoordinator:
         soc = self._read_float(self._battery)
         started = st.last_changed or dt_util.now()
         self.current_charge = ChargeInProgress(
-            started_at=started, soc_start=soc, last_seen_soc=soc
+            started_at=started, soc_start=soc, last_seen_soc=soc,
+            odometer_at_start=self._read_float(self._odometer),
         )
         _LOGGER.info(
             "Resumed mid-charge session at startup (started %s, soc≈%s)",
@@ -2446,6 +2468,17 @@ class EvTripLoggerCoordinator:
             return
 
         if self.current_charge is not None:
+            # v0.8.17 — only take over the session once the cable has
+            # actually stopped delivering. While it is still charging,
+            # defer: the charge-off handler opens the trip afterwards,
+            # with soc_start anchored to the session's real end SoC.
+            if self._charge_still_delivering():
+                _LOGGER.info(
+                    "vehicle_on=on but the charge is still delivering — "
+                    "deferring trip open until the session closes"
+                )
+                self._cancel_pending_open()
+                return
             # v0.5.16 — mutual exclusion: close the charge first so its
             # final SoC anchors the new trip. Charge close races the
             # retry chain; cancel the chain because the chained helper
@@ -2568,6 +2601,11 @@ class EvTripLoggerCoordinator:
         if (
             self.current is None
             and self._read_bool(self._vehicle_on) is True
+            # v0.8.17 — this path never checked current_charge, so it was
+            # a second door into the same bug: a battery/odometer tick
+            # mid-charge would open the trip even after the vehicle_on
+            # path had deferred.
+            and not self._charge_still_delivering()
             and self._read_float_if_fresh(
                 self._odometer, _metric_now, _ODOMETER_STALE_MAX_AGE_S
             ) is not None
@@ -3038,6 +3076,55 @@ class EvTripLoggerCoordinator:
             round(during_s["kwh"], 2) if during_s["kwh"] > 0 else None
         )
 
+        # v0.8.17 — the same two corrections the live close applies. This
+        # path was missed on the first pass, which matters more than the
+        # live one: as the comment above says, on a cloud-polled car
+        # nearly every trip is synthetic, so most rows never got either.
+        #
+        # (i) A charge inside the window has already refilled part of
+        # what the drive spent, so the SoC delta understates it. Note
+        # `soc_used` here is None whenever SoC did not fall, so the
+        # correction is driven off the raw endpoints.
+        if (
+            record.kwh_charged_during
+            and soc_s is not None
+            and soc_e is not None
+            and energy_source in (None, "soc", "estimated")
+        ):
+            corrected = (
+                float(record.kwh_charged_during)
+                + ((float(soc_s) - float(soc_e)) / 100.0) * self.battery_capacity
+            )
+            if corrected > 0:
+                record.energy_kwh = round(corrected, 2)
+                record.energy_source = "soc_plus_charge"
+                record.consumption_kwh_100km = (
+                    round(corrected / distance * 100.0, 1) if distance > 0 else None
+                )
+                _LOGGER.info(
+                    "Synth trip had %.2f kWh charged inside its window; "
+                    "energy -> %.2f kWh.",
+                    record.kwh_charged_during, corrected,
+                )
+        # (ii) SoC rose with no charge in the window — the estimate is
+        # the rolling average echoed back as a measurement.
+        elif (
+            record.kwh_charged_during is None
+            and soc_s is not None
+            and soc_e is not None
+            and float(soc_e) > float(soc_s)
+            and record.energy_source == "estimated"
+        ):
+            _LOGGER.info(
+                "Synth trip SoC rose %.0f%% -> %.0f%% with no charge in "
+                "its window; suppressing the estimated %.1f kWh/100km.",
+                soc_s, soc_e, record.consumption_kwh_100km or 0.0,
+            )
+            record.consumption_kwh_100km = None
+            record.consumption_lower_kwh_100km = None
+            record.consumption_upper_kwh_100km = None
+            record.low_confidence = True
+
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
         # v0.5.77 — schedule the vehicle-native energy heal (no-op when
@@ -3199,16 +3286,31 @@ class EvTripLoggerCoordinator:
                 # discharge and the next a deep regen (e.g. coasting →
                 # foot off): trip 163 logged 1.97 kWh regen in 10 km of
                 # city driving, physically impossible.
+                regen_delta = 0.0
                 if prev_kw <= 0 and value <= 0:
-                    self.current.regen_kwh += (-prev_kw + -value) / 2.0 * dt_h
+                    regen_delta = (-prev_kw + -value) / 2.0 * dt_h
                 elif prev_kw < 0 and value > 0:
                     span = -prev_kw + value
                     if span > 0:
-                        self.current.regen_kwh += (prev_kw * prev_kw) / (2.0 * span) * dt_h
+                        regen_delta = (prev_kw * prev_kw) / (2.0 * span) * dt_h
                 elif prev_kw > 0 and value < 0:
                     span = prev_kw + -value
                     if span > 0:
-                        self.current.regen_kwh += (value * value) / (2.0 * span) * dt_h
+                        regen_delta = (value * value) / (2.0 * span) * dt_h
+                # v0.8.17 — the per-trapezoid clamp used to guard only
+                # the gross term, so a cloud back-fill could inject
+                # fictional regen without limit: two consecutive
+                # -100 kW samples 20 min apart added 33.3 kWh of regen
+                # to an 82.5 kWh pack, permanently, into the year
+                # totals. Same ceiling as the gross side.
+                if regen_delta > _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH:
+                    _LOGGER.warning(
+                        "Capping outsized regen trapezoid: %.2f kWh "
+                        "(prev=%.1f kW, now=%.1f kW, dt=%.1f min)",
+                        regen_delta, prev_kw, value, dt_h * 60.0,
+                    )
+                    regen_delta = _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH
+                self.current.regen_kwh += regen_delta
                 # v0.5.13 — independent kWh estimator. Trapezoid over
                 # |power| gives the trip's gross throughput; we compare
                 # against SoC-derived energy on close and keep the more
@@ -3222,7 +3324,28 @@ class EvTripLoggerCoordinator:
                 # braces: even with both endpoints inside the magnitude
                 # cap, a single tick shouldn't push more than ~5 kWh.
                 if prev_abs is not None:
-                    delta = (prev_abs + abs_now) / 2.0 * dt_h
+                    # v0.8.17 — exact ∫|P|dt, matching the sub-area
+                    # maths the regen term above already uses. A
+                    # trapezoid over the MAGNITUDES over-counts any
+                    # segment that crosses zero, because |P| has a kink
+                    # at the crossing that a straight line cuts across:
+                    # +40 kW followed by -30 kW integrated 35·dt when
+                    # the true area is 17.86·dt, a factor of 1.96. That
+                    # over-count fed `discharge_kwh` and the month/year
+                    # discharge totals directly, biased `regen_ratio`
+                    # low through its denominator, and became the trip's
+                    # own `energy_kwh` whenever the SoC delta was under
+                    # one integer step. Same-sign segments are unchanged
+                    # (the trapezoid is already exact there).
+                    if (prev_kw > 0 and value < 0) or (prev_kw < 0 and value > 0):
+                        span = prev_abs + abs_now
+                        delta = (
+                            (prev_kw * prev_kw + value * value)
+                            / (2.0 * span) * dt_h
+                            if span > 0 else 0.0
+                        )
+                    else:
+                        delta = (prev_abs + abs_now) / 2.0 * dt_h
                     if delta > _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH:
                         _LOGGER.warning(
                             "Capping outsized power trapezoid: %.2f kWh "
@@ -3345,12 +3468,34 @@ class EvTripLoggerCoordinator:
                 return
             soc = self._read_float(self._battery)
             self.current_charge = ChargeInProgress(
-                started_at=now, soc_start=soc, last_seen_soc=soc
+                started_at=now, soc_start=soc, last_seen_soc=soc,
+                odometer_at_start=self._read_float(self._odometer),
             )
             _LOGGER.debug("Charge session opened at %s, soc=%s", now, soc)
             self._notify_listeners()
         elif self.current_charge is not None:
-            self.hass.async_create_task(self._async_close_auto_charge(now))
+            self.hass.async_create_task(
+                self._async_close_charge_then_resume_trip(now)
+            )
+
+    async def _async_close_charge_then_resume_trip(
+        self, now: datetime
+    ) -> None:
+        """Close the session, then open the trip we deferred earlier.
+
+        v0.8.17 — counterpart to `_charge_still_delivering`. The driver
+        was already sitting in the car with `vehicle_on` up, so once the
+        cable stops there is a real trip to open, and `_resolve_soc_start`
+        can now anchor it to the charge's freshly-persisted end SoC
+        instead of a reading taken mid-charge.
+        """
+        await self._async_close_auto_charge(now)
+        if self.current is None and self._read_bool(self._vehicle_on) is True:
+            _LOGGER.info(
+                "Charge closed with vehicle_on still on — opening the "
+                "trip that was deferred while the cable was live"
+            )
+            self._open_trip(dt_util.now())
 
     async def _async_close_then_open_charge(
         self, close_ts: datetime, now: datetime
@@ -3367,7 +3512,8 @@ class EvTripLoggerCoordinator:
         if self.current_charge is None:
             soc = self._read_float(self._battery)
             self.current_charge = ChargeInProgress(
-                started_at=now, soc_start=soc, last_seen_soc=soc
+                started_at=now, soc_start=soc, last_seen_soc=soc,
+                odometer_at_start=self._read_float(self._odometer),
             )
             _LOGGER.debug(
                 "Charge session opened after trip force-close: soc=%s", soc
@@ -3631,6 +3777,7 @@ class EvTripLoggerCoordinator:
             )
         )
 
+        force_merge = False
         if self.last_charge is not None and not can_merge:
             # Compare against `started_at` so a manual correction hours after
             # the original auto-detect doesn't open the window. Also widen
@@ -3648,14 +3795,60 @@ class EvTripLoggerCoordinator:
             # so a continuity-proven pulse within 2 h of the session
             # start was silently DROPPED (its kWh lost) instead of
             # merged. Continuity-proven pulses now bypass this gate.
+            #
+            # v0.8.17 — the gate used to `return`, i.e. throw the kWh
+            # away. On a road trip that is catastrophic: DCFC hops sit
+            # 40-90 min apart, so every stop after the first was
+            # silently deleted (measured: 150 kWh lost across 4 days).
+            # Discarding is now reserved for the ONE case it was
+            # actually written for — the user manually logging the same
+            # session the auto-detect just watched, which shows up as a
+            # previous charge whose window OVERLAPS this pulse (or whose
+            # window is unknown, as `log_charge` leaves `started_at`
+            # NULL). Everything else keeps its energy:
+            #   - SoC dropped since the previous charge ended → the car
+            #     was driven in between, so this is unambiguously a new
+            #     session. Insert it.
+            #   - Otherwise it's a continuation pulse we simply could
+            #     not prove with the plug sensor (public DCFC exposes no
+            #     plug telemetry, and the BYD cloud reports `charging`
+            #     off mid-session). Extend the previous row.
+            # The ≥2 % SoC-delta gate above already kills the balancing
+            # blips this dedup was feared to let through.
             if elapsed < 7200:  # 2 h
-                _LOGGER.debug(
-                    "Skipping auto-charge: previous charge %.0fs ago "
-                    "(price_locked=%s)",
-                    elapsed, self.last_charge.price_locked,
+                overlaps_previous = (
+                    self.last_charge.started_at is None
+                    or self.last_charge.ended_at is None
+                    or active.started_at is None
+                    or self.last_charge.ended_at > active.started_at
                 )
-                self._notify_listeners()
-                return
+                if overlaps_previous:
+                    _LOGGER.info(
+                        "Discarding auto-charge: previous charge #%s "
+                        "overlaps this pulse (%.0fs ago, price_locked=%s) "
+                        "— already recorded, not double-counting.",
+                        self.last_charge.charge_id, elapsed,
+                        self.last_charge.price_locked,
+                    )
+                    self._notify_listeners()
+                    return
+                if soc_dropped_since_last:
+                    _LOGGER.info(
+                        "Auto-charge %.0fs after charge #%s, but SoC fell "
+                        "%.0f%% → %.0f%% in between — the car was driven, "
+                        "so this is a new session. Inserting.",
+                        elapsed, self.last_charge.charge_id,
+                        float(self.last_charge.soc_end),
+                        float(active.soc_start),
+                    )
+                else:
+                    _LOGGER.info(
+                        "Auto-charge %.0fs after charge #%s with no drive "
+                        "in between and no plug proof — merging into it "
+                        "instead of discarding its kWh.",
+                        elapsed, self.last_charge.charge_id,
+                    )
+                    force_merge = True
 
         kwh_soc = (soc_end - active.soc_start) / 100.0 * self.battery_capacity
         # v0.5.89 / v0.8.14 — prefer the power-integration measurement
@@ -3736,7 +3929,7 @@ class EvTripLoggerCoordinator:
                 eff * 100.0 if eff else 0.0,
             )
 
-        if can_merge:
+        if can_merge or force_merge:
             # v0.5.94 — propagate the new pulse's EVSE-side energy so
             # merged multi-pulse sessions accumulate the AC reading
             # instead of dropping it on the floor.
@@ -3758,9 +3951,20 @@ class EvTripLoggerCoordinator:
             )
             if merged is not None:
                 self.last_charge = merged
+                # v0.8.17 — the merge used to `return` straight past the
+                # replay that a fresh insert triggers, so a session that
+                # grew by a pulse never re-priced the driving it covers.
+                try:
+                    await self.storage.async_recompute_trip_costs_from_charges(
+                        default_price=self._current_energy_price(),
+                    )
+                except Exception:  # pragma: no cover — defensive
+                    _LOGGER.exception("Cost replay after charge merge failed")
                 _LOGGER.info(
-                    "Merged %.2f kWh into charge #%s (cable still plugged in)",
+                    "Merged %.2f kWh into charge #%s (%s)",
                     kwh, merged.charge_id,
+                    "cable still plugged in" if can_merge
+                    else "continuation pulse within 2 h, no drive in between",
                 )
                 self.hass.bus.async_fire(
                     EVENT_CHARGE_LOGGED,
@@ -3864,7 +4068,30 @@ class EvTripLoggerCoordinator:
             )
             not_below_current = current is None or soc_end_f >= current - 0.5
             if plug_disconnected and drain_ok and not_below_current:
-                return soc_end_f, "last_charge_end"
+                # v0.8.17 — bound the correction instead of taking the
+                # charge's soc_end whole. This branch only ever raises
+                # soc_start, so every percent it adds becomes trip
+                # energy: with the old 2 % budget and a 12 h window, a
+                # car that sat overnight and lost 2 % to standby had
+                # that 1.65 kWh billed to the next drive (measured on a
+                # 5 km commute: 49.5 kWh/100km instead of ~16.5). Only
+                # one integer step is attributable to sensor staleness;
+                # anything beyond it is real parked drain and belongs to
+                # no trip. After `_QUANTIZATION_ANCHOR_WINDOW` even that
+                # step is more likely drain than staleness, so we stop
+                # correcting and trust the live reading.
+                if current is None:
+                    return soc_end_f, "last_charge_end"
+                elapsed_parked = now - lc.ended_at
+                allowance = (
+                    _SOC_QUANTIZATION_STEP_PCT
+                    if elapsed_parked <= _QUANTIZATION_ANCHOR_WINDOW
+                    else 0.0
+                )
+                anchored = min(soc_end_f, current + allowance)
+                if anchored > current:
+                    return anchored, "last_charge_end"
+                return current, "post_on_sample"
 
         # (a.5) Snap to previous trip's soc_end when parking was short
         # and the apparent gap is within integer-quantization / BMS-
@@ -5178,6 +5405,74 @@ class EvTripLoggerCoordinator:
             round(during["kwh"], 2) if during["kwh"] > 0 else None
         )
 
+        # v0.8.17 — a charge that lands INSIDE the trip's window was
+        # measured (`kwh_charged_during`) and then used for nothing but
+        # display, while `energy_kwh` came from the raw SoC delta — which
+        # the charge has already partly refilled. A 120 km leg from 60 %
+        # to 50 % with a 10 kWh top-up inside recorded 8.25 kWh
+        # (6.9 kWh/100km, impossible for this car) when the real figure
+        # is 8.25 + 10 = 18.25 kWh. Conservation says
+        # `consumed = charged - Δstored`, and `soc_used_pct` already
+        # carries the sign of Δstored, so one expression covers both a
+        # net drop and a net gain. Power-integration and vehicle-native
+        # rows are excluded: they measured discharge directly, so adding
+        # the charge would double-count it.
+        if (
+            record.kwh_charged_during
+            and record.soc_used_pct is not None
+            and record.energy_source in (None, "soc", "estimated")
+        ):
+            corrected = (
+                float(record.kwh_charged_during)
+                + (float(record.soc_used_pct) / 100.0) * self.battery_capacity
+            )
+            if corrected > 0:
+                _LOGGER.info(
+                    "Trip had %.2f kWh charged inside its window; energy "
+                    "%.2f -> %.2f kWh (SoC delta alone understates it).",
+                    record.kwh_charged_during, record.energy_kwh or 0.0,
+                    corrected,
+                )
+                record.energy_kwh = round(corrected, 2)
+                record.energy_source = "soc_plus_charge"
+                if record.distance_km:
+                    record.consumption_kwh_100km = round(
+                        corrected / float(record.distance_km) * 100.0, 1
+                    )
+
+        # v0.8.17 — SoC ROSE across the trip and no charge falls inside
+        # its window: the two measurements contradict each other. Real
+        # causes seen in the field: a long mountain descent where regen
+        # outweighs draw, a charge the cloud never reported, or SoC
+        # samples landing late after a coverage gap. By this point
+        # `energy_kwh` has already fallen through to
+        # `distance × rolling-average kWh/100km`, so publishing a
+        # consumption derived from it just echoes the fleet average back
+        # as though it were a measurement — and that same average is
+        # what produced the number. Worse, the row then feeds the
+        # average it was copied from. Keep the raw energy estimate (cost
+        # and kWh aggregates still need a figure) and drop the derived
+        # per-100 km value, the way v0.8.15 handles parked
+        # disconnect-orphans.
+        if (
+            record.soc_used_pct is not None
+            and record.soc_used_pct < 0
+            and record.kwh_charged_during is None
+            and record.energy_source == "estimated"
+        ):
+            _LOGGER.info(
+                "Trip SoC rose %.0f%% → %.0f%% with no charge in its "
+                "window; suppressing the estimated %.1f kWh/100km "
+                "(distance-derived, not measured).",
+                record.soc_start if record.soc_start is not None else -1.0,
+                record.soc_end if record.soc_end is not None else -1.0,
+                record.consumption_kwh_100km or 0.0,
+            )
+            record.consumption_kwh_100km = None
+            record.consumption_lower_kwh_100km = None
+            record.consumption_upper_kwh_100km = None
+            record.low_confidence = True
+
         trip_id = await self.storage.async_insert(record)
         record.trip_id = trip_id
         # v0.5.77 — vehicle-native energy heal scheduled here too.
@@ -5465,9 +5760,35 @@ class EvTripLoggerCoordinator:
         deleted = await self.storage.async_delete_last_charge()
         if deleted:
             self.last_charge = await self.storage.async_get_last_charge()
+            # v0.8.17 — deleting a charge removes energy from the WAC
+            # pool, so every trip that drew on it is now mispriced.
+            try:
+                await self.storage.async_recompute_trip_costs_from_charges(
+                    default_price=self._current_energy_price(),
+                )
+            except Exception:  # pragma: no cover — defensive
+                _LOGGER.exception("Cost replay after delete_last_charge failed")
             self._notify_listeners()
             self._notify_trip_log_listeners()
         return deleted
+
+    async def async_heal_history_service(self) -> dict[str, int]:
+        """Re-derive historical trips from the data as it stands today.
+
+        See `TripStorage.async_heal_history`. Replays the cost pool
+        afterwards, since the energy figures it withdraws just changed.
+        """
+        counts = await self.storage.async_heal_history(self.battery_capacity)
+        try:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                default_price=self._current_energy_price(),
+            )
+        except Exception:  # pragma: no cover — defensive
+            _LOGGER.exception("Cost replay after heal_history failed")
+        self.last_trip = await self.storage.async_get_last()
+        self._notify_listeners()
+        self._notify_trip_log_listeners()
+        return counts
 
     async def async_set_trip_service(
         self, *, trip_id: int, fields: dict[str, Any]
@@ -5484,6 +5805,37 @@ class EvTripLoggerCoordinator:
                 "set_trip: trip_id=%s not found or no editable fields", trip_id,
             )
             return None
+        # v0.8.17 — `_update_trip` is a raw column UPDATE, so correcting
+        # an input used to leave this row's own derived fields stale and
+        # self-contradictory: fixing a trip's `soc_start` left
+        # `soc_used_pct` (and any kWh/100km built on it) still quoting
+        # the old value, so the row disagreed with the very columns those
+        # numbers are computed from. The recompute pass below only
+        # touches cost, never these. Redo the two that depend on nothing
+        # but this row.
+        derived: dict[str, Any] = {}
+        if ({"soc_start", "soc_end"} & fields.keys()
+                and updated.soc_start is not None
+                and updated.soc_end is not None):
+            derived["soc_used_pct"] = round(
+                float(updated.soc_start) - float(updated.soc_end), 1
+            )
+        if ({"energy_kwh", "distance_km"} & fields.keys()
+                and updated.energy_kwh is not None
+                and updated.distance_km):
+            derived["consumption_kwh_100km"] = round(
+                float(updated.energy_kwh) / float(updated.distance_km) * 100.0,
+                2,
+            )
+        if derived:
+            repatched = await self.storage.async_update_trip(trip_id, derived)
+            if repatched is not None:
+                updated = repatched
+                _LOGGER.info(
+                    "set_trip: recomputed %s for trip #%s after the patch",
+                    sorted(derived), trip_id,
+                )
+
         # Refresh in-memory caches.
         if self.last_trip is not None and self.last_trip.trip_id == trip_id:
             self.last_trip = updated
@@ -5526,6 +5878,16 @@ class EvTripLoggerCoordinator:
             self.last_charge = updated
         else:
             self.last_charge = await self.storage.async_get_last_charge()
+        # v0.8.17 — this path mutates a WAC input (kWh, price,
+        # timestamps, or the row's existence), so the pool has to be
+        # replayed. Without it every trip cost stayed wrong until an
+        # unrelated trip closed or HA restarted.
+        try:
+            await self.storage.async_recompute_trip_costs_from_charges(
+                default_price=self._current_energy_price(),
+            )
+        except Exception:  # pragma: no cover — defensive
+            _LOGGER.exception("Cost replay after %s failed", "set_charge")
         self.hass.bus.async_fire(
             EVENT_CHARGE_LOGGED,
             {"entry_id": self.entry_id, **updated.to_dict()},
@@ -6161,6 +6523,14 @@ class EvTripLoggerCoordinator:
                 round(energy * self._trip_cost_price_per_kwh(), 2)
                 if energy is not None and energy > 0 else None
             )
+            # v0.8.17 — recorder history hands back UTC-aware stamps
+            # while every live insert uses `dt_util.now()` (local). Rows
+            # are ISO TEXT and "most recent" orders by that text, so a
+            # '+00:00' row sorted two hours early and landed ahead of a
+            # trip that really preceded it (2026-08-19: the recovered
+            # 13:55 leg listed before the 12:15 one).
+            s_ts = dt_util.as_local(s_ts)
+            e_ts = dt_util.as_local(e_ts)
             record = TripRecord(
                 started_at=s_ts, ended_at=e_ts,
                 duration_min=duration_min, distance_km=distance,
@@ -6976,6 +7346,38 @@ class EvTripLoggerCoordinator:
         if raw is None:
             return None
         return raw.strip().lower() in _CHARGING_STATES
+
+    def _charge_still_delivering(self) -> bool:
+        """True while an open charge session is genuinely still charging.
+
+        v0.8.17 — sitting in the car during a DCFC stop (screens, AC,
+        route planning) raises `vehicle_on` while the cable is still
+        pushing tens of kW. The v0.5.16 mutual-exclusion rule reacted by
+        force-closing the charge and opening a trip immediately, which
+        wrecked both records at once. Observed 2026-08-19: the charge was
+        cut 27 min before the cable stopped (its remaining SoC 67 → 96 %
+        never landed anywhere, and the truncated row was then dropped by
+        the 2 h dedup), while the trip anchored `soc_start` to 67 % and
+        closed at 78 %, i.e. `soc_used = -11 %`, so its energy fell
+        through to the distance-based estimate.
+
+        The odometer is the escape hatch: if the car has moved ≥1 km
+        since the session opened, the charge sensor is stuck 'on' and the
+        trip has to open regardless.
+        """
+        if self.current_charge is None or self._charge_sensor is None:
+            return False
+        if self._read_is_charging(self._charge_sensor) is not True:
+            return False
+        started_odo = self.current_charge.odometer_at_start
+        odo_now = self._read_float(self._odometer)
+        if (
+            started_odo is not None
+            and odo_now is not None
+            and odo_now - started_odo >= 1.0
+        ):
+            return False
+        return True
 
     def _read_is_charging(self, entity_id: str | None) -> bool | None:
         return self._is_charging_value(self._read_state(entity_id))

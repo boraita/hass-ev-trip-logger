@@ -15,6 +15,58 @@ from homeassistant.util import dt as dt_util
 
 from .const import STORAGE_FILENAME_TEMPLATE
 
+
+# v0.8.17 — distance-weighted consumption, over rows that carry BOTH
+# columns. `AVG(consumption_kwh_100km)` is a mean of ratios: it gave a
+# 2 km cold-start the same weight as a 200 km motorway run (2 km at 40
+# and 200 km at 15 averaged to 27.5 instead of 15.25). A plain
+# SUM(e)/SUM(d) is not enough either — SUM skips NULL energy while the
+# same row's kilometres still land in the denominator, understating the
+# result. Both sides are restricted to the same subset.
+_WEIGHTED = (
+    "CASE WHEN energy_kwh IS NOT NULL AND energy_kwh > 0 "
+    "AND distance_km IS NOT NULL AND distance_km > 0 THEN {col} END"
+)
+_WEIGHTED_CONSUMPTION_SQL = (
+    "CASE WHEN SUM(" + _WEIGHTED.format(col="distance_km") + ") > 0 "
+    "THEN SUM(" + _WEIGHTED.format(col="energy_kwh") + ") / "
+    "SUM(" + _WEIGHTED.format(col="distance_km") + ") * 100.0 "
+    "ELSE NULL END"
+)
+# v0.8.17 — real average speed = total distance / total time. `AVG(
+# avg_speed_kmh)` is a mean of means: 29 city trips of 5 km/20 min plus
+# one 400 km/4 h motorway run averaged to 18.2 km/h when the true figure
+# is 39.9. The three 30-day sensors used to contradict each other —
+# distance / duration did not equal the published speed.
+_SPEED_SUBSET = (
+    "CASE WHEN distance_km IS NOT NULL AND distance_km > 0 "
+    "AND duration_min IS NOT NULL AND duration_min > 0 THEN {col} END"
+)
+_WEIGHTED_SPEED_SQL = (
+    "CASE WHEN SUM(" + _SPEED_SUBSET.format(col="duration_min") + ") > 0 "
+    "THEN SUM(" + _SPEED_SUBSET.format(col="distance_km") + ") / "
+    "SUM(" + _SPEED_SUBSET.format(col="duration_min") + ") * 60.0 "
+    "ELSE NULL END"
+)
+
+
+def _iso_local(value: datetime) -> str:
+    """Serialise a datetime as local-time ISO.
+
+    v0.8.17 — rows are stored as ISO TEXT and every "most recent" query
+    orders by `ended_at` as a STRING, so two rows written with different
+    UTC offsets do not compare correctly: a row stamped '+00:00' sorts as
+    if it happened `utcoffset` earlier than it really did. The live paths
+    all use `dt_util.now()` (local), but the recovery sweep takes stamps
+    straight from the recorder (UTC) and the correction services take
+    whatever the caller passed — a naive datetime serialises with no
+    offset at all and sorts below everything. Normalising on the way in
+    keeps the text ordering equal to the chronological ordering.
+    """
+    if value.tzinfo is None:
+        return dt_util.as_local(value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)).isoformat()
+    return dt_util.as_local(value).isoformat()
+
 _LOGGER = logging.getLogger(__name__)
 
 _SCHEMA = """
@@ -460,6 +512,11 @@ class TripStorage:
         self._path = Path(hass.config.path(".storage")) / STORAGE_FILENAME_TEMPLATE.format(
             entry_id=entry_id
         )
+        # v0.8.17 — effective battery capacity, published by the
+        # coordinator's `battery_capacity` property. The WAC replay uses
+        # it to re-anchor its pool to the physical pack; None keeps the
+        # old purely-additive behaviour.
+        self.capacity_hint_kwh: float | None = None
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -699,8 +756,8 @@ class TripStorage:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    record.started_at.isoformat(),
-                    record.ended_at.isoformat(),
+                    _iso_local(record.started_at),
+                    _iso_local(record.ended_at),
                     record.duration_min,
                     record.distance_km,
                     record.odometer_start,
@@ -967,7 +1024,7 @@ class TripStorage:
             if k not in self._TRIP_USER_EDITABLE or v is None:
                 continue
             if isinstance(v, datetime):
-                clean[k] = v.isoformat()
+                clean[k] = _iso_local(v)
             else:
                 clean[k] = v
         if not clean:
@@ -1607,10 +1664,16 @@ class TripStorage:
     ) -> tuple[float | None, int]:
         with self._connect() as conn:
             rows = conn.execute(
+                # v0.8.17 — chronological, not insertion order. The
+                # v0.8.13/v0.8.14 sweep fixed this for recent_charges,
+                # recent_trips and the capacity query but missed here:
+                # importing historical charges via `log_charge` gives
+                # them ids above every live row, so this "recent N"
+                # window would be computed entirely from the import.
                 "SELECT charging_efficiency_pct FROM charges "
                 "WHERE charging_efficiency_pct IS NOT NULL "
                 "  AND charging_efficiency_pct > 0 "
-                "ORDER BY id DESC LIMIT ?",
+                "ORDER BY ended_at DESC, id DESC LIMIT ?",
                 (window,),
             ).fetchall()
         samples = [float(r[0]) for r in rows if r[0] is not None]
@@ -1652,10 +1715,13 @@ class TripStorage:
     ) -> tuple[float | None, int]:
         with self._connect() as conn:
             rows = conn.execute(
+                # v0.8.17 — chronological, not insertion order (same
+                # class of bug as above; a recovery sweep backfilling
+                # old trips would otherwise dominate this window).
                 "SELECT calibration_factor_k FROM trips "
                 "WHERE calibration_factor_k IS NOT NULL "
                 "  AND calibration_factor_k > 0 "
-                "ORDER BY id DESC LIMIT ?",
+                "ORDER BY ended_at DESC, id DESC LIMIT ?",
                 (window,),
             ).fetchall()
         samples = [float(r[0]) for r in rows if r[0] is not None]
@@ -1738,17 +1804,48 @@ class TripStorage:
                     COALESCE(SUM(cost), 0) AS cost,
                     COALESCE(SUM(regen_kwh), 0) AS regen,
                     COALESCE(SUM(discharge_kwh), 0) AS discharge,
-                    COUNT(*) AS count
+                    COUNT(*) AS count,
+                    -- v0.8.17 — the consumption ratio needs the same
+                    -- subset on both sides. SUM(energy_kwh) skips rows
+                    -- whose energy is NULL while SUM(distance_km) keeps
+                    -- their kilometres, so one 100 km trip with no
+                    -- energy reading dragged a true 15.0 kWh/100km down
+                    -- to 13.3 — and that figure drives the remaining-
+                    -- range estimate, which then read 495 km instead of
+                    -- 440. Same shape for regen_ratio below.
+                    COALESCE(SUM(CASE WHEN energy_kwh IS NOT NULL
+                        AND energy_kwh > 0 AND distance_km IS NOT NULL
+                        AND distance_km > 0 THEN distance_km END), 0)
+                        AS measured_distance,
+                    COALESCE(SUM(CASE WHEN energy_kwh IS NOT NULL
+                        AND energy_kwh > 0 AND distance_km IS NOT NULL
+                        AND distance_km > 0 THEN energy_kwh END), 0)
+                        AS measured_energy,
+                    COALESCE(SUM(CASE WHEN regen_kwh IS NOT NULL
+                        AND discharge_kwh IS NOT NULL AND discharge_kwh > 0
+                        THEN regen_kwh END), 0) AS paired_regen,
+                    COALESCE(SUM(CASE WHEN regen_kwh IS NOT NULL
+                        AND discharge_kwh IS NOT NULL AND discharge_kwh > 0
+                        THEN discharge_kwh END), 0) AS paired_discharge
                 FROM trips WHERE started_at >= ?
                 """,
                 (since.isoformat(),),
             ).fetchone()
-        distance, energy, cost, regen, discharge, count = row
-        avg_consumption = (energy / distance * 100) if distance else 0
+        (
+            distance, energy, cost, regen, discharge, count,
+            measured_distance, measured_energy,
+            paired_regen, paired_discharge,
+        ) = row
+        avg_consumption = (
+            (measured_energy / measured_distance * 100)
+            if measured_distance else 0
+        )
         # v0.6.0: regen_ratio = recovered / gross_discharge. Mirrors
         # the EV-app convention so dashboards can render "you got 18 %
         # back from braking this month" without bespoke template math.
-        regen_ratio = (regen / discharge) if discharge else 0.0
+        regen_ratio = (
+            (paired_regen / paired_discharge) if paired_discharge else 0.0
+        )
         return {
             "distance_km": float(distance),
             "energy_kwh": float(energy),
@@ -1775,8 +1872,8 @@ class TripStorage:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    record.started_at.isoformat() if record.started_at else None,
-                    record.ended_at.isoformat(),
+                    _iso_local(record.started_at) if record.started_at else None,
+                    _iso_local(record.ended_at),
                     record.kwh,
                     record.price_per_kwh,
                     record.total_cost,
@@ -1879,7 +1976,7 @@ class TripStorage:
             if k not in self._CHARGE_USER_EDITABLE or v is None:
                 continue
             if isinstance(v, datetime):
-                clean[k] = v.isoformat()
+                clean[k] = _iso_local(v)
             elif k == "is_dcfc":
                 clean[k] = 1 if bool(v) else 0
             else:
@@ -1901,17 +1998,37 @@ class TripStorage:
             cur = conn.execute(f"UPDATE charges SET {cols} WHERE id = ?", params)
             if not cur.rowcount:
                 return None
-            # If kwh changed and price_per_kwh exists, recompute total_cost.
+            # v0.8.17 — the money paid is an INPUT, not a derived value.
+            # This used to recompute `total_cost = kwh × price`, so
+            # correcting a charge's kWh to the battery-side truth
+            # silently rewrote a €20.00 invoice to €19.00. When a total
+            # is on record we re-derive the €/kWh from it instead; only
+            # when there is no total (or it was patched in this same
+            # call) do we compute the total from the price.
             if "kwh" in clean:
                 row = conn.execute(
-                    "SELECT kwh, price_per_kwh FROM charges WHERE id = ?",
+                    "SELECT kwh, price_per_kwh, total_cost "
+                    "FROM charges WHERE id = ?",
                     (charge_id,),
                 ).fetchone()
-                if row and row["price_per_kwh"] is not None:
-                    conn.execute(
-                        "UPDATE charges SET total_cost = ? WHERE id = ?",
-                        (float(row["kwh"]) * float(row["price_per_kwh"]), charge_id),
-                    )
+                if row:
+                    new_kwh = float(row["kwh"] or 0.0)
+                    total = row["total_cost"]
+                    if (
+                        "total_cost" not in clean
+                        and total is not None
+                        and float(total) > 0
+                        and new_kwh > 0
+                    ):
+                        conn.execute(
+                            "UPDATE charges SET price_per_kwh = ? WHERE id = ?",
+                            (float(total) / new_kwh, charge_id),
+                        )
+                    elif row["price_per_kwh"] is not None:
+                        conn.execute(
+                            "UPDATE charges SET total_cost = ? WHERE id = ?",
+                            (new_kwh * float(row["price_per_kwh"]), charge_id),
+                        )
             # v0.5.95 — if evse_energy_kwh was patched, recompute the
             # AC→DC efficiency from current kwh on row. Skip when evse is
             # zero / missing (efficiency undefined). When kwh was also
@@ -2222,11 +2339,22 @@ class TripStorage:
                 """
                 UPDATE trips SET
                     energy_kwh = ROUND(soc_used_pct * ? / 100.0, 4),
-                    consumption_kwh_100km = ROUND(
-                        soc_used_pct * ? / 100.0 / distance_km * 100.0, 4
-                    )
+                    consumption_kwh_100km = CASE
+                        WHEN consumption_kwh_100km IS NULL THEN NULL
+                        ELSE ROUND(
+                            soc_used_pct * ? / 100.0 / distance_km * 100.0, 4
+                        )
+                    END
                 WHERE soc_used_pct IS NOT NULL AND soc_used_pct > 0
                   AND distance_km IS NOT NULL AND distance_km > 0
+                  -- v0.8.17 — 'soc_plus_charge' rows already fold a
+                  -- metered charge into their energy; rescaling them by
+                  -- capacity alone would corrupt that. And a NULL
+                  -- consumption is a deliberate suppression (v0.8.15
+                  -- parked disconnect-orphans, v0.8.17 SoC-rose trips),
+                  -- so the CASE above keeps it NULL instead of
+                  -- resurrecting a figure the close path refused to
+                  -- publish.
                   AND (energy_source IS NULL
                        OR energy_source IN ('soc', 'estimated'))
                 """,
@@ -2318,13 +2446,29 @@ class TripStorage:
             avg_per_100 = (total_kwh / total_km * 100.0) if total_km else None
 
             if avg_per_100 and avg_per_100 > 0:
+                # v0.8.17 — two corrections:
+                #  * `orphan_odo_only` rows have NULL energy ON PURPOSE
+                #    (km appeared but SoC never dropped — a catch-up
+                #    odometer snapshot whose kilometres were already
+                #    consumed under another row). Fabricating energy for
+                #    them invented withdrawals that drained the pool and
+                #    pushed later real trips onto the fallback tariff.
+                #  * stamp `energy_source = 'estimated'` on whatever we
+                #    do fill, so `_avg_consumption_kwh_per_100km` — which
+                #    excludes 'estimated' precisely to avoid feeding
+                #    estimates back into the baseline — actually excludes
+                #    them. Without the stamp they stayed NULL-sourced and
+                #    slipped straight back into the average that produced
+                #    them.
                 conn.execute(
                     """
                     UPDATE trips SET
                         energy_kwh = distance_km * ? / 100.0,
-                        consumption_kwh_100km = ?
+                        consumption_kwh_100km = ?,
+                        energy_source = 'estimated'
                     WHERE (energy_kwh IS NULL OR energy_kwh <= 0)
                       AND distance_km IS NOT NULL AND distance_km > 0
+                      AND COALESCE(confidence, '') != 'orphan_odo_only'
                     """,
                     (avg_per_100, avg_per_100),
                 )
@@ -2342,14 +2486,24 @@ class TripStorage:
             # pool at whatever the blended average currently is — so a
             # free charge lowers the cost per km smoothly across all the
             # driving it covers instead of zeroing then snapping back.
+            # v0.8.17 — no ORDER BY here. The replay used to order by
+            # `started_at` and then consume the queue on `ended_at`,
+            # assuming the two agree. They do not, and the mismatch
+            # caused head-of-line blocking that dropped charges from the
+            # pool entirely: `started_at IS NULL` sorted FIRST (the
+            # documented shape of a `log_charge` with no start time), so
+            # one such row with a late `ended_at` stalled every charge
+            # behind it for the rest of the replay. A long overnight
+            # session did the same to every charge that ended during it.
+            # Ordering by an ISO TEXT column is also wrong whenever two
+            # rows carry different UTC offsets — including one hour every
+            # year at the DST fall-back. So: fetch, parse, sort by the
+            # real instant in Python.
             charge_rows = conn.execute(
                 """
-                SELECT ended_at, kwh, price_per_kwh
+                SELECT ended_at, kwh, price_per_kwh, total_cost,
+                       soc_start, soc_end
                 FROM charges
-                ORDER BY
-                    CASE WHEN started_at IS NULL THEN 0 ELSE 1 END,
-                    started_at,
-                    id
                 """
             ).fetchall()
             # v0.5.79 — normalise tz: older rows persisted as tz-naive,
@@ -2365,10 +2519,16 @@ class TripStorage:
                 except (TypeError, ValueError):
                     return None
                 if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
+                    # v0.8.17 — naive rows were written by the live paths
+                    # before v0.8.17, i.e. in LOCAL time. Reading them as
+                    # UTC shifted them 1-2 h into the future and
+                    # reordered them against tz-aware rows, so a charge
+                    # could land after a trip it really preceded and that
+                    # trip fell to the fallback tariff.
+                    ts = ts.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
                 return ts
 
-            pending_charges: deque[tuple[datetime, float, float]] = deque()
+            parsed_charges: list[tuple[datetime, float, float, float | None]] = []
             for r in charge_rows:
                 ts = _as_utc(r["ended_at"])
                 if ts is None:
@@ -2376,8 +2536,33 @@ class TripStorage:
                 kwh = float(r["kwh"] or 0.0)
                 if kwh <= 0:
                     continue
-                pp = float(r["price_per_kwh"] or 0.0)
-                pending_charges.append((ts, kwh, pp))
+                # v0.8.17 — the money paid is the input, the €/kWh is
+                # derived. Pricing the pool off `price_per_kwh` loses the
+                # charging losses whenever that price was billed on the
+                # charger side (a public tariff always is) while `kwh` is
+                # the battery-side figure: measured on this car, 402.88
+                # kWh metered against 365.17 kWh into the battery, so
+                # 9.4 % of the energy actually paid for reached no trip.
+                # `total_cost / kwh` conserves money by construction and
+                # is exactly "what the driving cost".
+                total_cost = r["total_cost"]
+                if total_cost is not None and float(total_cost) > 0:
+                    pp = float(total_cost) / kwh
+                else:
+                    pp = float(r["price_per_kwh"] or 0.0)
+                soc_start_c = (
+                    float(r["soc_start"]) if r["soc_start"] is not None else None
+                )
+                soc_end = (
+                    float(r["soc_end"]) if r["soc_end"] is not None else None
+                )
+                parsed_charges.append((ts, kwh, pp, soc_start_c, soc_end))
+            parsed_charges.sort(key=lambda c: c[0])
+            pending_charges: deque[
+                tuple[datetime, float, float, float | None, float | None]
+            ] = deque(parsed_charges)
+
+            capacity = self.capacity_hint_kwh
 
             pool_kwh = 0.0
             pool_avg_price = 0.0
@@ -2385,11 +2570,15 @@ class TripStorage:
                 """
                 SELECT id, started_at, energy_kwh
                 FROM trips
-                ORDER BY started_at, id
                 """
             ).fetchall()
 
-            updated = 0
+            # v0.8.17 — sort by the parsed instant, not by the ISO text.
+            # Text ordering put a row stamped '+00:00' two hours before
+            # its real position, so an EARLIER trip could be replayed
+            # after a later one and inherit a pool holding energy that
+            # did not exist yet.
+            parsed_trips: list[tuple[datetime, int, float]] = []
             for trow in trip_rows:
                 energy = trow["energy_kwh"]
                 if energy is None or float(energy) <= 0:
@@ -2397,32 +2586,86 @@ class TripStorage:
                 trip_started = _as_utc(trow["started_at"])
                 if trip_started is None:
                     continue
+                parsed_trips.append(
+                    (trip_started, int(trow["id"]), float(energy))
+                )
+            parsed_trips.sort(key=lambda t: (t[0], t[1]))
+
+            updated = 0
+            for trip_started, trip_id_, energy in parsed_trips:
                 # Advance: charges with ended_at <= trip_started blend
                 # into the pool now — new_avg is the kWh-weighted mean
                 # of what was already there and what just arrived.
                 while pending_charges and pending_charges[0][0] <= trip_started:
-                    _ts, c_kwh, c_price = pending_charges.popleft()
+                    (
+                        _ts, c_kwh, c_price, c_soc_start, c_soc_end,
+                    ) = pending_charges.popleft()
+                    # v0.8.17 — re-anchor BEFORE blending too. The blend
+                    # weights the pool's existing kWh against the
+                    # incoming ones, so if the pool still carries energy
+                    # that physically left the battery (standby drain, or
+                    # driving the logger never saw) the old cheap price
+                    # gets far more weight than it deserves. `soc_start`
+                    # says exactly what was in the pack when the cable
+                    # went in.
+                    if capacity and c_soc_start is not None:
+                        if pool_avg_price <= 0:
+                            # Opening inventory of unknown price — the
+                            # battery was not empty when tracking began.
+                            # Pricing it at 0 would report it as free
+                            # forever; the incoming charge's price is the
+                            # closest thing to evidence we have.
+                            pool_avg_price = c_price
+                        pool_kwh = max(0.0, c_soc_start / 100.0 * capacity)
                     new_pool_kwh = pool_kwh + c_kwh
                     pool_avg_price = (
                         (pool_kwh * pool_avg_price + c_kwh * c_price) / new_pool_kwh
                         if new_pool_kwh > 0 else c_price
                     )
                     pool_kwh = new_pool_kwh
+                    # v0.8.17 — re-anchor QUANTITY to the physical pack;
+                    # the pool keeps tracking PRICE only. The additive
+                    # pool had no sink for energy that leaves the battery
+                    # without being a trip (standby drain,
+                    # preconditioning, parked climate) and no opening
+                    # inventory for the charge the battery already held
+                    # on day one, so it drifted in both directions at
+                    # once: measured on this car, trips consumed 73.78
+                    # kWh MORE than was ever charged, while the pool was
+                    # free to exceed the pack's physical capacity. After
+                    # a charge closes the battery's real content is known
+                    # exactly — soc_end — so use it and let the drift go.
+                    if capacity and c_soc_end is not None:
+                        pool_kwh = max(0.0, c_soc_end / 100.0 * capacity)
+                    elif capacity:
+                        pool_kwh = min(pool_kwh, capacity)
 
                 energy_f = float(energy)
                 from_pool = min(energy_f, pool_kwh)
                 from_fallback = energy_f - from_pool
-                # Fall back to home tariff for whatever the pool
-                # couldn't cover (typical at startup before any charge
-                # was logged, or if a trip's energy estimate outruns
-                # what's been tracked as charged).
-                cost_accum = from_pool * pool_avg_price + from_fallback * price
+                # v0.8.17 — price the shortfall at the blend seen SO FAR
+                # rather than at the configured home tariff. The tariff
+                # was the cheapest assumption available, applied exactly
+                # when the driver is on a motorway paying DC prices. The
+                # running average is strictly better information and,
+                # unlike a whole-history average, it stays causal: only
+                # charges that already happened can influence this trip,
+                # so a charge logged tomorrow can never re-price
+                # yesterday's driving. Before the first charge there is
+                # nothing but the tariff, so that is what gets used.
+                fallback_price = (
+                    pool_avg_price if pool_avg_price > 0 else price
+                )
+                cost_accum = (
+                    from_pool * pool_avg_price
+                    + from_fallback * fallback_price
+                )
                 pool_kwh = max(0.0, pool_kwh - energy_f)
                 basis = cost_accum / energy_f if energy_f > 0 else None
                 cur = conn.execute(
                     "UPDATE trips SET cost = ?, cost_basis_per_kwh = ? "
                     "WHERE id = ?",
-                    (round(cost_accum, 4), round(basis, 6) if basis is not None else None, trow["id"]),
+                    (round(cost_accum, 4), round(basis, 6) if basis is not None else None, trip_id_),
                 )
                 if cur.rowcount:
                     updated += 1
@@ -2474,7 +2717,19 @@ class TripStorage:
             if not row:
                 return None
             new_kwh = float(row["kwh"] or 0) + float(extra_kwh)
-            new_total = new_kwh * float(row["price_per_kwh"] or 0)
+            # v0.8.17 — ADD the pulse's cost instead of re-deriving the
+            # whole row from the price. Re-deriving multiplied any fixed
+            # component of the bill: a €6.00 invoice on 10 kWh (€5
+            # energy + €1 connection fee) locks the price at 0.60, and a
+            # second 10 kWh pulse turned the row into €12.00 when the
+            # real bill is €11.00.
+            prev_total = row["total_cost"]
+            unit_price = float(row["price_per_kwh"] or 0)
+            new_total = (
+                float(prev_total) + float(extra_kwh) * unit_price
+                if prev_total is not None
+                else new_kwh * unit_price
+            )
             new_soc_end = (
                 float(soc_end) if soc_end is not None else row["soc_end"]
             )
@@ -2565,8 +2820,14 @@ class TripStorage:
                     COUNT(*) AS count,
                     COALESCE(SUM(CASE WHEN is_dcfc = 1 THEN kwh ELSE 0 END), 0) AS dc_kwh,
                     COALESCE(SUM(CASE WHEN is_dcfc = 1 THEN total_cost ELSE 0 END), 0) AS dc_cost,
-                    COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN kwh ELSE 0 END), 0) AS ac_kwh,
-                    COALESCE(SUM(CASE WHEN is_dcfc = 0 THEN total_cost ELSE 0 END), 0) AS ac_cost,
+                    -- v0.8.17 — NULL is_dcfc counted as neither, so
+                    -- ac_kwh + dc_kwh < kwh and the AC average silently
+                    -- excluded those sessions. `is_dcfc` is left NULL
+                    -- whenever log_charge runs without a start time or
+                    -- the session is under 3 min. Treat NULL as AC, the
+                    -- convention _lifetime_dcfc_ratio already documents.
+                    COALESCE(SUM(CASE WHEN COALESCE(is_dcfc, 0) = 0 THEN kwh ELSE 0 END), 0) AS ac_kwh,
+                    COALESCE(SUM(CASE WHEN COALESCE(is_dcfc, 0) = 0 THEN total_cost ELSE 0 END), 0) AS ac_cost,
                     COALESCE(SUM(
                         CASE WHEN evse_energy_kwh IS NOT NULL
                                   AND evse_energy_kwh > 0
@@ -2684,11 +2945,202 @@ class TripStorage:
             for b in sorted(sums)
             if dists[b] > 0
         }
+        # v0.8.17 — hand the weights out too. The per-bucket figures are
+        # correctly distance-weighted, and then the sensor's "no live
+        # temp" fallback averaged the bucket LABELS equally: a single
+        # 6 km January trip at 22.0 against 4 000 km of summer at 14.5
+        # came out as 18.25 instead of 14.51. `sample_count` also used
+        # to count rows FETCHED, including the ones the loop skips for
+        # having no usable distance.
         return {
             "by_bucket": by_bucket,
+            "bucket_distance_km": {
+                str(b): round(dists[b], 1) for b in sorted(dists)
+            },
             "bucket_size_c": bucket_size_c,
-            "sample_count": len(rows),
+            "sample_count": sum(
+                1 for _t, _c, d in rows if d is not None and d > 0
+            ),
         }
+
+    async def async_heal_history(
+        self, battery_capacity_kwh: float
+    ) -> dict[str, int]:
+        """v0.8.17 — re-derive historical trips from data that exists NOW.
+
+        Two things changed under these rows after they were written:
+
+        1. Charges were recovered. `kwh_charged_before` / `_during` are
+           computed once, at trip close, so a charge inserted afterwards
+           (by `log_charge`, `set_charge`, or a recovery sweep) is
+           invisible to every trip around it — and with it the v0.8.17
+           correction that folds a mid-trip charge into the trip's
+           energy. Both fields are recomputed here from the charges
+           table as it stands, and the energy correction reapplied.
+
+        2. The SoC anchor was bounded. Rows written before that could
+           carry a `soc_start` ABOVE the previous trip's `soc_end` with
+           no charge in between, which is physically impossible while
+           parked: standby drain only ever removes charge. Those rows
+           are re-anchored to the last actually-measured value.
+
+        Nothing is modelled or invented: a rise that a real charge
+        explains is left alone, and a row whose energy came from an
+        independent measurement (`power_integration`, `vehicle`) keeps
+        that energy — only its SoC bookkeeping is made consistent.
+
+        Returns per-action counts. Call the cost replay afterwards.
+        """
+        return await self._hass.async_add_executor_job(
+            self._heal_history, float(battery_capacity_kwh),
+        )
+
+    def _heal_history(self, capacity: float) -> dict[str, int]:
+        def _parse(value: str | None) -> datetime | None:
+            if not value:
+                return None
+            try:
+                ts = datetime.fromisoformat(value)
+            except (TypeError, ValueError):
+                return None
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+            return ts
+
+        counts = {
+            "trips_seen": 0,
+            "charge_attribution_fixed": 0,
+            "soc_start_reanchored": 0,
+            "energy_recomputed": 0,
+            "consumption_suppressed": 0,
+        }
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            charges = []
+            for r in conn.execute(
+                "SELECT started_at, ended_at, kwh FROM charges"
+            ).fetchall():
+                end = _parse(r["ended_at"])
+                if end is None:
+                    continue
+                start = _parse(r["started_at"]) or end
+                kwh = float(r["kwh"] or 0.0)
+                if kwh <= 0:
+                    continue
+                charges.append((start, end, kwh))
+
+            trips = []
+            for r in conn.execute(
+                """
+                SELECT id, started_at, ended_at, soc_start, soc_end,
+                       soc_used_pct, energy_kwh, energy_source, distance_km,
+                       consumption_kwh_100km, kwh_charged_before,
+                       kwh_charged_during
+                FROM trips
+                """
+            ).fetchall():
+                start = _parse(r["started_at"])
+                end = _parse(r["ended_at"])
+                if start is None or end is None:
+                    continue
+                trips.append((start, end, dict(r)))
+            trips.sort(key=lambda item: (item[0], item[2]["id"]))
+
+            prev_end_ts: datetime | None = None
+            prev_soc_end: float | None = None
+            for start, end, row in trips:
+                counts["trips_seen"] += 1
+                updates: dict[str, Any] = {}
+
+                # --- charge attribution, from the charges that exist now
+                during = sum(
+                    kwh for c_start, c_end, kwh in charges
+                    if c_end >= start and c_start <= end
+                )
+                before = 0.0
+                if prev_end_ts is not None and prev_end_ts < start:
+                    before = sum(
+                        kwh for _cs, c_end, kwh in charges
+                        if prev_end_ts <= c_end <= start
+                    )
+                new_during = round(during, 2) if during > 0 else None
+                new_before = round(before, 2) if before > 0 else None
+                if (
+                    new_during != row["kwh_charged_during"]
+                    or new_before != row["kwh_charged_before"]
+                ):
+                    updates["kwh_charged_during"] = new_during
+                    updates["kwh_charged_before"] = new_before
+                    counts["charge_attribution_fixed"] += 1
+
+                # --- provably impossible SoC rise while parked
+                soc_start = row["soc_start"]
+                if (
+                    soc_start is not None
+                    and prev_soc_end is not None
+                    and float(soc_start) > float(prev_soc_end)
+                    and new_during is None
+                    and new_before is None
+                ):
+                    soc_start = float(prev_soc_end)
+                    updates["soc_start"] = soc_start
+                    counts["soc_start_reanchored"] += 1
+
+                soc_end = row["soc_end"]
+                if soc_start is not None and soc_end is not None:
+                    soc_used = round(float(soc_start) - float(soc_end), 1)
+                    if soc_used != row["soc_used_pct"]:
+                        updates["soc_used_pct"] = soc_used
+                else:
+                    soc_used = row["soc_used_pct"]
+
+                # --- energy, only where it was NOT independently measured
+                distance = row["distance_km"]
+                if row["energy_source"] not in ("power_integration", "vehicle"):
+                    energy: float | None = None
+                    source: str | None = None
+                    if new_during is not None and soc_used is not None:
+                        candidate = (
+                            new_during + (float(soc_used) / 100.0) * capacity
+                        )
+                        if candidate > 0:
+                            energy, source = round(candidate, 2), "soc_plus_charge"
+                    elif soc_used is not None and float(soc_used) > 0:
+                        energy, source = (
+                            round(float(soc_used) / 100.0 * capacity, 2), "soc"
+                        )
+                    if energy is not None:
+                        if energy != row["energy_kwh"]:
+                            updates["energy_kwh"] = energy
+                            updates["energy_source"] = source
+                            counts["energy_recomputed"] += 1
+                        if distance and float(distance) > 0:
+                            updates["consumption_kwh_100km"] = round(
+                                energy / float(distance) * 100.0, 1
+                            )
+                    elif (
+                        soc_used is not None
+                        and float(soc_used) < 0
+                        and new_during is None
+                        and row["consumption_kwh_100km"] is not None
+                    ):
+                        # SoC rose, nothing charged: no honest per-km figure
+                        updates["consumption_kwh_100km"] = None
+                        updates["low_confidence"] = 1
+                        counts["consumption_suppressed"] += 1
+
+                if updates:
+                    cols = ", ".join(f"{k} = ?" for k in updates)
+                    conn.execute(
+                        f"UPDATE trips SET {cols} WHERE id = ?",
+                        list(updates.values()) + [row["id"]],
+                    )
+
+                prev_end_ts = end
+                prev_soc_end = (
+                    float(soc_end) if soc_end is not None else prev_soc_end
+                )
+        return counts
 
     async def async_export_csv(self, path: str) -> int:
         """Dump all trips to a CSV at `path`; returns row count."""
@@ -2986,26 +3438,31 @@ class TripStorage:
                     AVG(distance_km) AS d,
                     AVG(duration_min) AS dur,
                     AVG(energy_kwh) AS e,
-                    AVG(consumption_kwh_100km) AS c,
-                    AVG(avg_speed_kmh) AS s,
+                    {weighted_consumption} AS c,
+                    {weighted_speed} AS s,
                     AVG(regen_kwh) AS r,
                     SUM(duration_min) AS total_driving,
                     COUNT(*) AS n
                 FROM trips
                 WHERE started_at >= ?
-                """,
+                """.format(
+                    weighted_consumption=_WEIGHTED_CONSUMPTION_SQL,
+                    weighted_speed=_WEIGHTED_SPEED_SQL,
+                ),
                 (since.isoformat(),),
             ).fetchone()
         d, dur, e, c, s, r, total_driving, n = row
         return {
-            "avg_distance_km": float(d) if d else None,
-            "avg_duration_min": float(dur) if dur else None,
-            "avg_energy_kwh": float(e) if e else None,
-            "avg_consumption_kwh_100km": float(c) if c else None,
-            "avg_speed_kmh": float(s) if s else None,
+            # v0.8.17 — `if d` treated a legitimate 0.0 as missing and
+            # published "unknown"; the test is None-ness, not truthiness.
+            "avg_distance_km": float(d) if d is not None else None,
+            "avg_duration_min": float(dur) if dur is not None else None,
+            "avg_energy_kwh": float(e) if e is not None else None,
+            "avg_consumption_kwh_100km": float(c) if c is not None else None,
+            "avg_speed_kmh": float(s) if s is not None else None,
             # AVG() skips NULL rows, so trips without a power sensor
             # don't drag the regen mean toward zero.
-            "avg_regen_kwh": float(r) if r else None,
+            "avg_regen_kwh": float(r) if r is not None else None,
             "driving_time_min": float(total_driving) if total_driving else 0.0,
             "count": int(n or 0),
         }
@@ -3033,12 +3490,12 @@ class TripStorage:
                     COALESCE(SUM(distance_km), 0) AS km,
                     COALESCE(SUM(duration_min), 0) AS minutes,
                     COALESCE(SUM(energy_kwh), 0) AS kwh,
-                    AVG(consumption_kwh_100km) AS cons
+                    {weighted_consumption} AS cons
                 FROM trips
                 WHERE started_at >= ?
                 GROUP BY drv
                 ORDER BY km DESC
-                """,
+                """.format(weighted_consumption=_WEIGHTED_CONSUMPTION_SQL),
                 (since.isoformat(),),
             ).fetchall()
         return [
@@ -3343,7 +3800,12 @@ class TripStorage:
         )
 
     def _avg_soc_end_recent(self, days: int) -> float | None:
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        # v0.8.17 — dt_util.now(), like every other window in this file.
+        # datetime.now() is naive and in the HOST's timezone, so on a
+        # UTC container it built a cutoff both offset-shifted and
+        # missing a tzinfo, then compared it as TEXT against rows that
+        # carry one.
+        cutoff = (dt_util.now() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT AVG(soc_end) FROM charges "
@@ -3369,7 +3831,12 @@ class TripStorage:
         )
 
     def _avg_ambient_temp_recent(self, days: int) -> float | None:
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        # v0.8.17 — dt_util.now(), like every other window in this file.
+        # datetime.now() is naive and in the HOST's timezone, so on a
+        # UTC container it built a cutoff both offset-shifted and
+        # missing a tzinfo, then compared it as TEXT against rows that
+        # carry one.
+        cutoff = (dt_util.now() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT AVG(COALESCE(avg_temp_c, ambient_temp_c)) "
@@ -3398,7 +3865,13 @@ class TripStorage:
     def _aggregates_by_season(
         self, hemisphere: str,
     ) -> dict[str, dict[str, float | int]]:
-        # SQLite's strftime('%m', ts) returns the month with leading zero.
+        # v0.8.17 — read the month out of the stored local ISO text.
+        # SQLite's strftime() CONVERTS an offset-bearing string to UTC
+        # first, so a trip started 2026-03-01T00:30:00+02:00 was bucketed
+        # as February — while naive legacy rows were NOT shifted, so the
+        # same clock time landed in different buckets depending on which
+        # write path created the row.
+        # SQLite's month substring carries the leading zero.
         # Bucket via CASE so it's a single scan, no per-bucket query.
         n_to_s = {
             "winter": ("12", "01", "02"),
@@ -3422,10 +3895,10 @@ class TripStorage:
                         COUNT(*) AS n,
                         COALESCE(SUM(distance_km), 0) AS d,
                         COALESCE(SUM(energy_kwh), 0) AS e,
-                        AVG(consumption_kwh_100km) AS c,
+                        {_WEIGHTED_CONSUMPTION_SQL} AS c,
                         AVG(COALESCE(avg_temp_c, ambient_temp_c)) AS t
                     FROM trips
-                    WHERE strftime('%m', started_at) IN (?, ?, ?)
+                    WHERE substr(started_at, 6, 2) IN (?, ?, ?)
                       AND distance_km IS NOT NULL AND distance_km > 0
                     """,
                     months,
@@ -3477,7 +3950,7 @@ class TripStorage:
                         COUNT(*) AS n,
                         COALESCE(SUM(distance_km), 0) AS d,
                         COALESCE(SUM(energy_kwh), 0) AS e,
-                        AVG(consumption_kwh_100km) AS c
+                        {_WEIGHTED_CONSUMPTION_SQL} AS c
                     FROM trips
                     WHERE {predicate}
                       AND distance_km IS NOT NULL AND distance_km > 0
@@ -3500,7 +3973,7 @@ class TripStorage:
         """v0.5.54 — lifetime aggregates bucketed by local start hour.
 
         night 22–06, morning 06–12, midday 12–15, afternoon 15–19,
-        evening 19–22. Uses `strftime('%H', started_at)` — works
+        evening 19–22. Uses `substr(started_at, 12, 2)` — works
         because we store ISO strings with timezone offsets.
         """
         return await self._hass.async_add_executor_job(
@@ -3523,14 +3996,14 @@ class TripStorage:
             for name, (lo, hi) in buckets.items():
                 if name == "night":
                     where = (
-                        "CAST(strftime('%H', started_at) AS INTEGER) >= 22 "
-                        "OR CAST(strftime('%H', started_at) AS INTEGER) < 6"
+                        "CAST(substr(started_at, 12, 2) AS INTEGER) >= 22 "
+                        "OR CAST(substr(started_at, 12, 2) AS INTEGER) < 6"
                     )
                     params: tuple[Any, ...] = ()
                 else:
                     where = (
-                        "CAST(strftime('%H', started_at) AS INTEGER) >= ? "
-                        "AND CAST(strftime('%H', started_at) AS INTEGER) < ?"
+                        "CAST(substr(started_at, 12, 2) AS INTEGER) >= ? "
+                        "AND CAST(substr(started_at, 12, 2) AS INTEGER) < ?"
                     )
                     params = (lo, hi)
                 row = conn.execute(
@@ -3539,7 +4012,7 @@ class TripStorage:
                         COUNT(*) AS n,
                         COALESCE(SUM(distance_km), 0) AS d,
                         COALESCE(SUM(energy_kwh), 0) AS e,
-                        AVG(consumption_kwh_100km) AS c
+                        {_WEIGHTED_CONSUMPTION_SQL} AS c
                     FROM trips
                     WHERE ({where})
                       AND distance_km IS NOT NULL AND distance_km > 0

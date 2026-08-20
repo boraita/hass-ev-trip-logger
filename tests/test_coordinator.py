@@ -1334,11 +1334,15 @@ async def test_recent_trips_sensor_lists_trips_in_attributes(
     assert t["distance_km"] == pytest.approx(30.0)
     assert t["energy_kwh"] == pytest.approx(11.25)
     assert t["consumption_kwh_100km"] == pytest.approx(37.5)
-    # v0.5.76, WAC pool since v0.8.8 — 10 kWh @ 0.30 blended into the
-    # pool ahead of the trip → 10×0.30 + 1.25×0.15 (home fallback for
-    # the overflow) = 3.19 €. Each kWh is now priced at the rate it
-    # was charged at.
-    assert t["cost"] == pytest.approx(3.19, abs=0.01)
+    # v0.5.76, WAC pool since v0.8.8. v0.8.17 — the charge closed at
+    # 80 % SoC, so the pool is re-anchored to the pack's real content
+    # (0.80 × 75 = 60 kWh) instead of holding only the 10 kWh of this
+    # session: the battery was not empty before it. The whole 11.25 kWh
+    # withdrawal is therefore covered at the blended 0.30 → 3.38 €.
+    # Previously the pool held 10 kWh and the 1.25 kWh overflow was
+    # billed at the home tariff, which is the cheapest assumption
+    # available and the least likely to be true.
+    assert t["cost"] == pytest.approx(3.375, abs=0.01)
     assert t["score"] is not None  # depends on consumption
 
 
@@ -3485,3 +3489,465 @@ def test_integrate_evse_from_recorder_masks_idle_windows() -> None:
         window_start=t0,
         window_end=t0 + timedelta(hours=2),
     ) is None
+
+
+async def test_road_trip_second_dcfc_hop_within_2h_is_not_discarded(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — regression for the real 2026-08-19/20 data loss.
+
+    Two DCFC stops 50 min apart with a drive in between (SoC falls from
+    the first stop's end SoC before the second starts). The 2 h dedup
+    used to `return` and delete the second session's kWh outright —
+    ~150 kWh vanished across four days of a road trip. SoC dropping in
+    between proves the car was driven, so the second stop must land as
+    its own row.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(CHG, STATE_OFF)
+        entry = await _setup(hass, bat=20.0, **{CONF_CHARGE_SENSOR: CHG})
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        # --- stop #1: 20 % → 30 % (7.5 kWh at 75 kWh capacity)
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=10))
+        hass.states.async_set(BAT, "30")
+        await hass.async_block_till_done()
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+        first = coordinator.last_charge
+        assert first is not None
+        assert first.kwh == pytest.approx(7.5)
+
+        # --- drove 40 min: SoC falls below the first stop's end SoC
+        frozen.tick(timedelta(minutes=40))
+        hass.states.async_set(BAT, "25")
+        await hass.async_block_till_done()
+
+        # --- stop #2: 25 % → 60 % (26.25 kWh), 50 min after stop #1
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=15))
+        hass.states.async_set(BAT, "60")
+        await hass.async_block_till_done()
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+        charges = await coordinator.storage.async_recent_charges(10)
+        assert len(charges) == 2, "second DCFC hop was discarded"
+        second = coordinator.last_charge
+        assert second.charge_id != first.charge_id
+        assert second.soc_start == 25.0
+        assert second.soc_end == 60.0
+        assert second.kwh == pytest.approx(26.25)
+
+
+async def test_continuation_pulse_without_plug_proof_merges_not_drops(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — the 2026-08-17 case: one DCFC session the cloud split.
+
+    `charging` flickered off for 2 min mid-session and back on, with no
+    plug sensor to prove continuity. SoC never dropped, so it's the same
+    session — the tail must be merged into the existing row instead of
+    dropped on the floor.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(CHG, STATE_OFF)
+        entry = await _setup(hass, bat=40.0, **{CONF_CHARGE_SENSOR: CHG})
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        # --- pulse 1: 40 % → 55 % (11.25 kWh)
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=12))
+        hass.states.async_set(BAT, "55")
+        await hass.async_block_till_done()
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+        first_id = coordinator.last_charge.charge_id
+        assert coordinator.last_charge.kwh == pytest.approx(11.25)
+
+        # --- 2 min gap (cloud dropout), then the session resumes
+        frozen.tick(timedelta(minutes=2))
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=20))
+        hass.states.async_set(BAT, "80")
+        await hass.async_block_till_done()
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+        charges = await coordinator.storage.async_recent_charges(10)
+        assert len(charges) == 1, "continuation pulse fragmented the session"
+        merged = coordinator.last_charge
+        assert merged.charge_id == first_id
+        # 40 % → 80 % of 75 kWh, accumulated across both pulses
+        assert merged.kwh == pytest.approx(30.0)
+        assert merged.soc_end == 80.0
+
+
+async def test_vehicle_on_mid_charge_defers_trip_until_cable_stops(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — regression for the real 2026-08-19 trip/charge collision.
+
+    Turning the car on during a DCFC stop (screens, AC, planning the next
+    leg) used to force-close the charge and open a trip on the spot: the
+    session lost everything after that moment, and the trip anchored
+    `soc_start` to a SoC that was still climbing, ending with a negative
+    `soc_used`. Nothing should open until the cable stops.
+    """
+    hass.states.async_set(CHG, STATE_OFF)
+    entry = await _setup(hass, bat=20.0, **{CONF_CHARGE_SENSOR: CHG})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current_charge is not None
+
+    # Driver sits in the car while it keeps charging.
+    hass.states.async_set(BAT, "40")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+
+    assert coordinator.current is None, "trip opened while the cable was live"
+    assert coordinator.current_charge is not None, "charge was truncated"
+
+    # Charge runs to completion, then the cable stops.
+    hass.states.async_set(BAT, "96")
+    await hass.async_block_till_done()
+    hass.states.async_set(CHG, STATE_OFF)
+    await hass.async_block_till_done()
+
+    charge = coordinator.last_charge
+    assert charge is not None
+    assert charge.soc_end == 96.0
+    # 20 % → 96 % of 75 kWh, i.e. the full session, not a truncated slice
+    assert charge.kwh == pytest.approx(57.0)
+
+    # ...and the deferred trip opens now, anchored to the real end SoC.
+    assert coordinator.current is not None
+    assert coordinator.current.soc_start == 96.0
+
+
+async def test_stuck_charge_sensor_does_not_block_a_moving_car(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — the defer must not strand a trip when `charging` sticks on.
+
+    If the cloud leaves the charge sensor at 'on' after the cable is out,
+    odometer movement is the ground truth: ≥1 km since the session opened
+    means the car is driving and the trip has to open.
+    """
+    hass.states.async_set(CHG, STATE_OFF)
+    entry = await _setup(hass, bat=50.0, **{CONF_CHARGE_SENSOR: CHG})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current_charge is not None
+    assert coordinator.current_charge.odometer_at_start == 1000.0
+
+    # Charge sensor never goes off, but the car covers ground.
+    hass.states.async_set(ODO, "1004")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+
+    assert coordinator.current is not None, "trip stranded by a stuck sensor"
+
+
+async def test_soc_rise_without_charge_suppresses_estimated_consumption(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — don't echo the rolling average back as a measurement.
+
+    A trip whose SoC *rose* with no charge in its window (mountain regen,
+    or SoC samples landing late after a coverage gap) has no usable
+    energy measurement, so `energy_kwh` falls through to
+    `distance × rolling-average kWh/100km`. Publishing a consumption from
+    that just restates the average as if it had been measured — and then
+    feeds the average it came from. The raw energy figure stays; the
+    per-100 km number goes.
+    """
+    entry = await _setup(hass, bat=80.0)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Trip 1 — ordinary drive, seeds the rolling average.
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1050")
+    hass.states.async_set(BAT, "70")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 4)
+    assert coordinator.last_trip.consumption_kwh_100km is not None
+
+    # Trip 2 — SoC climbs from 70 % to 74 % across the drive.
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1060")
+    hass.states.async_set(BAT, "74")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 4)
+
+    trip = coordinator.last_trip
+    assert trip.soc_used_pct == pytest.approx(-4.0)
+    assert trip.kwh_charged_during is None
+    assert trip.energy_source == "estimated"
+    assert trip.energy_kwh is not None, "raw energy estimate should survive"
+    assert trip.consumption_kwh_100km is None, "fabricated kWh/100km published"
+    assert trip.low_confidence is True
+
+
+async def test_set_trip_recomputes_soc_used_and_consumption(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — a correction must not leave the row contradicting itself.
+
+    `set_trip` is a raw column patch: fixing `soc_start` used to leave
+    `soc_used_pct` quoting the old delta, and fixing `energy_kwh` left the
+    kWh/100km built on the old figure. Both are derived from this row
+    alone, so both get recomputed after the patch.
+    """
+    from custom_components.ev_trip_logger.const import SERVICE_SET_TRIP
+
+    entry = await _setup(hass, bat=80.0)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1100")
+    hass.states.async_set(BAT, "60")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 4)
+
+    trip = coordinator.last_trip
+    assert trip.soc_used_pct == pytest.approx(20.0)
+    trip_id = trip.trip_id
+
+    # The charge before this trip really ended at 95 %, not 80 %.
+    await hass.services.async_call(
+        DOMAIN, SERVICE_SET_TRIP,
+        {"trip_id": trip_id, "soc_start": 95.0, "energy_kwh": 26.25},
+        blocking=True,
+    )
+
+    fixed = (await coordinator.storage.async_recent_trips(1))[0]
+    assert fixed.soc_start == 95.0
+    assert fixed.soc_used_pct == pytest.approx(35.0), "stale soc_used_pct"
+    # 26.25 kWh over 100 km
+    assert fixed.consumption_kwh_100km == pytest.approx(26.25)
+
+
+async def test_set_trip_normalises_timestamps_to_local(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — mixed UTC offsets broke the "most recent" ordering.
+
+    Rows are ISO TEXT and every recency query orders by that text, so a
+    row written with a '+00:00' stamp sorted as if it had happened
+    `utcoffset` earlier and jumped ahead of trips that really preceded
+    it. Whatever offset the caller passes, storage keeps local time.
+    """
+    entry = await _setup(hass, bat=80.0)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "1020")
+    hass.states.async_set(BAT, "75")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 4)
+
+    trip_id = coordinator.last_trip.trip_id
+    utc_stamp = datetime(2026, 8, 19, 11, 55, 50, tzinfo=timezone.utc)
+    await coordinator.storage.async_update_trip(
+        trip_id, {"started_at": utc_stamp},
+    )
+
+    fixed = (await coordinator.storage.async_recent_trips(1))[0]
+    assert fixed.started_at == utc_stamp, "the instant must not move"
+    assert fixed.started_at.utcoffset() == dt_util.as_local(
+        utc_stamp
+    ).utcoffset(), "stored offset should be local, not UTC"
+
+
+async def test_post_charge_anchor_absorbs_only_one_soc_step(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — parked drain must not be billed to the next drive.
+
+    The post-charge anchor only ever RAISES `soc_start`, so every percent
+    it adds becomes trip energy. With the old 2 % budget over a 12 h
+    window, a car that sat overnight and lost 2 % to standby had that
+    1.65 kWh charged to the next drive. Only one integer step is
+    attributable to sensor staleness.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        entry = await _setup(hass, bat=80.0)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        # A charge ends at 80 %.
+        await hass.services.async_call(
+            DOMAIN, SERVICE_LOG_CHARGE,
+            {"kwh": 30.0, "price_per_kwh": 0.20},
+            blocking=True,
+        )
+        assert coordinator.last_charge.soc_end == 80.0
+
+        # Sits for an hour and loses 2 % to standby.
+        frozen.tick(timedelta(hours=1))
+        hass.states.async_set(BAT, "78")
+        hass.states.async_set(ODO, "1001")  # fresh odometer for the open
+        await hass.async_block_till_done()
+
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+
+        # 79, not 80: one step of staleness, the other point was drain.
+        assert coordinator.current.soc_start == 79.0
+
+
+async def test_post_charge_anchor_gives_up_after_a_long_park(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — past the quantization window, trust the live reading."""
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        entry = await _setup(hass, bat=80.0)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        await hass.services.async_call(
+            DOMAIN, SERVICE_LOG_CHARGE,
+            {"kwh": 30.0, "price_per_kwh": 0.20},
+            blocking=True,
+        )
+
+        frozen.tick(timedelta(hours=6))
+        hass.states.async_set(BAT, "78")
+        hass.states.async_set(ODO, "1001")  # fresh odometer for the open
+        await hass.async_block_till_done()
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+
+        assert coordinator.current.soc_start == 78.0
+
+
+async def test_charge_inside_trip_window_is_added_to_trip_energy(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — `kwh_charged_during` was measured and then ignored.
+
+    A charge inside the trip's window has already partly refilled the
+    battery, so the raw SoC delta understates what the car burned.
+    """
+    entry = await _setup(hass, bat=60.0)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(VOK, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current.soc_start == 60.0
+
+    # 10 kWh top-up mid-leg.
+    await hass.services.async_call(
+        DOMAIN, SERVICE_LOG_CHARGE,
+        {"kwh": 10.0, "price_per_kwh": 0.50},
+        blocking=True,
+    )
+
+    hass.states.async_set(ODO, "1120")
+    hass.states.async_set(BAT, "50")
+    await hass.async_block_till_done()
+    hass.states.async_set(VOK, STATE_OFF)
+    await hass.async_block_till_done()
+    await _advance(hass, 4)
+
+    trip = coordinator.last_trip
+    assert trip.kwh_charged_during == pytest.approx(10.0)
+    # SoC delta alone says 10 % of 75 kWh = 7.5; the car really used 17.5
+    assert trip.energy_kwh == pytest.approx(17.5)
+    assert trip.energy_source == "soc_plus_charge"
+    assert trip.consumption_kwh_100km == pytest.approx(14.6, abs=0.1)
+
+
+async def test_zero_crossing_power_integral_is_exact_not_trapezoid(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — |P| has a kink at zero that a trapezoid cuts across.
+
+    +40 kW followed by -30 kW eight minutes later: the true area under
+    |P| is two triangles, (40²+30²)/(2·70)·dt = 2.380 kWh. A trapezoid
+    over the magnitudes gives (40+30)/2·dt = 4.666 kWh — 1.96× too much,
+    and that over-count fed `discharge_kwh`, the month/year discharge
+    totals, and the trip's own energy whenever the SoC delta was under
+    one integer step.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(POW, "0")
+        entry = await _setup(hass, **{CONF_POWER: POW})
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+        hass.states.async_set(POW, "40")
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=8))
+        hass.states.async_set(POW, "-30")
+        await hass.async_block_till_done()
+
+        active = coordinator.current
+        # exact sub-areas, matching the maths regen already used
+        assert active.energy_from_power_kwh == pytest.approx(2.381, abs=0.01)
+        assert active.regen_kwh == pytest.approx(0.857, abs=0.01)
+        # gross = discharge + regen must still close
+        discharge = active.energy_from_power_kwh - active.regen_kwh
+        assert discharge == pytest.approx(1.524, abs=0.01)
+
+
+async def test_regen_trapezoid_is_clamped_like_the_gross_term(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.17 — the per-trapezoid ceiling guarded only the gross term.
+
+    A cloud back-fill delivering two consecutive -100 kW samples 20 min
+    apart added 33.3 kWh of regen to an 82.5 kWh pack — permanently, into
+    the year totals — while the gross side was correctly capped at 5.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(POW, "0")
+        entry = await _setup(hass, **{CONF_POWER: POW})
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+        hass.states.async_set(POW, "-100")
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=20))
+        hass.states.async_set(POW, "-100.5")
+        await hass.async_block_till_done()
+
+        assert coordinator.current.regen_kwh <= 5.0
