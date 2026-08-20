@@ -2,6 +2,17 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.18 — 2026-08-21
+**Fix — a charge that was already running when a trip opened had its whole session billed to that trip.** Regression in v0.8.17's mid-trip-charge correction, caught by running `heal_history` against real data: the lifetime driven/charged ratio went the wrong way, from 1.07 to 1.22, and two rows came out physically impossible — a 74 km leg credited all 66.83 kWh of the session it opened in the middle of (78 kWh/100km), and a 3 km hop credited a session that had finished as it set off (86 kWh/100km).
+
+`kwh_charged_during` selects sessions that *ended* inside the trip's window, which is the right set — but the quantity was the whole session, and only the part delivered after the window opened belongs to it. SoC is the meter that says how much:
+
+    kwh x (soc_end - trip_soc_start) / (soc_end - soc_start)
+
+For the reported leg that is 66.83 x (96-67)/(96-15) = 23.92 kWh in the window, so 23.92 delivered against 11 points more stored at the end leaves 14.84 kWh really used — 20.1 kWh/100km over 74 km, which is what the car actually does. A session wholly inside the window still counts in full. One that straddles the opening without the SoC readings needed to apportion it contributes nothing: a guess here lands straight in the trip's consumption and its cost.
+
+Applied to the live close, the synthetic close and `heal_history` alike, so re-running the heal corrects rows an earlier run got wrong.
+
 ## v0.8.17 — 2026-08-20
 **Fix — consecutive charging sessions inside a 2-hour window were discarded, not recorded.** Reported case: a four-day road trip lost roughly 150 kWh across three sessions. The car's own sensors saw every one of them (`charge_in_progress` went to `charging`, `current_charge_energy` integrated up to 42.9 and 50.3 kWh), yet no row was ever written.
 

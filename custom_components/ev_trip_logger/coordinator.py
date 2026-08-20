@@ -3080,9 +3080,11 @@ class EvTripLoggerCoordinator:
             record.kwh_charged_before = (
                 round(before_s["kwh"], 2) if before_s["kwh"] > 0 else None
             )
-        during_s = await self.storage.async_charges_in_window(started_at, ended_at)
+        during_s_kwh = await self.storage.async_charges_attributable_to_trip(
+            started_at, ended_at, soc_s,
+        )
         record.kwh_charged_during = (
-            round(during_s["kwh"], 2) if during_s["kwh"] > 0 else None
+            round(during_s_kwh, 2) if during_s_kwh > 0.005 else None
         )
 
         # v0.8.17 — the same two corrections the live close applies. This
@@ -5420,11 +5422,14 @@ class EvTripLoggerCoordinator:
             record.kwh_charged_before = (
                 round(before["kwh"], 2) if before["kwh"] > 0 else None
             )
-        during = await self.storage.async_charges_in_window(
-            active.started_at, now,
+        # v0.8.18 — apportioned by SoC: only the part of a session
+        # delivered after this trip opened belongs to it (see
+        # `async_charges_attributable_to_trip`).
+        during_kwh = await self.storage.async_charges_attributable_to_trip(
+            active.started_at, now, record.soc_start,
         )
         record.kwh_charged_during = (
-            round(during["kwh"], 2) if during["kwh"] > 0 else None
+            round(during_kwh, 2) if during_kwh > 0.005 else None
         )
 
         # v0.8.17 — a charge that lands INSIDE the trip's window was

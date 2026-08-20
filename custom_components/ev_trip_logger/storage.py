@@ -50,6 +50,46 @@ _WEIGHTED_SPEED_SQL = (
 )
 
 
+def _parse_stored(value: str | None) -> datetime | None:
+    """Parse a stored ISO timestamp; naive rows are local (see _iso_local)."""
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+    return ts
+
+
+def _apportion_straddling_charge(
+    kwh: float,
+    *,
+    soc_start: float | None,
+    soc_end: float | None,
+    trip_soc_start: float | None,
+) -> float:
+    """kWh of a charge that was already running when a trip window opened.
+
+    v0.8.18 — SoC is the meter: the fraction of the session delivered
+    after `trip_soc_start` is (soc_end - trip_soc_start) / (soc_end -
+    soc_start). Returns 0.0 when the readings cannot support the split,
+    because a guess here lands in the trip's consumption and its cost.
+    """
+    if soc_start is None or soc_end is None or trip_soc_start is None:
+        return 0.0
+    span = float(soc_end) - float(soc_start)
+    if span <= 0:
+        return 0.0
+    cut = float(trip_soc_start)
+    if cut <= float(soc_start):
+        return kwh
+    if cut >= float(soc_end):
+        return 0.0
+    return kwh * (float(soc_end) - cut) / span
+
+
 def _iso_local(value: datetime) -> str:
     """Serialise a datetime as local-time ISO.
 
@@ -1008,6 +1048,68 @@ class TripStorage:
                 (since.isoformat(), until.isoformat()),
             ).fetchone()
         return {"kwh": float(row[0] or 0), "count": int(row[1] or 0)}
+
+    async def async_charges_attributable_to_trip(
+        self,
+        start: datetime,
+        end: datetime,
+        trip_soc_start: float | None,
+    ) -> float:
+        """kWh delivered INSIDE a trip's window, apportioned by SoC.
+
+        v0.8.18 — `async_charges_in_window` answers "which sessions
+        ended in here", which is the right set but the wrong quantity
+        when a session was already delivering as the window opened. The
+        v0.8.17 mid-trip-charge correction credited the whole session,
+        so a trip that opened mid-charge (67 %) while the cable ran on to
+        96 % was credited all 66.83 kWh and reported 78 kWh/100km over
+        74 km — physically impossible.
+
+        Only the part delivered after the window opened belongs to it,
+        and SoC is the meter that says how much:
+
+            kwh x (soc_end - trip_soc_start) / (soc_end - soc_start)
+
+        A session fully inside the window contributes all of its energy.
+        One that straddles the opening without the SoC readings needed to
+        apportion it contributes nothing — a guess here lands straight in
+        the trip's consumption and cost.
+        """
+        return await self._hass.async_add_executor_job(
+            self._charges_attributable_to_trip, start, end, trip_soc_start,
+        )
+
+    def _charges_attributable_to_trip(
+        self,
+        start: datetime,
+        end: datetime,
+        trip_soc_start: float | None,
+    ) -> float:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT started_at, ended_at, kwh, soc_start, soc_end "
+                "FROM charges"
+            ).fetchall()
+        total = 0.0
+        for r in rows:
+            c_end = _parse_stored(r["ended_at"])
+            if c_end is None or not (start <= c_end <= end):
+                continue
+            kwh = float(r["kwh"] or 0.0)
+            if kwh <= 0:
+                continue
+            c_start = _parse_stored(r["started_at"]) or c_end
+            if c_start >= start:
+                total += kwh
+                continue
+            total += _apportion_straddling_charge(
+                kwh,
+                soc_start=r["soc_start"],
+                soc_end=r["soc_end"],
+                trip_soc_start=trip_soc_start,
+            )
+        return round(total, 3)
 
     async def async_update_trip(
         self, trip_id: int, fields: dict[str, Any]
@@ -3034,7 +3136,8 @@ class TripStorage:
             conn.row_factory = sqlite3.Row
             charges = []
             for r in conn.execute(
-                "SELECT started_at, ended_at, kwh FROM charges"
+                "SELECT started_at, ended_at, kwh, soc_start, soc_end "
+                "FROM charges"
             ).fetchall():
                 end = _parse(r["ended_at"])
                 if end is None:
@@ -3043,7 +3146,9 @@ class TripStorage:
                 kwh = float(r["kwh"] or 0.0)
                 if kwh <= 0:
                     continue
-                charges.append((start, end, kwh))
+                charges.append(
+                    (start, end, kwh, r["soc_start"], r["soc_end"])
+                )
 
             trips = []
             for r in conn.execute(
@@ -3069,23 +3174,34 @@ class TripStorage:
                 updates: dict[str, Any] = {}
 
                 # --- charge attribution, from the charges that exist now
-                # v0.8.17 — same semantics as the close path
-                # (`async_charges_in_window`): a charge counts when it
-                # ENDED inside the trip's window. Interval overlap would
-                # additionally catch a session that merely started inside
-                # and ran on afterwards, then fold its WHOLE kWh into the
-                # trip — turning a correct 60 km row into >80 kWh/100km.
-                during = sum(
-                    kwh for _c_start, c_end, kwh in charges
-                    if start <= c_end <= end
-                )
+                # v0.8.17 — same semantics as the close path: a charge
+                # counts when it ENDED inside the trip's window. Interval
+                # overlap would also catch a session that merely started
+                # inside and ran on afterwards.
+                # v0.8.18 — and only the part delivered AFTER the window
+                # opened belongs to it. Crediting the whole session gave
+                # a trip that opened mid-charge all 66.83 kWh and 78
+                # kWh/100km over 74 km. SoC apportions it exactly.
+                during = 0.0
+                for c_start, c_end, kwh, c_soc_s, c_soc_e in charges:
+                    if not (start <= c_end <= end):
+                        continue
+                    if c_start >= start:
+                        during += kwh
+                    else:
+                        during += _apportion_straddling_charge(
+                            kwh,
+                            soc_start=c_soc_s,
+                            soc_end=c_soc_e,
+                            trip_soc_start=row["soc_start"],
+                        )
                 before = 0.0
                 if prev_end_ts is not None and prev_end_ts < start:
                     before = sum(
-                        kwh for _cs, c_end, kwh in charges
+                        kwh for _cs, c_end, kwh, _ss, _se in charges
                         if prev_end_ts <= c_end <= start
                     )
-                new_during = round(during, 2) if during > 0 else None
+                new_during = round(during, 2) if during > 0.005 else None
                 new_before = round(before, 2) if before > 0 else None
                 if (
                     new_during != row["kwh_charged_during"]
