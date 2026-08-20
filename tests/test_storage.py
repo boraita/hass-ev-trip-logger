@@ -1164,15 +1164,19 @@ async def test_heal_history_reattributes_a_charge_recovered_later(
     ))
     # Leg 2 starts at 85 % — impossible without a charge, and none was known.
     trip2 = await storage.async_insert(TripRecord(
-        started_at=base + timedelta(hours=3), ended_at=base + timedelta(hours=4),
+        started_at=base + timedelta(hours=3), ended_at=base + timedelta(hours=4, minutes=30),
         duration_min=60.0, distance_km=100.0, soc_start=85.0, soc_end=75.0,
         soc_used_pct=10.0, energy_kwh=8.25, consumption_kwh_100km=8.25,
         energy_source="soc",
     ))
-    # The session is recovered later, overlapping leg 2's window.
+    # The session is recovered later. It sits wholly INSIDE leg 2's
+    # window — the driver stopped mid-leg and plugged in — so all of its
+    # energy belongs to that leg. (A session that was already running as
+    # the window opened is apportioned by SoC instead; see
+    # test_charge_straddling_the_trip_start_is_apportioned_by_soc.)
     await storage.async_insert_charge(ChargeRecord(
-        started_at=base + timedelta(hours=2, minutes=30),
-        ended_at=base + timedelta(hours=3, minutes=30),
+        started_at=base + timedelta(hours=3, minutes=10),
+        ended_at=base + timedelta(hours=3, minutes=40),
         kwh=40.0, price_per_kwh=0.50, total_cost=20.0, currency="EUR",
         soc_start=30.0, soc_end=85.0,
     ))
@@ -1285,3 +1289,83 @@ async def test_heal_history_ignores_a_charge_that_outlives_the_trip(
     assert healed.kwh_charged_during is None, "charge ended after the trip"
     assert healed.energy_kwh == pytest.approx(12.38, abs=0.01)
     assert healed.energy_source == "soc"
+
+
+async def test_charge_straddling_the_trip_start_is_apportioned_by_soc(
+    storage: TripStorage,
+) -> None:
+    """v0.8.18 — regression from the real 2026-08-19 leg.
+
+    The trip opened while the cable was still delivering (67 %) and the
+    session ran on to 96 %. Crediting the whole 66.83 kWh gave 57.75 kWh
+    over 74 km — 78 kWh/100km, impossible for the car. Only the 29 of 81
+    SoC points delivered after the trip opened belong to it.
+    """
+    base = dt_util.now() - timedelta(days=2)
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=base, ended_at=base + timedelta(hours=1),
+        kwh=66.83, price_per_kwh=0.50, total_cost=33.42, currency="EUR",
+        soc_start=15.0, soc_end=96.0,
+    ))
+
+    # Trip opened mid-charge at 67 %, closed after the cable stopped.
+    attributable = await storage.async_charges_attributable_to_trip(
+        base + timedelta(minutes=35), base + timedelta(hours=2),
+        trip_soc_start=67.0,
+    )
+    # 66.83 * (96-67)/(96-15) = 23.92
+    assert attributable == pytest.approx(23.92, abs=0.01)
+
+    # A session fully inside the window still counts in full.
+    assert await storage.async_charges_attributable_to_trip(
+        base - timedelta(minutes=5), base + timedelta(hours=2),
+        trip_soc_start=15.0,
+    ) == pytest.approx(66.83, abs=0.01)
+
+    # Finished exactly as the trip began → nothing belongs to the trip.
+    assert await storage.async_charges_attributable_to_trip(
+        base + timedelta(minutes=59), base + timedelta(hours=2),
+        trip_soc_start=96.0,
+    ) == pytest.approx(0.0)
+
+    # No SoC readings to apportion with → contribute nothing, don't guess.
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=base + timedelta(hours=3),
+        ended_at=base + timedelta(hours=4),
+        kwh=20.0, price_per_kwh=0.30, total_cost=6.0, currency="EUR",
+    ))
+    assert await storage.async_charges_attributable_to_trip(
+        base + timedelta(hours=3, minutes=30), base + timedelta(hours=5),
+        trip_soc_start=50.0,
+    ) == pytest.approx(0.0)
+
+
+async def test_heal_history_apportions_a_straddling_charge(
+    storage: TripStorage,
+) -> None:
+    """v0.8.18 — and the heal must apportion it too, or running it makes
+    the numbers worse than leaving them alone (measured: a lifetime
+    driven/charged ratio of 1.07 became 1.22).
+    """
+    base = dt_util.now() - timedelta(days=3)
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=base, ended_at=base + timedelta(hours=1),
+        kwh=66.83, price_per_kwh=0.50, total_cost=33.42, currency="EUR",
+        soc_start=15.0, soc_end=96.0,
+    ))
+    trip_id = await storage.async_insert(TripRecord(
+        started_at=base + timedelta(minutes=35),
+        ended_at=base + timedelta(hours=2, minutes=5),
+        duration_min=90.0, distance_km=74.0,
+        soc_start=67.0, soc_end=78.0, soc_used_pct=-11.0,
+        energy_kwh=14.81, energy_source="estimated",
+        consumption_kwh_100km=20.0,
+    ))
+
+    await storage.async_heal_history(battery_capacity_kwh=82.5)
+
+    healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip_id]
+    assert healed.kwh_charged_during == pytest.approx(23.92, abs=0.01)
+    # 23.92 in, 11 points (9.08 kWh) more stored at the end → 14.84 used
+    assert healed.energy_kwh == pytest.approx(14.84, abs=0.02)
+    assert healed.consumption_kwh_100km == pytest.approx(20.1, abs=0.1)
