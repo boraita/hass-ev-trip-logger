@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1078,3 +1078,210 @@ async def test_logger_total_km_sums_distance(storage: TripStorage) -> None:
     await storage.async_insert(_trip(distance_km=15.0))
     await storage.async_insert(_trip(distance_km=23.5))
     assert await storage.async_logger_total_km() == pytest.approx(38.5)
+
+
+async def test_avg_trip_metrics_are_weighted_not_means_of_ratios(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 — consumption and speed must be totals over totals.
+
+    `AVG(consumption_kwh_100km)` and `AVG(avg_speed_kmh)` gave a short
+    city hop the same weight as a long motorway run, so the three 30-day
+    sensors contradicted each other: distance / duration did not equal
+    the published speed.
+    """
+    since = dt_util.now() - timedelta(days=30)
+    base = dt_util.now() - timedelta(days=1)
+
+    # 2 km at 40 kWh/100km, 6 min  → 20 km/h
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=6),
+        duration_min=6.0, distance_km=2.0, energy_kwh=0.8,
+        consumption_kwh_100km=40.0, avg_speed_kmh=20.0,
+    ))
+    # 200 km at 15 kWh/100km, 2 h → 100 km/h
+    await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=1),
+        ended_at=base + timedelta(hours=3),
+        duration_min=120.0, distance_km=200.0, energy_kwh=30.0,
+        consumption_kwh_100km=15.0, avg_speed_kmh=100.0,
+    ))
+
+    m = await storage.async_avg_trip_metrics(since)
+
+    # 30.8 kWh over 202 km, not (40+15)/2 = 27.5
+    assert m["avg_consumption_kwh_100km"] == pytest.approx(15.25, abs=0.01)
+    # 202 km over 126 min, not (20+100)/2 = 60
+    assert m["avg_speed_kmh"] == pytest.approx(96.19, abs=0.05)
+    # and the trio is now self-consistent
+    implied = m["avg_distance_km"] / (m["avg_duration_min"] / 60.0)
+    assert implied == pytest.approx(m["avg_speed_kmh"], abs=0.05)
+
+
+async def test_null_energy_trip_does_not_dilute_avg_consumption(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 — a row with kilometres but no energy reading used to
+    contribute to the denominator only, understating consumption. That
+    figure drives the remaining-range estimate.
+    """
+    since = dt_util.now() - timedelta(days=30)
+    base = dt_util.now() - timedelta(days=1)
+
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(hours=1),
+        duration_min=60.0, distance_km=800.0, energy_kwh=120.0,
+        consumption_kwh_100km=15.0,
+    ))
+    await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=2), ended_at=base + timedelta(hours=3),
+        duration_min=60.0, distance_km=100.0, energy_kwh=None,
+    ))
+
+    totals = await storage.async_aggregates_since(since)
+    # 120 / 800, not 120 / 900
+    assert totals["avg_consumption_kwh_100km"] == pytest.approx(15.0)
+
+
+async def test_heal_history_reattributes_a_charge_recovered_later(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 — a charge inserted after the fact is invisible to the
+    trips around it, because `kwh_charged_*` is computed once at close.
+
+    Here a 40 kWh session that really happened mid-leg is recovered
+    afterwards: the trip's SoC only fell 10 points, so its stored energy
+    badly understates what it burned, and its `soc_start` looks like it
+    rose out of nowhere.
+    """
+    base = dt_util.now() - timedelta(days=5)
+    # Leg 1 ends at 30 %.
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(hours=1),
+        duration_min=60.0, distance_km=100.0, soc_start=60.0, soc_end=30.0,
+        soc_used_pct=30.0, energy_kwh=24.75, consumption_kwh_100km=24.75,
+        energy_source="soc",
+    ))
+    # Leg 2 starts at 85 % — impossible without a charge, and none was known.
+    trip2 = await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=3), ended_at=base + timedelta(hours=4),
+        duration_min=60.0, distance_km=100.0, soc_start=85.0, soc_end=75.0,
+        soc_used_pct=10.0, energy_kwh=8.25, consumption_kwh_100km=8.25,
+        energy_source="soc",
+    ))
+    # The session is recovered later, overlapping leg 2's window.
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=base + timedelta(hours=2, minutes=30),
+        ended_at=base + timedelta(hours=3, minutes=30),
+        kwh=40.0, price_per_kwh=0.50, total_cost=20.0, currency="EUR",
+        soc_start=30.0, soc_end=85.0,
+    ))
+
+    counts = await storage.async_heal_history(battery_capacity_kwh=82.5)
+
+    assert counts["charge_attribution_fixed"] >= 1
+    healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip2]
+    assert healed.kwh_charged_during == pytest.approx(40.0)
+    # 40 kWh in, SoC net -10 points → 40 + 8.25 = 48.25 kWh really used
+    assert healed.energy_kwh == pytest.approx(48.25)
+    assert healed.energy_source == "soc_plus_charge"
+    # the rise is explained by a real charge, so soc_start is left alone
+    assert healed.soc_start == 85.0
+
+
+async def test_heal_history_reanchors_an_unexplained_soc_rise(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 — SoC cannot rise while parked with nothing charging."""
+    base = dt_util.now() - timedelta(days=5)
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(hours=1),
+        duration_min=60.0, distance_km=100.0, soc_start=80.0, soc_end=70.0,
+        soc_used_pct=10.0, energy_kwh=8.25, consumption_kwh_100km=8.25,
+        energy_source="soc",
+    ))
+    # Anchored up to 72 by the old post-charge/short-park snap.
+    trip2 = await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=2), ended_at=base + timedelta(hours=3),
+        duration_min=60.0, distance_km=50.0, soc_start=72.0, soc_end=68.0,
+        soc_used_pct=4.0, energy_kwh=3.3, consumption_kwh_100km=6.6,
+        energy_source="soc",
+    ))
+
+    counts = await storage.async_heal_history(battery_capacity_kwh=82.5)
+
+    assert counts["soc_start_reanchored"] == 1
+    healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip2]
+    assert healed.soc_start == 70.0
+    assert healed.soc_used_pct == pytest.approx(2.0)
+    # 2 points of 82.5 kWh, not 4 — the other two were never the trip's
+    assert healed.energy_kwh == pytest.approx(1.65)
+    assert healed.consumption_kwh_100km == pytest.approx(3.3)
+
+
+async def test_trip_overlaps_matches_locally_stored_rows_from_utc_bounds(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 regression — the recovery dedup must still see its own rows.
+
+    Trips are written as local ISO since v0.8.17, but the recovery sweep
+    asks this question with the recorder's UTC stamps. Comparing those as
+    TEXT ('…+02:00' rows against '…+00:00' bounds) made the guard miss
+    the very rows the sweep had just inserted, so every run re-inserted
+    them — and the sweep is also fired automatically after a telemetry
+    silence, so they would pile up unattended.
+    """
+    local_start = dt_util.now() - timedelta(hours=5)
+    local_end = local_start + timedelta(hours=1)
+    await storage.async_insert(TripRecord(
+        started_at=local_start, ended_at=local_end,
+        duration_min=60.0, distance_km=80.0,
+    ))
+
+    # Same instants, expressed in UTC, as the recorder hands them back.
+    assert await storage.async_trip_overlaps(
+        local_start.astimezone(timezone.utc),
+        local_end.astimezone(timezone.utc),
+    ) is True
+
+    # A genuinely different window must still report no overlap.
+    far = local_start - timedelta(days=3)
+    assert await storage.async_trip_overlaps(
+        far.astimezone(timezone.utc),
+        (far + timedelta(hours=1)).astimezone(timezone.utc),
+    ) is False
+
+
+async def test_heal_history_ignores_a_charge_that_outlives_the_trip(
+    storage: TripStorage,
+) -> None:
+    """v0.8.17 regression — the heal must match the close path exactly.
+
+    `async_charges_in_window` counts a charge that ENDED inside the trip's
+    window. Interval overlap would also catch one that merely started
+    inside and ran on afterwards — the plug-in-at-the-end case — and then
+    fold its whole kWh into the trip, turning a correct row into a
+    physically impossible one.
+    """
+    base = dt_util.now() - timedelta(days=4)
+    trip_id = await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(hours=1, minutes=10),
+        duration_min=70.0, distance_km=60.0, soc_start=70.0, soc_end=55.0,
+        soc_used_pct=15.0, energy_kwh=12.38, consumption_kwh_100km=20.6,
+        energy_source="soc",
+    ))
+    # Plugged in five minutes before the trip closed; session runs on for
+    # another 40 minutes after it.
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=base + timedelta(hours=1, minutes=5),
+        ended_at=base + timedelta(hours=1, minutes=50),
+        kwh=30.0, price_per_kwh=0.50, total_cost=15.0, currency="EUR",
+        soc_start=55.0, soc_end=91.0,
+    ))
+
+    await storage.async_heal_history(battery_capacity_kwh=82.5)
+
+    healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip_id]
+    assert healed.kwh_charged_during is None, "charge ended after the trip"
+    assert healed.energy_kwh == pytest.approx(12.38, abs=0.01)
+    assert healed.energy_source == "soc"

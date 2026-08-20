@@ -16,6 +16,7 @@ from .const import (
     SERVICE_END_TRIP,
     SERVICE_EXPORT_CSV,
     SERVICE_FIX_SPEED_STATS,
+    SERVICE_HEAL_HISTORY,
     SERVICE_LOG_CHARGE,
     SERVICE_LOG_MANUAL_TRIP,
     SERVICE_PURGE_TRIPS,
@@ -296,6 +297,25 @@ def async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_FIX_SPEED_STATS, _fix_speed_stats, schema=_SCHEMA_ENTRY,
     )
 
+    async def _heal_history(call: ServiceCall) -> None:
+        for c in _resolve_coordinators(hass, call):
+            counts = await c.async_heal_history_service()
+            _LOGGER.info(
+                "heal_history: %d trip(s) seen — charge attribution fixed on "
+                "%d, soc_start re-anchored on %d, energy recomputed on %d, "
+                "consumption suppressed on %d (entry %s)",
+                counts["trips_seen"],
+                counts["charge_attribution_fixed"],
+                counts["soc_start_reanchored"],
+                counts["energy_recomputed"],
+                counts["consumption_suppressed"],
+                c.entry_id,
+            )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_HEAL_HISTORY, _heal_history, schema=_SCHEMA_ENTRY,
+    )
+
     async def _set_trip(call: ServiceCall) -> None:
         # Build the patch dict from every field the user passed.
         # entry_id and trip_id are stripped; everything else is forwarded.
@@ -393,6 +413,7 @@ def async_unregister_services(hass: HomeAssistant) -> None:
         SERVICE_RECOVER_MISSING_TRIPS,
         SERVICE_BACKFILL_CHARGE_EVSE,
         SERVICE_FIX_SPEED_STATS,
+        SERVICE_HEAL_HISTORY,
     ):
         if hass.services.has_service(DOMAIN, name):
             hass.services.async_remove(DOMAIN, name)

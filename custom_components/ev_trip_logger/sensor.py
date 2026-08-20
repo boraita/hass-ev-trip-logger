@@ -1568,6 +1568,13 @@ class AbrpNextChargeSocSensor(_BaseTripSensor):
         return self._value
 
 
+# v0.8.17 — floors for the SoH degradation rate. Below either of these a
+# two-point slope is dominated by the noise of the capacity estimate
+# itself, and annualising it produces alarming nonsense.
+_SOH_RATE_MIN_SNAPSHOTS = 6
+_SOH_RATE_MIN_SPAN_YEARS = 0.25  # three months
+
+
 class TrackedAvgSensor(_BaseTripSensor):
     """Rolling N-day mean of an arbitrary numeric sensor via HA recorder.
 
@@ -1628,6 +1635,7 @@ class TrackedAvgSensor(_BaseTripSensor):
         self._mean: float | None = None
         self._samples: int = 0
         self._window_start: datetime | None = None
+        self._covered_hours: float = 0.0
         # v0.5.48 — last KNOWN unit of the source. Mirroring the source's
         # live attributes made the unit flip to None while the upstream
         # integration was reloading, which the recorder registered as a
@@ -1685,19 +1693,60 @@ class TrackedAvgSensor(_BaseTripSensor):
             self._schedule_startup_retry()
             return
         states = result.get(self._source, []) if isinstance(result, dict) else []
-        values: list[float] = []
-        for s in states:
-            try:
-                v = float(s.state)
-            except (TypeError, ValueError):
+        # v0.8.17 — TIME-weighted, not sample-count-weighted. The
+        # recorder emits one row per state CHANGE, so a value held for
+        # 20 hours counted once while a value reported every 30 seconds
+        # counted thousands of times. Tracking a charge-power sensor,
+        # 0 kW held for 29 days (≈1 row) against 50 kW reported every
+        # 30 s during 20 h of charging (2 400 rows) produced a "30-day
+        # average power" of 49.98 kW; the honest figure is
+        # 50 × 20/720 = 1.39 kW. Each sample now weighs the time it was
+        # actually in force.
+        # Keep EVERY state, numeric or not, so a value's span ends at the
+        # next reported state rather than at the next parseable one.
+        # v0.8.17 — crediting an `unavailable` gap to the last numeric
+        # sample would be the same bug in reverse: a cloud dropout that
+        # begins while the sensor reads 50 kW would let that one sample
+        # weigh hours of no data, and `covered_hours` would count time
+        # the recorder never had.
+        timeline: list[tuple[Any, float | None]] = []
+        for st in states:
+            ts = getattr(st, "last_changed", None) or getattr(
+                st, "last_updated", None
+            )
+            if ts is None:
                 continue
-            values.append(v)
-        if values:
-            self._mean = sum(values) / len(values)
-            self._samples = len(values)
+            try:
+                value: float | None = float(st.state)
+            except (TypeError, ValueError):
+                value = None
+            timeline.append((ts, value))
+        timeline.sort(key=lambda item: item[0])
+        weighted_sum = 0.0
+        total_seconds = 0.0
+        numeric_samples = 0
+        for idx, (ts, value) in enumerate(timeline):
+            if value is None:
+                continue
+            numeric_samples += 1
+            next_ts = timeline[idx + 1][0] if idx + 1 < len(timeline) else end
+            seconds = (next_ts - ts).total_seconds()
+            if seconds <= 0:
+                continue
+            weighted_sum += value * seconds
+            total_seconds += seconds
+        if total_seconds > 0:
+            self._mean = weighted_sum / total_seconds
+            self._samples = numeric_samples
+            # How much of the advertised window the recorder could
+            # actually cover. `window_start` claims N days even when
+            # retention is far shorter, which made a 3-day mean look
+            # like a 30-day one.
+            self._covered_hours = round(total_seconds / 3600.0, 1)
         else:
             self._mean = None
             self._samples = 0
+            self._covered_hours = 0.0
         self.async_write_ha_state()
 
     @property
@@ -1727,6 +1776,10 @@ class TrackedAvgSensor(_BaseTripSensor):
             "samples": self._samples,
             "window_start": self._window_start.isoformat()
                 if self._window_start else None,
+            # v0.8.17 — hours the recorder could actually cover. The mean
+            # is time-weighted over THIS span, which is shorter than
+            # `window_days` whenever recorder retention is.
+            "covered_hours": self._covered_hours,
         }
 
 
@@ -2516,6 +2569,9 @@ class ConsumptionByTempBucketSensor(_BaseTripSensor):
         )
         self._buckets = result.get("by_bucket", {})
         self._sample_count = int(result.get("sample_count", 0))
+        self._bucket_km: dict[str, float] = result.get(
+            "bucket_distance_km", {}
+        ) or {}
         self.async_write_ha_state()
 
     @property
@@ -2532,18 +2588,37 @@ class ConsumptionByTempBucketSensor(_BaseTripSensor):
             return getattr(self._coordinator, "score_baseline_kwh_100km", None)
         temp = self._coordinator.exterior_temp
         if temp is None:
-            # No live temp → return the overall average across buckets
-            # so the tile shows "typical consumption" instead of going
-            # blank when the temp source is asleep.
-            vals = [v for v in self._buckets.values() if v is not None]
-            return sum(vals) / len(vals) if vals else None
+            # No live temp → typical consumption across all buckets.
+            return self._overall_mean()
         bucket = int((temp // self._BUCKET_SIZE_C) * self._BUCKET_SIZE_C)
         val = self._buckets.get(str(bucket))
         if val is None:
             # Bucket has no samples — fall back to the overall mean.
-            vals = [v for v in self._buckets.values() if v is not None]
-            return sum(vals) / len(vals) if vals else None
+            return self._overall_mean()
         return val
+
+    def _overall_mean(self) -> float | None:
+        """Distance-weighted mean across buckets.
+
+        v0.8.17 — this averaged the bucket VALUES equally, which threw
+        away the weighting each bucket was carefully built with: one
+        6 km January trip at 22.0 kWh/100km counted as much as 4 000 km
+        of summer driving at 14.5, giving 18.25 instead of 14.51 — and it
+        fired exactly in the "temp source asleep" case the fallback
+        exists for.
+        """
+        km = getattr(self, "_bucket_km", None) or {}
+        total_km = sum(
+            km.get(b, 0.0) for b, v in self._buckets.items() if v is not None
+        )
+        if total_km > 0:
+            return sum(
+                v * km.get(b, 0.0)
+                for b, v in self._buckets.items()
+                if v is not None
+            ) / total_km
+        vals = [v for v in self._buckets.values() if v is not None]
+        return sum(vals) / len(vals) if vals else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -3295,17 +3370,38 @@ class BatterySohSensor(_BaseTripSensor):
         declared = coord._battery_capacity_declared
         calibrated = coord._battery_capacity_calibrated
         # Degradation rate: slope between oldest and newest snapshot.
+        # v0.8.17 — do not annualise a span too short to mean anything.
+        # This was a two-point slope with no minimum span and no
+        # snapshot floor, so two readings 10 days apart differing by
+        # 1.1 kWh — well inside the noise of a median-of-30-charges
+        # estimate — extrapolated to "-40.2 kWh/year", i.e. the pack
+        # emptying in two years. Require a real span and enough
+        # snapshots, and fit the whole series by least squares instead
+        # of trusting two endpoints.
         rate_kwh_per_year: float | None = None
-        if len(self._history) >= 2:
-            oldest = self._history[0]
-            newest = self._history[-1]
+        if len(self._history) >= _SOH_RATE_MIN_SNAPSHOTS:
             try:
-                t0 = datetime.fromisoformat(oldest["observed_at"])
-                t1 = datetime.fromisoformat(newest["observed_at"])
-                years = (t1 - t0).total_seconds() / (365.25 * 86400)
-                if years > 0:
-                    delta = newest["calibrated_kwh"] - oldest["calibrated_kwh"]
-                    rate_kwh_per_year = round(delta / years, 3)
+                points: list[tuple[float, float]] = []
+                t0 = datetime.fromisoformat(self._history[0]["observed_at"])
+                for snap in self._history:
+                    ts = datetime.fromisoformat(snap["observed_at"])
+                    years_from_t0 = (
+                        (ts - t0).total_seconds() / (365.25 * 86400)
+                    )
+                    points.append(
+                        (years_from_t0, float(snap["calibrated_kwh"]))
+                    )
+                span_years = points[-1][0]
+                if span_years >= _SOH_RATE_MIN_SPAN_YEARS:
+                    n = float(len(points))
+                    mean_x = sum(x for x, _ in points) / n
+                    mean_y = sum(y for _, y in points) / n
+                    sxx = sum((x - mean_x) ** 2 for x, _ in points)
+                    sxy = sum(
+                        (x - mean_x) * (y - mean_y) for x, y in points
+                    )
+                    if sxx > 0:
+                        rate_kwh_per_year = round(sxy / sxx, 3)
             except Exception:  # pragma: no cover — defensive
                 rate_kwh_per_year = None
         # v0.5.65 — surface the car's current km and age in the SoH

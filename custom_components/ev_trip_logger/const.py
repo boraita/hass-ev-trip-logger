@@ -220,5 +220,6 @@ SERVICE_RECOVER_MISSING_TRIPS: Final = "recover_missing_trips"
 # optionally masked by the charge_sensor=on windows.
 SERVICE_BACKFILL_CHARGE_EVSE: Final = "backfill_charge_evse"
 SERVICE_FIX_SPEED_STATS: Final = "fix_speed_stats"
+SERVICE_HEAL_HISTORY: Final = "heal_history"
 
 STORAGE_FILENAME_TEMPLATE: Final = "ev_trip_logger.{entry_id}.db"
