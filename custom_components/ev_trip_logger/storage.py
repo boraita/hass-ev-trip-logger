@@ -1143,6 +1143,16 @@ class TripStorage:
             if c_start >= start:
                 total += kwh
                 continue
+            # Started before the window AND finished within the boundary
+            # tolerance of its opening: it delivered nothing inside. The
+            # SoC apportion cannot see this, because it trusts the trip's
+            # `soc_start` — and when that anchor is wrong (a re-anchor, a
+            # late cloud sample) it invents energy for the trip out of a
+            # session that had already stopped. Time settles it first.
+            if c_end <= start + timedelta(
+                seconds=_CHARGE_TRIP_BOUNDARY_TOLERANCE_S
+            ):
+                continue
             total += _apportion_straddling_charge(
                 kwh,
                 soc_start=r["soc_start"],
@@ -3171,6 +3181,7 @@ class TripStorage:
             "soc_start_reanchored": 0,
             "energy_recomputed": 0,
             "consumption_suppressed": 0,
+            "stale_energy_source_cleared": 0,
         }
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -3223,11 +3234,21 @@ class TripStorage:
                 # a trip that opened mid-charge all 66.83 kWh and 78
                 # kWh/100km over 74 km. SoC apportions it exactly.
                 during = 0.0
+                straddle_floor = start + timedelta(
+                    seconds=_CHARGE_TRIP_BOUNDARY_TOLERANCE_S
+                )
                 for c_start, c_end, kwh, c_soc_s, c_soc_e in charges:
                     if not (start <= c_end <= end):
                         continue
                     if c_start >= start:
                         during += kwh
+                    elif c_end <= straddle_floor:
+                        # Started before the window, finished as it opened:
+                        # nothing was delivered inside. Apportioning by SoC
+                        # here trusts `soc_start`, and a row whose anchor
+                        # this very heal re-anchored would be credited
+                        # energy from a session that had already stopped.
+                        continue
                     else:
                         during += _apportion_straddling_charge(
                             kwh,
@@ -3242,12 +3263,9 @@ class TripStorage:
                 # session was still to come when the window opened.
                 before = 0.0
                 if prev_end_ts is not None and prev_end_ts < start:
-                    before_hi = start + timedelta(
-                        seconds=_CHARGE_TRIP_BOUNDARY_TOLERANCE_S
-                    )
                     before = sum(
                         kwh for _cs, c_end, kwh, _ss, _se in charges
-                        if prev_end_ts <= c_end <= before_hi
+                        if prev_end_ts <= c_end <= straddle_floor
                     )
                 new_during = round(during, 2) if during > 0.005 else None
                 new_before = round(before, 2) if before > 0 else None
@@ -3324,6 +3342,32 @@ class TripStorage:
                         updates["consumption_kwh_100km"] = None
                         updates["low_confidence"] = 1
                         counts["consumption_suppressed"] += 1
+
+                    # Nothing could be recomputed, so whatever is stored
+                    # survives — including a label that this run has just
+                    # disproved. `soc_plus_charge` asserts "my energy
+                    # includes a session delivered inside my window"; with
+                    # `kwh_charged_during` NULL that is provably false, and
+                    # leaving it there presents a stranded number as a
+                    # derivation nobody can reproduce. Observed on the real
+                    # id352: 2.58 kWh from a v0.8.17 run that credited a
+                    # whole session, kept through two later runs that both
+                    # concluded the session contributed nothing.
+                    #
+                    # The value stays — cost and the lifetime kWh
+                    # aggregates need a number, the same call v0.8.15 and
+                    # v0.8.17 made when suppressing a consumption figure.
+                    # Only the claim is dropped, to NULL: "no longer known
+                    # how this was derived", already a legal state for
+                    # rows where neither SoC nor power was available.
+                    if (
+                        energy is None
+                        and new_during is None
+                        and row["energy_source"] == "soc_plus_charge"
+                    ):
+                        updates["energy_source"] = None
+                        updates["low_confidence"] = 1
+                        counts["stale_energy_source_cleared"] += 1
 
                 if updates:
                     cols = ", ".join(f"{k} = ?" for k in updates)

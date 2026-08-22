@@ -1511,3 +1511,83 @@ async def test_heal_does_not_reanchor_soc_over_a_boundary_charge(
     # 1 SoC point of an 82.5 kWh pack, no charge inside the window.
     assert healed.energy_kwh == pytest.approx(0.83, abs=0.02)
     assert healed.energy_source == "soc"
+
+
+async def test_heal_drops_an_energy_source_its_own_fields_contradict(
+    storage: TripStorage,
+) -> None:
+    """The heal must not leave a row asserting a premise it just disproved.
+
+    Real state of trip id352 after two heal runs. `energy_source` says
+    `soc_plus_charge` — "this energy includes a charge delivered inside my
+    window" — while `kwh_charged_during` is NULL, which says the opposite.
+    The 2.58 kWh is a fossil: the v0.8.17 run computed it by crediting the
+    whole 1.76 kWh session plus one SoC point, v0.8.18 then re-derived the
+    session's contribution as zero, and because `soc_used` had gone
+    negative in between neither run could recompute the number, so it was
+    stranded with a label that no longer describes it.
+
+    The value itself stays — cost and the lifetime kWh aggregates need a
+    number, the same call v0.8.15 and v0.8.17 made when suppressing a
+    consumption figure. It is the *claim* that cannot survive.
+    """
+    prev_end = dt_util.now() - timedelta(hours=5)
+    trip_start = prev_end + timedelta(hours=1)
+
+    await storage.async_insert(TripRecord(
+        started_at=prev_end - timedelta(minutes=20), ended_at=prev_end,
+        duration_min=20.0, distance_km=10.0,
+        soc_start=70.0, soc_end=64.0, soc_used_pct=6.0,
+        energy_kwh=4.95, energy_source="soc",
+    ))
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=trip_start - timedelta(minutes=12),
+        ended_at=trip_start + timedelta(microseconds=177),
+        kwh=1.76, price_per_kwh=0.07, total_cost=0.12, currency="EUR",
+        soc_start=63.0, soc_end=66.0,
+    ))
+    trip_id = await storage.async_insert(TripRecord(
+        started_at=trip_start, ended_at=trip_start + timedelta(minutes=27),
+        duration_min=27.0, distance_km=3.0,
+        # soc_start already re-anchored down by the earlier run, so the
+        # SoC delta is negative and no recompute is possible.
+        soc_start=64.0, soc_end=65.0, soc_used_pct=-1.0,
+        energy_kwh=2.58, energy_source="soc_plus_charge",
+        consumption_kwh_100km=None,
+    ))
+
+    await storage.async_heal_history(battery_capacity_kwh=82.5)
+
+    healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip_id]
+    assert healed.kwh_charged_during is None
+    assert healed.energy_source is None, "the soc_plus_charge claim is false"
+    assert healed.energy_kwh == pytest.approx(2.58), "the number is kept"
+    assert healed.low_confidence
+
+
+async def test_heal_keeps_a_consistent_energy_source_untouched(
+    storage: TripStorage,
+) -> None:
+    """Only a contradicted claim is cleared. A `soc_plus_charge` row that
+    really does have a charge inside its window keeps its label.
+    """
+    base = dt_util.now() - timedelta(days=1)
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=base + timedelta(minutes=10),
+        ended_at=base + timedelta(minutes=40),
+        kwh=20.0, price_per_kwh=0.30, total_cost=6.0, currency="EUR",
+        soc_start=40.0, soc_end=64.0,
+    ))
+    trip_id = await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(hours=1),
+        duration_min=60.0, distance_km=50.0,
+        soc_start=50.0, soc_end=60.0, soc_used_pct=-10.0,
+        energy_kwh=20.0, energy_source="soc_plus_charge",
+        kwh_charged_during=20.0, consumption_kwh_100km=40.0,
+    ))
+
+    await storage.async_heal_history(battery_capacity_kwh=82.5)
+
+    healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip_id]
+    assert healed.kwh_charged_during == pytest.approx(20.0)
+    assert healed.energy_source == "soc_plus_charge"
