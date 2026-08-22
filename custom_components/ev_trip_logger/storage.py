@@ -63,6 +63,29 @@ def _parse_stored(value: str | None) -> datetime | None:
     return ts
 
 
+#: Tolerance on the upper bound of the "charged before this trip" window.
+#:
+#: The v0.8.17 mutex has the charge-off handler open the trip, so both
+#: stamps come out of the same event cascade and land microseconds apart —
+#: one instant recorded twice. Compared exactly, `ended_at <= trip_start`
+#: fails, and the session is not reported as having charged before the
+#: trip. That NULL is not cosmetic: `heal_history`'s "provably impossible
+#: SoC rise while parked" rule reads it as "nothing charged in the gap" and
+#: re-anchors a real SoC start downwards, destroying the charge's points.
+#:
+#: 60 s absorbs the shared-instant case plus a full cloud-poll interval.
+#:
+#: Deliberately NOT applied to the "during" bucket. That question — how
+#: much of a session was still to come when the window opened — is already
+#: answered by SoC in `_apportion_straddling_charge`, and a time-based
+#: exclusion there wrongly drops a genuine mid-trip charge whenever the
+#: two events happen to sit close together. The buckets may therefore both
+#: count a charge that ends right at the boundary; `before` is
+#: informational, only `during` feeds the trip's energy, so the overlap
+#: costs nothing while the missing `before` cost a SoC anchor.
+_CHARGE_TRIP_BOUNDARY_TOLERANCE_S: int = 60
+
+
 def _apportion_straddling_charge(
     kwh: float,
     *,
@@ -1037,6 +1060,23 @@ class TripStorage:
     def _charges_in_window(
         self, since: datetime, until: datetime
     ) -> dict[str, float | int]:
+        # Normalise the bounds the same way the rows are written. Rows go
+        # in as local ISO (`_iso_local`) and this compares `ended_at` as
+        # TEXT, so a bare .isoformat() from a UTC caller — the recovery
+        # sweep takes its stamps straight from the recorder — compares
+        # '…+00:00' bounds against '…+02:00' rows and matches NOTHING.
+        # Same defect v0.8.17 fixed in `_trip_overlaps`; it was never
+        # applied here, so this query silently returned zero for every
+        # UTC-bounded caller.
+        #
+        # The upper bound also carries the boundary tolerance, so a charge
+        # that ended as the trip opened counts as "before" instead of
+        # falling between the two buckets (see
+        # `_CHARGE_TRIP_BOUNDARY_TOLERANCE_S`).
+        lo = _iso_local(since)
+        hi = _iso_local(
+            until + timedelta(seconds=_CHARGE_TRIP_BOUNDARY_TOLERANCE_S)
+        )
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -1045,7 +1085,7 @@ class TripStorage:
                 FROM charges
                 WHERE ended_at >= ? AND ended_at <= ?
                 """,
-                (since.isoformat(), until.isoformat()),
+                (lo, hi),
             ).fetchone()
         return {"kwh": float(row[0] or 0), "count": int(row[1] or 0)}
 
@@ -3195,11 +3235,19 @@ class TripStorage:
                             soc_end=c_soc_e,
                             trip_soc_start=row["soc_start"],
                         )
+                # `before` carries the boundary tolerance the exact
+                # comparison lacked (see
+                # `_CHARGE_TRIP_BOUNDARY_TOLERANCE_S`); `during` above
+                # needs none, because SoC already decides how much of a
+                # session was still to come when the window opened.
                 before = 0.0
                 if prev_end_ts is not None and prev_end_ts < start:
+                    before_hi = start + timedelta(
+                        seconds=_CHARGE_TRIP_BOUNDARY_TOLERANCE_S
+                    )
                     before = sum(
                         kwh for _cs, c_end, kwh, _ss, _se in charges
-                        if prev_end_ts <= c_end <= start
+                        if prev_end_ts <= c_end <= before_hi
                     )
                 new_during = round(during, 2) if during > 0.005 else None
                 new_before = round(before, 2) if before > 0 else None

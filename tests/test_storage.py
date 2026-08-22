@@ -1369,3 +1369,145 @@ async def test_heal_history_apportions_a_straddling_charge(
     # 23.92 in, 11 points (9.08 kWh) more stored at the end → 14.84 used
     assert healed.energy_kwh == pytest.approx(14.84, abs=0.02)
     assert healed.consumption_kwh_100km == pytest.approx(20.1, abs=0.1)
+
+
+async def test_charge_ending_on_the_trip_boundary_lands_in_before_not_nowhere(
+    storage: TripStorage,
+) -> None:
+    """The real 2026-08-17 collision: charge id53 and trip id352.
+
+    The v0.8.17 mutex has the charge-off handler open the trip, so the two
+    stamps come out of the same event cascade — charge id53 ended at
+    14:21:56.961478 and trip id352 started at 14:21:56.961301, 177
+    MICROSECONDS earlier. That is one instant recorded twice, but the two
+    buckets disagreed about it and the session fell through the gap:
+
+    * `kwh_charged_before` asks for `ended_at <= trip_start`, which fails
+      by those 177 us, so the charge is not "before".
+    That NULL is not cosmetic — `heal_history` reads it as "nothing
+    charged in the gap" (see
+    `test_heal_does_not_reanchor_soc_over_a_boundary_charge`).
+
+    All 1.76 kWh belong to `before`. `during` needs no time tolerance of
+    its own: the trip anchored at the SoC the charge finished on, so SoC
+    already says none of the session was still to come.
+    """
+    trip_start = dt_util.now() - timedelta(hours=3)
+    charge_end = trip_start + timedelta(microseconds=177)
+    prev_trip_end = trip_start - timedelta(hours=1)
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=charge_end - timedelta(minutes=12, seconds=25),
+        ended_at=charge_end,
+        kwh=1.76, price_per_kwh=0.07, total_cost=0.12, currency="EUR",
+        soc_start=63.0, soc_end=66.0,
+    ))
+
+    before = await storage.async_charges_in_window(prev_trip_end, trip_start)
+    assert before["count"] == 1, "the charge ended AT the trip start"
+    assert before["kwh"] == pytest.approx(1.76)
+
+    during = await storage.async_charges_attributable_to_trip(
+        trip_start, trip_start + timedelta(minutes=27), trip_soc_start=66.0,
+    )
+    assert during == pytest.approx(0.0), "it had already finished"
+
+
+async def test_charge_well_inside_the_trip_is_still_attributed(
+    storage: TripStorage,
+) -> None:
+    """The boundary tolerance must not swallow a real mid-trip session.
+
+    A stop that plugs in ten minutes into a drive genuinely delivered
+    inside the window, and stays apportioned by SoC.
+    """
+    trip_start = dt_util.now() - timedelta(hours=4)
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=trip_start + timedelta(minutes=10),
+        ended_at=trip_start + timedelta(minutes=30),
+        kwh=20.0, price_per_kwh=0.50, total_cost=10.0, currency="EUR",
+        soc_start=40.0, soc_end=70.0,
+    ))
+    during = await storage.async_charges_attributable_to_trip(
+        trip_start, trip_start + timedelta(hours=1), trip_soc_start=40.0,
+    )
+    assert during == pytest.approx(20.0), "started inside → counts in full"
+
+
+async def test_charges_in_window_matches_across_mixed_timezone_bounds(
+    storage: TripStorage,
+) -> None:
+    """Rows are written as local ISO (`_iso_local`); the recovery sweep and
+    the correction services hand these bounds recorder/UTC stamps. The
+    window query compares `ended_at` as TEXT, so un-normalised bounds
+    compare '+00:00' against '+02:00' rows and silently match nothing —
+    the same defect v0.8.17 fixed in `_trip_overlaps` and never applied
+    here.
+    """
+    ended = dt_util.now() - timedelta(hours=6)
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=ended - timedelta(hours=1), ended_at=ended,
+        kwh=11.0, price_per_kwh=0.20, total_cost=2.20, currency="EUR",
+        soc_start=30.0, soc_end=45.0,
+    ))
+    local = await storage.async_charges_in_window(
+        ended - timedelta(hours=2), ended + timedelta(hours=2),
+    )
+    assert local["kwh"] == pytest.approx(11.0)
+
+    as_utc = await storage.async_charges_in_window(
+        (ended - timedelta(hours=2)).astimezone(timezone.utc),
+        (ended + timedelta(hours=2)).astimezone(timezone.utc),
+    )
+    assert as_utc["kwh"] == pytest.approx(11.0), "UTC bounds must match too"
+
+
+async def test_heal_does_not_reanchor_soc_over_a_boundary_charge(
+    storage: TripStorage,
+) -> None:
+    """The heal keeps its OWN copy of the charge-window logic, so fixing
+    `_charges_in_window` / `_charges_attributable_to_trip` does not reach
+    it. Without the same tolerance there, the real 2026-08-17 rows healed
+    into a worse state than they started:
+
+    charge id53 (63 -> 66 %, 1.76 kWh) ended 177 us after trip id352
+    opened at 66 %. Both buckets came out NULL, so the "provably
+    impossible SoC rise while parked" rule concluded the 66 % start could
+    not be real and re-anchored it down to the previous trip's 64 % —
+    erasing the charge's three points and, with them, its energy.
+
+    The charge is visible as `before`, so nothing is impossible and the
+    66 % start must survive.
+    """
+    prev_end = dt_util.now() - timedelta(hours=5)
+    trip_start = prev_end + timedelta(hours=1)
+    charge_end = trip_start + timedelta(microseconds=177)
+
+    await storage.async_insert(TripRecord(
+        started_at=prev_end - timedelta(minutes=20), ended_at=prev_end,
+        duration_min=20.0, distance_km=10.0,
+        soc_start=70.0, soc_end=64.0, soc_used_pct=6.0,
+        energy_kwh=4.95, energy_source="soc",
+    ))
+    await storage.async_insert_charge(ChargeRecord(
+        started_at=charge_end - timedelta(minutes=12, seconds=25),
+        ended_at=charge_end,
+        kwh=1.76, price_per_kwh=0.07, total_cost=0.12, currency="EUR",
+        soc_start=63.0, soc_end=66.0,
+    ))
+    trip_id = await storage.async_insert(TripRecord(
+        started_at=trip_start,
+        ended_at=trip_start + timedelta(minutes=27),
+        duration_min=27.0, distance_km=3.0,
+        soc_start=66.0, soc_end=65.0, soc_used_pct=1.0,
+        energy_kwh=0.83, energy_source="soc",
+    ))
+
+    await storage.async_heal_history(battery_capacity_kwh=82.5)
+
+    healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip_id]
+    assert healed.soc_start == pytest.approx(66.0), "must not re-anchor to 64"
+    assert healed.kwh_charged_before == pytest.approx(1.76)
+    assert healed.kwh_charged_during is None, "the charge had finished"
+    # 1 SoC point of an 82.5 kWh pack, no charge inside the window.
+    assert healed.energy_kwh == pytest.approx(0.83, abs=0.02)
+    assert healed.energy_source == "soc"

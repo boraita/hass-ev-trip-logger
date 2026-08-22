@@ -2,6 +2,22 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.21 — 2026-08-22
+**Fix — a charge that ended as a trip began was lost from both charge buckets, and the heal then erased its SoC.** The v0.8.17 mutex has the charge-off handler open the trip, so the two stamps come out of the same event cascade. On the real 2026-08-17 rows they landed 177 **microseconds** apart: charge id53 ended at `14:21:56.961478`, trip id352 started at `14:21:56.961301`. One instant, recorded twice — and compared exactly, the session satisfied neither bucket:
+
+- `kwh_charged_before` asks for `ended_at <= trip_start`, which those 177 us fail.
+- `kwh_charged_during` sees the session started before the window and treats it as still delivering, apportioning it by SoC — but it had already finished.
+
+Both came out NULL. The "provably impossible SoC rise while parked" rule in `heal_history` then concluded a 66 % start could not follow a 64 % end with nothing charged in between, and re-anchored `soc_start` down to 64 — erasing the charge's three points and the energy they represented.
+
+The `before` window now carries a 60 s tolerance on its upper bound, which absorbs the shared-instant case plus a full cloud-poll interval. `heal_history` keeps its own copy of this logic — it runs inside one executor job over an already-loaded charge list — so the tolerance is applied there too; without it, running the heal made the rows worse than leaving them alone.
+
+The tolerance is deliberately **not** applied to the `during` bucket. The first attempt did apply it symmetrically, on the reasoning that the two buckets should stay disjoint, and that broke a v0.8.17 regression test: a genuine mid-trip top-up whose timeline is compressed sits within seconds of the trip's start, and a time-based exclusion drops it. "How much of a session was still to come when the window opened" is a SoC question, and `_apportion_straddling_charge` already answers it correctly — a trip that anchored at the SoC the charge finished on gets nothing, exactly as intended. The buckets can therefore both count a charge that ends right at the boundary; `before` is informational and only `during` feeds the trip's energy, so the overlap costs nothing, while the missing `before` cost a SoC anchor.
+
+Dry-run against the user's real 60-trip / 60-charge history before release: exactly one boundary collision exists in it (id53/id352), and it now reports `kwh_charged_before = 1.76` instead of NULL, with `soc_start` no longer moving. Note this prevents recurrence rather than repairing the past — id352's `soc_start` was already re-anchored to 64 by an earlier run, and because its `soc_used` is now negative the heal will not recompute `energy_kwh`, so that row still carries the stale `2.58` / `soc_plus_charge` from v0.8.17 and needs `set_trip` to restore `soc_start = 66`.
+
+**Fix — `async_charges_in_window` silently returned zero for every UTC-bounded caller.** Rows are written as local ISO (`_iso_local`) and the query compares `ended_at` as TEXT, so bounds passed as `.isoformat()` from a UTC caller — the recovery sweep takes its stamps straight from the recorder — compared `'…+00:00'` against `'…+02:00'` rows and matched nothing. This is the same defect v0.8.17 fixed in `_trip_overlaps`; it was never applied here. The bounds are now normalised the same way the rows are written. Verified by a test that runs the identical window with local and UTC bounds and requires both to find the charge (the UTC form returned 0.0 kWh before).
+
 ## v0.8.20 — 2026-08-22
 **Fix — ABRP telemetry rejected by the server was counted as delivered.** The Iternio Telemetry API uses HTTP status codes only for serious errors — a bad API key, a malformed call. A *rejected sample* comes back as HTTP 200 with `{"status": "error", "errors": [...]}` in the body, most commonly because `car_model` is not a slug ABRP recognises (it is a free-text field, so a typo is easy and nothing validates it). The client stopped at the status code and never read the body, so every rejected push was recorded as a success: the failure counter reset, the backoff never engaged, `last_sent_at` kept advancing, and the switch reported a healthy connection while ABRP was storing nothing.
 
