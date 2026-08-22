@@ -18,6 +18,7 @@ from custom_components.ev_trip_logger.const import (
     CONF_BATTERY_CAPACITY,
     CONF_CABIN_TEMP_SENSOR,
     CONF_CHARGE_SENSOR,
+    CONF_EVSE_POWER_SENSOR,
     CONF_HVAC_SETPOINT_SENSOR,
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
@@ -4020,3 +4021,116 @@ async def test_capacity_hint_is_published_before_the_startup_cost_heal(
     )
     second = (await coordinator.storage.async_recent_trips(1))[0].cost
     assert second == pytest.approx(first)
+
+
+EVSE_POW = "sensor.wallbox_power"
+
+
+async def test_auto_evse_backfill_scheduled_when_live_integral_empty(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.8.19 — a home charge that closed with no live AC integral gets its
+    EVSE window replayed from the recorder, shortly after the close.
+
+    This is the common case, not an edge one: the charge sensor is
+    cloud-polled, so `current_charge` frequently doesn't exist while the
+    wallbox is delivering and `evse_energy_kwh` stayed NULL on every row.
+    """
+    hass.states.async_set(CHG, STATE_OFF)
+    hass.states.async_set(EVSE_POW, "0", {"unit_of_measurement": "kW"})
+    entry = await _setup(
+        hass, **{CONF_CHARGE_SENSOR: CHG, CONF_EVSE_POWER_SENSOR: EVSE_POW},
+    )
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    calls: list[int] = []
+
+    async def _fake_backfill(*, charge_id: int, **_kw):
+        calls.append(charge_id)
+        return None
+
+    monkeypatch.setattr(
+        coordinator, "async_backfill_charge_evse_service", _fake_backfill,
+    )
+
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(BAT, "90")
+    await hass.async_block_till_done()
+    hass.states.async_set(CHG, STATE_OFF)
+    await hass.async_block_till_done()
+
+    charge_id = coordinator.last_charge.charge_id
+    assert charge_id is not None
+    # Deferred, so the recorder has time to commit the tail of the session.
+    assert calls == []
+
+    await _advance(hass, 1)
+    assert calls == [charge_id]
+
+
+async def test_no_auto_evse_backfill_without_a_wallbox_sensor(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No `evse_power_sensor` configured → nothing to replay, no call."""
+    hass.states.async_set(CHG, STATE_OFF)
+    entry = await _setup(hass, **{CONF_CHARGE_SENSOR: CHG})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    calls: list[int] = []
+
+    async def _fake_backfill(*, charge_id: int, **_kw):
+        calls.append(charge_id)
+        return None
+
+    monkeypatch.setattr(
+        coordinator, "async_backfill_charge_evse_service", _fake_backfill,
+    )
+
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(BAT, "90")
+    await hass.async_block_till_done()
+    hass.states.async_set(CHG, STATE_OFF)
+    await hass.async_block_till_done()
+
+    await _advance(hass, 1)
+    assert calls == []
+
+
+async def test_pending_evse_backfill_cancelled_on_stop(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.8.19 — an options change reloads the entry; a replay still in the
+    queue must not fire against the stopped coordinator's storage.
+    """
+    hass.states.async_set(CHG, STATE_OFF)
+    hass.states.async_set(EVSE_POW, "0", {"unit_of_measurement": "kW"})
+    entry = await _setup(
+        hass, **{CONF_CHARGE_SENSOR: CHG, CONF_EVSE_POWER_SENSOR: EVSE_POW},
+    )
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    calls: list[int] = []
+
+    async def _fake_backfill(*, charge_id: int, **_kw):
+        calls.append(charge_id)
+        return None
+
+    monkeypatch.setattr(
+        coordinator, "async_backfill_charge_evse_service", _fake_backfill,
+    )
+
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    hass.states.async_set(BAT, "90")
+    await hass.async_block_till_done()
+    hass.states.async_set(CHG, STATE_OFF)
+    await hass.async_block_till_done()
+
+    assert coordinator._pending_evse_backfills
+    await coordinator.async_stop()
+    assert not coordinator._pending_evse_backfills
+
+    await _advance(hass, 1)
+    assert calls == []

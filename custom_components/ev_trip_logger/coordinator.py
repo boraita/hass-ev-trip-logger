@@ -669,6 +669,12 @@ _MAX_POWER_TRAPEZOID_DT_H = 20.0 / 60.0
 # throttle for 10 min" territory, beyond which the sample is junk.
 _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH = 5.0
 
+# v0.8.19 — delay before replaying a just-closed charge's EVSE window from
+# the recorder. The recorder commits roughly once a second, but the last
+# wallbox samples of a session can land after our close, so give it a
+# comfortable margin rather than racing it.
+_EVSE_BACKFILL_DELAY_S = 30.0
+
 # v0.5.97 — driver-sensor pre/post window used by `_async_driver_during`
 # and the live-close fallback. Wide enough to catch BT/AA flickers that
 # pair briefly *before* ignition (the trip-191 case: AA went on at
@@ -1112,6 +1118,8 @@ class EvTripLoggerCoordinator:
         # v0.5.79 — periodic stuck-trip watchdog (always-on; runs even
         # when no live tick is active).
         self._unsub_stuck_watchdog: CALLBACK_TYPE | None = None
+        # v0.8.19 — charge_id → cancel handle for a deferred EVSE replay.
+        self._pending_evse_backfills: dict[int, CALLBACK_TYPE] = {}
         # v0.6.4 — periodic refresh of `_avg_tariff_cache_per_kwh`.
         self._unsub_avg_tariff: CALLBACK_TYPE | None = None
         # Pending synthetic-trip finalize timer + baseline (start_t, start_odo,
@@ -2369,6 +2377,8 @@ class EvTripLoggerCoordinator:
         # v0.5.49 — make sure a deferred live-open retry doesn't fire
         # after async_stop (would touch a stopped coordinator).
         self._cancel_pending_open()
+        # v0.8.19 — same reasoning for a deferred EVSE replay.
+        self._cancel_pending_evse_backfills()
 
     @callback
     def _async_vehicle_on_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -3990,6 +4000,15 @@ class EvTripLoggerCoordinator:
                     "cable still plugged in" if can_merge
                     else "continuation pulse within 2 h, no drive in between",
                 )
+                # v0.8.19 — the merge path takes an early return, so it needs
+                # the same recorder replay as a fresh insert: a merged row
+                # whose AC side is still empty is exactly as blind.
+                if (
+                    self._evse_power_sensor
+                    and not merged.evse_energy_kwh
+                    and merged.charge_id is not None
+                ):
+                    self._schedule_evse_backfill(merged.charge_id)
                 self.hass.bus.async_fire(
                     EVENT_CHARGE_LOGGED,
                     {"entry_id": self.entry_id, **merged.to_dict()},
@@ -4001,7 +4020,7 @@ class EvTripLoggerCoordinator:
         # Location comes from the configured device_tracker (e.g. zone "home"); falls
         # back to "auto" so we can still tell auto-detected charges apart in the log.
         location = self._read_str(self._location) if self._location else None
-        await self.async_log_charge_service(
+        record = await self.async_log_charge_service(
             kwh=kwh,
             location=location or "auto",
             notes=f"auto-detected from {self._charge_sensor}",
@@ -4020,6 +4039,78 @@ class EvTripLoggerCoordinator:
             # read the current exterior-temp sensor at close.
             temperature_c=None,
         )
+        # v0.8.19 — the live AC integral comes out empty whenever the session
+        # object didn't exist while the wallbox was delivering: the charge
+        # sensor is cloud-polled, so `current_charge` can be opened (or
+        # reconstructed) after the fact, and `_async_evse_power_changed` then
+        # had nothing to accumulate into. Historically that left
+        # `evse_energy_kwh` — and with it `charging_efficiency_pct` — NULL on
+        # roughly half the home charges even with a healthy wallbox sensor.
+        # Rather than trust the live integral, replay the session window from
+        # the recorder: the exact integration the manual
+        # `backfill_charge_evse` service performs, just applied automatically.
+        if (
+            self._evse_power_sensor
+            and active.evse_energy_kwh <= 0
+            and record.charge_id is not None
+            # A configured wallbox implies home; when there's no location
+            # tracker at all we can't tell, and guessing "not home" would
+            # silently disable the backfill for that whole class of setup.
+            and (location is None or self._is_at_any_home(location))
+        ):
+            self._schedule_evse_backfill(record.charge_id)
+
+    def _schedule_evse_backfill(self, charge_id: int) -> None:
+        """Integrate a just-closed charge's EVSE window from the recorder.
+
+        Deferred by `_EVSE_BACKFILL_DELAY_S` so the recorder has committed
+        the tail of the session. Failures are logged and swallowed: a
+        missing AC figure must never take the charge row down with it.
+
+        The cancel handle is kept per charge so `async_stop` can drop a
+        pending replay — an options change reloads the entry, and a timer
+        that fires afterwards would write through a stopped coordinator's
+        storage. Two charges can be in flight at once (a pulse merged in
+        just before an unplug), hence a dict rather than one slot.
+        """
+
+        async def _run(_now: datetime | None = None) -> None:
+            self._pending_evse_backfills.pop(charge_id, None)
+            try:
+                patched = await self.async_backfill_charge_evse_service(
+                    charge_id=charge_id,
+                )
+            except Exception:  # pragma: no cover — defensive
+                _LOGGER.exception(
+                    "Auto EVSE backfill failed for charge %s", charge_id,
+                )
+                return
+            if patched is not None:
+                _LOGGER.info(
+                    "Auto EVSE backfill: charge #%s → %.2f kWh AC, "
+                    "efficiency %.1f %%",
+                    charge_id,
+                    patched.evse_energy_kwh or 0.0,
+                    patched.charging_efficiency_pct or 0.0,
+                )
+                self._notify_listeners()
+                self._notify_trip_log_listeners()
+
+        # A second close for the same charge (merge → re-close) replaces the
+        # pending replay instead of stacking a duplicate recorder query.
+        existing = self._pending_evse_backfills.pop(charge_id, None)
+        if existing:
+            existing()
+        self._pending_evse_backfills[charge_id] = async_call_later(
+            self.hass, _EVSE_BACKFILL_DELAY_S, _run
+        )
+
+    def _cancel_pending_evse_backfills(self) -> None:
+        """Drop every deferred EVSE replay (entry unload / reload)."""
+        for unsub in list(self._pending_evse_backfills.values()):
+            if unsub:
+                unsub()
+        self._pending_evse_backfills.clear()
 
     @callback
     def _async_temp_changed(self, event: Event[EventStateChangedData]) -> None:

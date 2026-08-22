@@ -2,6 +2,13 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.19 — 2026-08-22
+**Fix — a home charge could close with no AC-side energy even with a healthy wallbox.** The AC integration is fed by state changes on `evse_power_sensor` and accumulates into the *open* charge session. With a cloud-polled `charge_sensor` that session doesn't always exist while the wallbox is delivering: it opens late, or the session is reconstructed after the fact, and every sample that arrived in between had nowhere to go. Those charges were written with `evse_energy_kwh` NULL, and with it no `charging_efficiency_pct` — reviewing a real 60-charge history, 19 of the 39 home charges had no AC side, all of them from before the v0.8.x charge work.
+
+The live integral is no longer the only chance to measure it. When a home charge closes — or a continuation pulse merges into one — with nothing accumulated, the session window is replayed from the recorder 30 s later: the same integration the manual `backfill_charge_evse` service performs, masked by `charge_sensor` so the wallbox's standby draw between pulses isn't counted as delivery. The delay lets the recorder commit the tail of the session rather than racing it.
+
+Scope is deliberately narrow: it only runs with an `evse_power_sensor` configured and at a home (or secondary-home) location, since an away DCFC has no wallbox samples to find and its AC side comes from the operator's invoice instead. A replay still queued when the entry reloads is cancelled, so it can't write through a stopped coordinator.
+
 ## v0.8.18 — 2026-08-21
 **Fix — a charge that was already running when a trip opened had its whole session billed to that trip.** Regression in v0.8.17's mid-trip-charge correction, caught by running `heal_history` against real data: the lifetime driven/charged ratio went the wrong way, from 1.07 to 1.22, and two rows came out physically impossible — a 74 km leg credited all 66.83 kWh of the session it opened in the middle of (78 kWh/100km), and a 3 km hop credited a session that had finished as it set off (86 kWh/100km).
 
