@@ -775,7 +775,17 @@ class AggregateSensor(_BaseTripSensor):
             # sum can legitimately drop as old high-value days age out
             # of the window. TOTAL_INCREASING assumes only-up-or-reset,
             # so the recorder flags every rolling decrease as invalid.
-            state_class = SensorStateClass.MEASUREMENT
+            #
+            # TOTAL, not MEASUREMENT: `total` is the state class that both
+            # tolerates a decrease (it derives statistics from signed
+            # deltas rather than assuming a reset) and stays valid on the
+            # ENERGY device_class these keys declare. MEASUREMENT looked
+            # right for "a value that goes up and down", but HA rejects
+            # device_class=energy + state_class=measurement outright —
+            # "impossible considering device class" — which silently kept
+            # regen_30d and discharge_30_days out of long-term statistics
+            # altogether, the opposite of what this branch is for.
+            state_class = SensorStateClass.TOTAL
         self.entity_description = SensorEntityDescription(
             key=f"total_{slug}",
             translation_key=f"total_{slug}",

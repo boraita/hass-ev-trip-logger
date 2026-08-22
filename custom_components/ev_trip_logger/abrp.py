@@ -154,6 +154,9 @@ class AbrpClient:
         self.next_charge_soc: int | None = None
         #: Timestamp of the last successful send (for diagnostics).
         self.last_sent_at: float | None = None
+        #: Last rejection reported by ABRP in a 200 response body, or None
+        #: when the most recent send was accepted (for diagnostics).
+        self.last_error: str | None = None
 
     @property
     def _suppressed(self) -> bool:
@@ -194,7 +197,28 @@ class AbrpClient:
                     _LOGGER.debug("ABRP send HTTP %s", resp.status)
                     self._note_failure()
                     return False
+                # The API only uses HTTP status codes for serious errors
+                # (bad key, malformed call). A *rejected sample* comes back
+                # as 200 with {"status": "error", "errors": [...]} — so a
+                # client that stops at the status code silently reports
+                # undelivered telemetry as delivered, never backs off, and
+                # leaves the user with no signal at all. Read the body.
+                try:
+                    body = await resp.json(content_type=None)
+                except (ClientError, ValueError) as exc:
+                    # Unparseable/absent body (proxy stripped it, empty
+                    # response). We only fail on a positively-read non-ok
+                    # status, so treat this as delivered.
+                    _LOGGER.debug("ABRP send: unreadable 200 body: %s", exc)
+                    body = None
+                error = _reject_reason(body)
+                if error is not None:
+                    self.last_error = error
+                    _LOGGER.warning("ABRP rejected the telemetry: %s", error)
+                    self._note_failure()
+                    return False
                 self._fail_count = 0
+                self.last_error = None
                 self.last_sent_at = time.time()
                 return True
         except ClientError as exc:
@@ -219,6 +243,35 @@ class AbrpClient:
             return self.next_charge_soc
         self.next_charge_soc = _parse_next_charge(data)
         return self.next_charge_soc
+
+
+def _reject_reason(data: Any) -> str | None:
+    """Return why ABRP rejected a sample, or None when it accepted it.
+
+    The documented envelope is ``{"status": "ok" | "error", ...}`` with an
+    ``errors`` property when the status is not ok. We deliberately only
+    report a rejection when we can positively read a non-ok status: an
+    absent or unrecognised body must not turn a working push into a
+    permanent failure.
+    """
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    if not isinstance(status, str) or status.lower() == "ok":
+        return None
+    errors = data.get("errors")
+    if isinstance(errors, (list, tuple)) and errors:
+        detail = "; ".join(str(e) for e in errors)
+    elif errors:
+        detail = str(errors)
+    else:
+        detail = str(data.get("error") or "no detail given")
+    # `status` is almost always the literal "error", which reads as noise
+    # in front of the reason when a UI renders this string verbatim. Keep
+    # it only when it carries information of its own.
+    if status.lower() == "error":
+        return detail
+    return f"{status}: {detail}"
 
 
 def _parse_next_charge(data: Any) -> int | None:

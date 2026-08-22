@@ -97,4 +97,10 @@ class AbrpPushSwitch(SwitchEntity, RestoreEntity):
             "interval_s": self._coordinator._abrp_interval_s,
             "last_sent_at": getattr(client, "last_sent_at", None),
             "car_model": self._coordinator._abrp_car_model,
+            # ABRP reports a rejected sample as HTTP 200 with an error
+            # body, so "the switch is on and nothing broke" is not proof
+            # the telemetry landed. None here means the last push was
+            # accepted; a string is ABRP's own reason for dropping it
+            # (most often an unknown `car_model`).
+            "last_error": getattr(client, "last_error", None),
         }

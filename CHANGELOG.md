@@ -2,6 +2,17 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.20 — 2026-08-22
+**Fix — ABRP telemetry rejected by the server was counted as delivered.** The Iternio Telemetry API uses HTTP status codes only for serious errors — a bad API key, a malformed call. A *rejected sample* comes back as HTTP 200 with `{"status": "error", "errors": [...]}` in the body, most commonly because `car_model` is not a slug ABRP recognises (it is a free-text field, so a typo is easy and nothing validates it). The client stopped at the status code and never read the body, so every rejected push was recorded as a success: the failure counter reset, the backoff never engaged, `last_sent_at` kept advancing, and the switch reported a healthy connection while ABRP was storing nothing.
+
+The body is now parsed. A positively-read non-ok status fails the send and feeds the same backoff as a transport error, and ABRP's own reason is logged at warning level and published as a `last_error` attribute on `switch.abrp_push` (None when the last push was accepted). A 200 whose body cannot be parsed — proxy stripped it, empty response — still counts as delivered: only a status we actually read is allowed to turn a working push into a failure.
+
+**Fix — the two 30-day energy roll-ups were excluded from long-term statistics.** `regen_30d` and `discharge_30_days` registered `state_class: measurement` alongside `device_class: energy`, a pair HA rejects outright ("impossible considering device class; expected None or one of total, total_increasing"), so neither sensor ever produced a statistic.
+
+The `measurement` came from a deliberate downgrade: unlike today/week/month/year, "30d" is a rolling lookback whose sum legitimately *drops* as old high-value days age out of the window, and `total_increasing` reads every such decrease as a counter reset. The downgrade fixed that and broke the device-class pairing instead. `total` is the state class that does both — it derives statistics from signed deltas, so a decrease is just a negative delta, and it is valid on an energy sensor. Nothing else changes; the calendar periods keep `total_increasing`.
+
+A new test walks every period x key combination the roll-ups can be built with and asserts the pair against `DEVICE_CLASS_STATE_CLASSES`, HA's own validity table, so a future state-class change picked for its recorder behaviour cannot silently break the pairing again.
+
 ## v0.8.19 — 2026-08-22
 **Fix — a home charge could close with no AC-side energy even with a healthy wallbox.** The AC integration is fed by state changes on `evse_power_sensor` and accumulates into the *open* charge session. With a cloud-polled `charge_sensor` that session doesn't always exist while the wallbox is delivering: it opens late, or the session is reconstructed after the fact, and every sample that arrived in between had nowhere to go. Those charges were written with `evse_energy_kwh` NULL, and with it no `charging_efficiency_pct` — reviewing a real 60-charge history, 19 of the 39 home charges had no AC side, all of them from before the v0.8.x charge work.
 
