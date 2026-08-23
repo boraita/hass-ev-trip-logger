@@ -1824,6 +1824,14 @@ class TrackedAvgSensor(_BaseTripSensor):
             self._samples = 0
             self._covered_hours = 0.0
         self.async_write_ha_state()
+        # v0.8.24 — v0.8.23 taught `_retry_needed()` to keep waiting for a
+        # missing unit and then never asked it: the only caller was the
+        # recorder-failure branch. The restart race takes the SUCCESS path
+        # — query fine, mean computed, source entity simply not created
+        # yet — so nothing rescheduled and the sensor published
+        # `unit_of_measurement: None` until the next 1800 s tick, which
+        # stops the recorder compiling its statistics. Schedule here too.
+        self._schedule_startup_retry()
 
     @property
     def native_value(self) -> float | None:

@@ -2,6 +2,13 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.24 — 2026-08-24
+**Fix — v0.8.23's unit fix was dead code.** Extending `_retry_needed()` to keep retrying while the unit is unknown was correct and did nothing, because `_schedule_startup_retry()` is called from exactly one place: the branch that runs when the recorder query *fails*. On the success path — the one the restart race actually takes, where the query works, a mean is computed, and only the source entity is missing — the retry was never scheduled at all, so the sensor still sat on `unit_of_measurement: None` until the next 1800 s tick.
+
+Verified against the live install after deploying v0.8.23: all 22 rolling-average sensors still had no unit. The retry is now scheduled after a successful refresh too.
+
+The lesson is the test's: `test_tracked_avg_retries_while_only_the_unit_is_missing` asserted that `_retry_needed()` returns the right answer, which it did. Nothing asserted that anybody asks it.
+
 ## v0.8.23 — 2026-08-24
 Three defects found by reading a real install's logs after a 500 km day, all of them things the integration reported about itself rather than about the car.
 
