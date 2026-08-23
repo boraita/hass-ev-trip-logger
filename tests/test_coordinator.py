@@ -4134,3 +4134,53 @@ async def test_pending_evse_backfill_cancelled_on_stop(
 
     await _advance(hass, 1)
     assert calls == []
+
+
+async def test_odometer_catchup_does_not_release_the_charge_guard(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.23 — the real 2026-08-23 corruption.
+
+    v0.8.17 defers opening a trip while the charge session is still
+    delivering, with an escape hatch: if the odometer has moved >=1 km
+    since the session opened, the charge sensor must be stuck 'on' and the
+    trip has to open anyway.
+
+    That hatch fired for the wrong reason. Polling had been paused for
+    4h31m; when it resumed at 16:47:08 the odometer caught up 46 km, the
+    charge was detected, and `vehicle_on` went high — all inside the same
+    second. The hatch saw "+46 km since the session opened" and released
+    the guard, so a trip opened while the car was drawing 87 kW at a DC
+    charger. That trip then swallowed the charge and reported 197 km at
+    20.0 kWh/100km instead of 24.8.
+
+    46 km in under a second is not movement, it is a stale reading landing.
+    Only a delta the car could plausibly have covered in the elapsed time
+    counts as movement.
+    """
+    hass.states.async_set(CHG, STATE_OFF)
+    hass.states.async_set(ODO, "31028")
+    hass.states.async_set(POW, "0")
+    entry = await _setup(hass, **{CONF_CHARGE_SENSOR: CHG, CONF_POWER: POW})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    hass.states.async_set(CHG, STATE_ON)
+    await hass.async_block_till_done()
+    assert coordinator.current_charge is not None
+    coordinator.current_charge.odometer_at_start = 31028.0
+
+    # 87 kW going INTO the battery (negative = charging after the sign
+    # normalisation), and the odometer catches up 46 km at the same time.
+    hass.states.async_set(POW, "-87")
+    await hass.async_block_till_done()
+    hass.states.async_set(ODO, "31074")
+    await hass.async_block_till_done()
+    assert coordinator._charge_still_delivering() is True, (  # noqa: SLF001
+        "a car taking 87 kW is not driving away from the charger"
+    )
+
+    # Cable out, sensor stuck 'on', car actually rolling: the hatch is for
+    # exactly this and must still fire.
+    hass.states.async_set(POW, "12")     # discharging
+    await hass.async_block_till_done()
+    assert coordinator._charge_still_delivering() is False  # noqa: SLF001

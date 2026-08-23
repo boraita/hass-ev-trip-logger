@@ -669,6 +669,23 @@ _MAX_POWER_TRAPEZOID_DT_H = 20.0 / 60.0
 # throttle for 10 min" territory, beyond which the sample is junk.
 _MAX_POWER_TRAPEZOID_CONTRIBUTION_KWH = 5.0
 
+# v0.8.23 — the >=1 km escape hatch in `_charge_still_delivering` is
+# vetoed while the battery is visibly taking this much power or more. The
+# hatch exists for a charge sensor stuck 'on' while the car drives away,
+# and it keyed on distance alone. On 2026-08-23 a 4h31m polling outage
+# ended with the odometer catching up 46 km in the same second the charge
+# was detected; the hatch read that as driving and let a trip open while
+# 87 kW was going into the battery, which then swallowed the whole session.
+#
+# Elapsed time cannot separate the two — a compressed test timeline moves
+# a legitimately-driving car just as fast as a stale reading lands. Power
+# can, and physically: a car taking 87 kW is not driving away from the
+# charger. Below this threshold the reading is idle noise or a trickle and
+# the odometer stays the arbiter, so a genuinely stuck sensor still
+# releases the guard. With no power sensor configured there is nothing to
+# veto with and the pre-v0.8.23 behaviour stands.
+_CHARGE_GUARD_VETO_KW = 1.0
+
 # v0.8.19 — delay before replaying a just-closed charge's EVSE window from
 # the recorder. The recorder commits roughly once a second, but the last
 # wallbox samples of a session can land after our close, so give it a
@@ -7513,7 +7530,21 @@ class EvTripLoggerCoordinator:
             # metric-arrival path is gated too. No reference means no
             # deferral — fall back to the old close-then-open behaviour.
             return False
-        if odo_now - started_odo >= 1.0:
+        moved_km = odo_now - started_odo
+        if moved_km >= 1.0:
+            # Distance alone is not evidence of driving: a stale odometer
+            # landing after a polling outage moves just as far, and on
+            # 2026-08-23 it did so in the same second the charge opened.
+            # Power settles it physically — see `_CHARGE_GUARD_VETO_KW`.
+            signed_kw = self.current_charge._last_power_kw_signed  # noqa: SLF001
+            if signed_kw is not None and signed_kw <= -_CHARGE_GUARD_VETO_KW:
+                _LOGGER.debug(
+                    "Charge guard: %.1f km on the odometer ignored, the "
+                    "battery is taking %.1f kW — a stale reading catching "
+                    "up, not the car driving off",
+                    moved_km, -signed_kw,
+                )
+                return True
             return False
         return True
 

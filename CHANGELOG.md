@@ -2,6 +2,27 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.23 — 2026-08-24
+Three defects found by reading a real install's logs after a 500 km day, all of them things the integration reported about itself rather than about the car.
+
+**Fix — a stale odometer catching up released the "still charging" guard, and a trip opened on a stationary car.** v0.8.17 defers opening a trip while the charge session is still delivering, with an escape hatch: ≥1 km on the odometer since the session opened means the charge sensor is stuck `on` and the trip must open regardless. The hatch keyed on distance alone.
+
+On 2026-08-23 polling was paused for 4 h 31 min. When it resumed, the odometer caught up **46 km, the charge was detected, and `vehicle_on` went high — inside the same second**. The hatch read the catch-up as driving, released the guard, and a trip opened while 87 kW was going into the battery. That trip then swallowed the whole charge and reported 197 km at 20.0 kWh/100 km; the real figure was 24.8.
+
+The first attempt keyed on elapsed time — reject a delta implying an impossible speed — and it broke the v0.8.17 regression test on the first run: a compressed test timeline moves a legitimately-driving car just as fast as a stale reading lands, so time cannot separate the two.
+
+Power can, and physically. A car taking 87 kW is not driving away from the charger. The hatch is now vetoed while the battery is visibly drawing ≥1 kW; below that the reading is idle noise or a trickle and the odometer stays the arbiter, so a sensor genuinely stuck `on` mid-drive still releases the guard, which is what it is for. With no power sensor configured there is nothing to veto with and the pre-v0.8.23 behaviour stands.
+
+**Fix — 22 rolling-average sensors published without their unit for half an hour after every restart, and the recorder stopped compiling their statistics.** The v0.5.48 sticky-unit protection adopts the source's unit and keeps it across upstream blips, and a fast startup retry exists for when the first refresh runs before the recorder is ready. That retry gave up as soon as a *value* existed.
+
+Measured: after a restart the average sensor published at 20:48:13 and its source entity was created at 20:48:16 — three seconds later. The mean was already good, so the retry bailed; with an 1800 s cadence the sensor went on reporting `unit_of_measurement: None` until the next tick. The recorder read that as a units change and refused to compile statistics for all 22 at once. The retry now also runs while the unit is unknown: a value whose unit is missing is not finished starting up.
+
+**Fix — two permanently-unknown entities both displayed as "Distance".** `elevation_gain_m` and `elevation_loss_m` were built as `current_trip_` sensors as well as `last_trip_` ones, but elevation is derived from the trip's GPS route at close, so the live pair can never hold a value. Neither had a `current_trip_` translation either, so both fell back to their device-class name and collided — the real install carried `sensor.<device>_distance` and `sensor.<device>_distance_2`. Both keys join `cost_lifo` in the last-trip-only set.
+
+**Fix — `cost_lifo` never reached the journey cards.** v0.8.22 added it to the journey SQL and to the dicts storage returns, but all three journey sensors rebuild their attribute payload key by key and none copied it across, so the figure was recomputed on every refresh and dropped. On the current journey it is deliberately the closed stages only — the active stage has no per-lot figure until the replay prices it — exactly as `cost` already behaves on that payload.
+
+Existing entities are not renamed or removed by an upgrade: `sensor.<device>_distance` and `_distance_2` stay in the registry until deleted by hand.
+
 ## v0.8.22 — 2026-08-23
 **Feature — `cost_lifo`, a per-lot answer to "what did the energy I just bought cost me".** The weighted-average pool that prices `cost` is the honest average of the whole battery, but blending is lossy by design: fill up cheap on top of an expensive pack and the pool reports a €/kWh you never paid for anything. Measured on a real 245 km drive — a 39.63 kWh charge at 0.2735 €/kWh sitting on top of DC energy bought at ~0.57 — the pool priced the trip's 54.49 kWh at a blended 0.432 and reported **23.55 €**, while the driver had actually bought most of that energy at the cheap rate.
 

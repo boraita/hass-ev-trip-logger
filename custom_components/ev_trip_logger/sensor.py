@@ -288,10 +288,6 @@ async def async_setup_entry(
         entities.append(CurrentTripSensor(coordinator, meta))
         entities.append(LastTripSensor(coordinator, meta))
 
-    # v0.8.22 — `cost_lifo` exists only once the cost replay has priced a
-    # CLOSED trip against the charge lots, so a live counterpart would be
-    # a permanently-empty entity. Last-trip only.
-    _LAST_TRIP_ONLY = frozenset({"cost_lifo"})
     for key, cfg in _TRIP_FIELDS_EXTRA_LAST.items():
         entities.append(LastTripExtraSensor(coordinator, key=key, cfg=cfg))
         if key not in _LAST_TRIP_ONLY:
@@ -567,6 +563,24 @@ class LastTripSensor(_BaseTripSensor):
             "destination_raw": trip.destination,
             "driver": getattr(trip, "driver", None),
         }
+
+
+#: Keys that get a `last_trip_` sensor but NOT a `current_trip_` one,
+#: because the value only exists once the trip has closed:
+#:
+#: * `cost_lifo` — the cost replay prices a trip against the charge lots
+#:   only after it is written (v0.8.22).
+#: * `elevation_gain_m` / `elevation_loss_m` — computed from the trip's GPS
+#:   route by `_async_populate_elevation` at close (v0.7.5).
+#:
+#: A live counterpart is not merely empty, it is actively harmful: neither
+#: elevation key had a `current_trip_` translation, so both fell back to
+#: their device-class name and collided. The real install carried
+#: `sensor.<device>_distance` and `sensor.<device>_distance_2`, two
+#: permanently-unknown entities both displayed as "Distance" (v0.8.23).
+_LAST_TRIP_ONLY: frozenset[str] = frozenset({
+    "cost_lifo", "elevation_gain_m", "elevation_loss_m",
+})
 
 
 class LastTripExtraSensor(_BaseTripSensor):
@@ -1200,6 +1214,11 @@ class LastJourneySensor(_BaseTripSensor):
             "distance_km": round(s["distance_km"], 1),
             "energy_kwh": round(s["energy_kwh"], 2),
             "cost": round(s["cost"], 2),
+            # v0.8.23 — storage computes this on every refresh; all three
+            # journey payloads used to drop it before it reached the card.
+            "cost_lifo": (
+                round(s["cost_lifo"], 2) if s.get("cost_lifo") is not None else None
+            ),
         }
 
 
@@ -1275,6 +1294,11 @@ class CurrentJourneySensor(_BaseTripSensor):
             "distance_km": distance,
             "energy_kwh": energy,
             "cost": base["cost"] if base else 0.0,
+            # v0.8.23 — closed stages only. The active stage has no per-lot
+            # figure yet (the cost replay prices a trip after it is
+            # written), so this is deliberately partial while driving,
+            # exactly like `cost` on the same payload.
+            "cost_lifo": (base or {}).get("cost_lifo"),
             "stages": stages,
             "stage_active": snap is not None,
         }
@@ -1349,6 +1373,10 @@ class RecentJourneysSensor(_BaseTripSensor):
                     "distance_km": round(j["distance_km"], 1),
                     "energy_kwh": round(j["energy_kwh"], 2),
                     "cost": round(j["cost"], 2),
+                    "cost_lifo": (
+                        round(j["cost_lifo"], 2)
+                        if j.get("cost_lifo") is not None else None
+                    ),
                     "stages": j["stages"],
                 }
                 for j in self._journeys
@@ -1689,10 +1717,25 @@ class TrackedAvgSensor(_BaseTripSensor):
             )
         )
 
+    def _retry_needed(self) -> bool:
+        """True while startup is not finished.
+
+        v0.8.23 — this used to be `self._mean is None`, i.e. "do I have a
+        value yet". That gave up too early. On the real install the source
+        entity was created three seconds AFTER this sensor first published:
+        the mean was already good, so the retry budget bailed, and with a
+        1800 s cadence the sensor went on reporting `unit_of_measurement:
+        None` for the next half hour. The recorder read that as a units
+        change and stopped compiling statistics for 22 sensors at once.
+
+        A value whose unit is still unknown is not started up.
+        """
+        return self._mean is None or self.native_unit_of_measurement is None
+
     @callback
     def _schedule_startup_retry(self) -> None:
-        """One-shot fast retry while we still have no value (startup)."""
-        if self._mean is not None or self._startup_retries_left <= 0:
+        """One-shot fast retry while startup is unfinished (value or unit)."""
+        if not self._retry_needed() or self._startup_retries_left <= 0:
             return
         self._startup_retries_left -= 1
 
