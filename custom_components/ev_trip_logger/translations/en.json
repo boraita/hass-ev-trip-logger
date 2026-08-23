@@ -154,6 +154,7 @@
       "last_max_power": { "name": "Last trip max power" },
       "last_trip_cost": { "name": "Last trip cost" },
       "last_trip_cost_at_avg_tariff": { "name": "Last trip cost at avg tariff" },
+      "last_trip_cost_lifo": { "name": "Last trip cost by charge lot" },
       "current_trip_cost_at_avg_tariff": { "name": "Current trip cost at avg tariff" },
       "last_trip_idle_minutes": { "name": "Last trip idle minutes" },
       "current_trip_idle_minutes": { "name": "Current trip idle minutes" },

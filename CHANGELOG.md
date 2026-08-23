@@ -2,6 +2,19 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.22 — 2026-08-23
+**Feature — `cost_lifo`, a per-lot answer to "what did the energy I just bought cost me".** The weighted-average pool that prices `cost` is the honest average of the whole battery, but blending is lossy by design: fill up cheap on top of an expensive pack and the pool reports a €/kWh you never paid for anything. Measured on a real 245 km drive — a 39.63 kWh charge at 0.2735 €/kWh sitting on top of DC energy bought at ~0.57 — the pool priced the trip's 54.49 kWh at a blended 0.432 and reported **23.55 €**, while the driver had actually bought most of that energy at the cheap rate.
+
+`cost_lifo` keeps the charges as discrete lots and draws **newest first**, so a drive taken right after a cheap charge is priced at that charge until it runs out and only then spills into older, dearer energy. The same trip reads **19.35 €**. Neither number is wrong; they answer different questions, and both are now available.
+
+It is computed inside the existing cost replay, which already walks every charge and trip in chronological order to build the pool — so the lot ledger is replayed in lockstep, stays idempotent, re-prices itself when a charge's price is corrected, and **backfills the whole history on the next startup** with no data migration.
+
+The lot stack re-anchors to the pack's real content at `soc_start` and `soc_end` exactly as the pool does, because energy leaves a battery without being a trip (standby drain, preconditioning). Which lots absorb that discrepancy is a decision, not an accident: a surplus is trimmed from the *oldest* end, since unexplained loss is far likelier to be energy that has sat there for days than the charge that just went in — and trimming the newest would delete the very lot the next trip is about to be priced against. A shortfall (opening inventory on a fresh install) is padded at the incoming charge's price, mirroring the pool's own rule. When there are no lots at all the shortfall uses the identical fallback the pool uses, so the two figures agree rather than this one reading a misleading zero.
+
+Surfaces: `cost_lifo` on every trip in `recent_trips`, summed per journey in `recent_journeys` and the journey summary (as `SUM`, not `COALESCE(...,0)` — a journey the replay never priced must read null, not free), and one new sensor, `last_trip_cost_lifo`. Deliberately no `current_trip_` counterpart: the figure only exists once a closed trip has been replayed against the lots, so a live one would be a permanently-empty entity.
+
+`cost` and `cost_basis_per_kwh` are untouched. This is a second opinion alongside `cost_at_avg_tariff`, not a return to the FIFO-slice model v0.8.8 removed — that model was the *primary* price and made a cheap charge create a slice other energy had to wait behind. Dry-run against the real 60-trip history before release: every row with energy got a figure, none left null.
+
 ## v0.8.21 — 2026-08-22
 **Fix — a charge that ended as a trip began was reported as charging neither before it nor during it, and the heal then destroyed the trip's SoC anchor.** The v0.8.17 mutex has the charge-off handler open the trip, so both stamps come out of the same event cascade. On the real 2026-08-17 rows they landed 177 **microseconds** apart: charge id53 ended at `14:21:56.961478`, trip id352 started at `14:21:56.961301`. One instant, recorded twice — and compared exactly, `ended_at <= trip_start` fails, so the session was not reported as having charged before the trip.
 

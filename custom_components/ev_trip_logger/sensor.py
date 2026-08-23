@@ -87,6 +87,18 @@ _TRIP_FIELDS_EXTRA_LAST: dict[str, dict[str, Any]] = {
         "precision": 2,
         "slug": "cost_at_avg_tariff",
     },
+    # v0.8.22 — per-lot companion to `cost`, drawn newest-charge-first.
+    # Answers "what did the energy I actually just bought cost me",
+    # which the blended pool cannot: fill up cheap on top of an
+    # expensive pack and `cost` reports a price paid for nothing. Read
+    # straight off the trip row (the replay computes it), unlike
+    # `cost_at_avg_tariff` which LastTripExtraSensor derives live.
+    "cost_lifo": {
+        "device_class": SensorDeviceClass.MONETARY,
+        "state_class": None,
+        "precision": 2,
+        "slug": "cost_lifo",
+    },
     # v0.6.6 — idle accounting tiles. `idle_minutes` is the raw
     # accumulator; `moving_consumption_kwh_100km` is the "what would
     # this trip have cost if you hadn't waited with the AC on"
@@ -276,9 +288,14 @@ async def async_setup_entry(
         entities.append(CurrentTripSensor(coordinator, meta))
         entities.append(LastTripSensor(coordinator, meta))
 
+    # v0.8.22 — `cost_lifo` exists only once the cost replay has priced a
+    # CLOSED trip against the charge lots, so a live counterpart would be
+    # a permanently-empty entity. Last-trip only.
+    _LAST_TRIP_ONLY = frozenset({"cost_lifo"})
     for key, cfg in _TRIP_FIELDS_EXTRA_LAST.items():
         entities.append(LastTripExtraSensor(coordinator, key=key, cfg=cfg))
-        entities.append(CurrentTripExtraSensor(coordinator, key=key, cfg=cfg))
+        if key not in _LAST_TRIP_ONLY:
+            entities.append(CurrentTripExtraSensor(coordinator, key=key, cfg=cfg))
 
     entities.extend(
         [
@@ -1021,6 +1038,12 @@ def _trip_to_attr(
             )
             else None
         ),
+        # v0.8.22 — the third cost view. `cost` blends the whole battery
+        # into one average; this prices the trip against the charges that
+        # actually filled it, newest lot first, so a drive taken right
+        # after a cheap charge reads at that charge's price instead of at
+        # a blend the driver never paid for anything.
+        "cost_lifo": _r(trip.cost_lifo, 2),
         "avg_tariff_per_kwh": _r(avg_tariff_per_kwh, 4),
         "currency": trip.currency,
         "score": _r(trip.score_with_baseline(score_baseline), 1),

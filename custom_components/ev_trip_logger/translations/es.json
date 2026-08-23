@@ -146,6 +146,7 @@
       "last_max_power": { "name": "Potencia máxima del último viaje" },
       "last_trip_cost": { "name": "Coste del último viaje" },
       "last_trip_cost_at_avg_tariff": { "name": "Coste del último viaje (a tarifa media)" },
+      "last_trip_cost_lifo": { "name": "Coste del último viaje (por tramos de carga)" },
       "current_trip_cost_at_avg_tariff": { "name": "Coste del viaje actual (a tarifa media)" },
       "last_trip_idle_minutes": { "name": "Minutos parado (último viaje)" },
       "current_trip_idle_minutes": { "name": "Minutos parado (viaje actual)" },

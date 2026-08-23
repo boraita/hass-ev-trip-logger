@@ -526,3 +526,111 @@ async def test_wac_charge_after_trip_does_not_pollute(
     # Later trip pulls cleanly from the (now-available) charge.
     assert trips[later_id].cost == pytest.approx(0.50)
     assert trips[later_id].cost_basis_per_kwh == pytest.approx(0.05)
+
+
+# ---------------------------------------------------------------------------
+# v0.8.22 — `cost_lifo`, the per-lot companion to the pool's `cost`.
+#
+# The pool answers "what does a kWh out of this battery cost on average".
+# It cannot answer "what did the energy I actually just bought cost me",
+# because blending is lossy by design: fill up cheap on top of an expensive
+# pack and the pool reports a price you never paid for anything.
+#
+# `cost_lifo` keeps the discrete lots and draws NEWEST-FIRST, so a trip taken
+# right after a cheap charge is priced at that charge until it runs out.
+# `cost` and `cost_basis_per_kwh` are untouched — this is a second opinion,
+# not a replacement, exactly as `cost_at_avg_tariff` is.
+# ---------------------------------------------------------------------------
+
+
+async def test_lifo_draws_from_the_newest_charge_first(
+    storage: TripStorage,
+) -> None:
+    """Expensive charge, then a cheap one, then a trip small enough to fit
+    inside the cheap one. The pool blends both; LIFO spends the cheap one.
+    """
+    storage.capacity_hint_kwh = 100.0
+    await storage.async_insert_charge(
+        _charge(ended_at=T0, kwh=40.0, price_per_kwh=0.60)
+    )
+    await storage.async_insert_charge(
+        _charge(ended_at=T0 + timedelta(hours=1), kwh=30.0, price_per_kwh=0.20)
+    )
+    trip_id = await storage.async_insert(_trip(
+        started_at=T0 + timedelta(hours=2),
+        ended_at=T0 + timedelta(hours=3),
+        energy_kwh=10.0,
+    ))
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.99)
+    t = (await _trips_by_id(storage))[trip_id]
+
+    assert t.cost_lifo == pytest.approx(10.0 * 0.20, abs=0.01)
+    # The pool still blends, and still reports its own number.
+    assert t.cost is not None and t.cost > t.cost_lifo
+
+
+async def test_lifo_spills_into_the_older_lot_when_the_newest_runs_out(
+    storage: TripStorage,
+) -> None:
+    """The real 2026-08-23 shape: a cheap charge on top of expensive DC
+    energy, and a trip bigger than the cheap charge.
+
+    39.63 kWh at 0.2735 = 10.84, then 14.86 kWh of the older 0.57 energy
+    = 8.47 -> 19.31. The pool blends the two into ~0.43 and reports 23.55
+    for the same 54.49 kWh.
+    """
+    storage.capacity_hint_kwh = 82.5
+    await storage.async_insert_charge(
+        _charge(ended_at=T0, kwh=60.0, price_per_kwh=0.57)
+    )
+    await storage.async_insert_charge(
+        _charge(ended_at=T0 + timedelta(hours=1), kwh=39.63,
+                price_per_kwh=0.2735)
+    )
+    trip_id = await storage.async_insert(_trip(
+        started_at=T0 + timedelta(hours=2),
+        ended_at=T0 + timedelta(hours=5),
+        energy_kwh=54.49, distance_km=245.0,
+    ))
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.07)
+    t = (await _trips_by_id(storage))[trip_id]
+
+    expected = 39.63 * 0.2735 + (54.49 - 39.63) * 0.57
+    assert t.cost_lifo == pytest.approx(expected, abs=0.05)
+    assert t.cost_lifo < t.cost, "LIFO must be cheaper here than the blend"
+
+
+async def test_lifo_falls_back_to_the_tariff_with_no_charges(
+    storage: TripStorage,
+) -> None:
+    """No lots at all: the shortfall is priced exactly as the pool prices
+    it, so the two figures agree rather than one silently reading zero.
+    """
+    trip_id = await storage.async_insert(_trip(
+        started_at=T0, ended_at=T0 + timedelta(hours=1), energy_kwh=8.0,
+    ))
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.30)
+    t = (await _trips_by_id(storage))[trip_id]
+
+    assert t.cost_lifo == pytest.approx(8.0 * 0.30, abs=0.01)
+    assert t.cost_lifo == pytest.approx(t.cost, abs=0.01)
+
+
+async def test_lifo_is_null_when_the_trip_has_no_energy(
+    storage: TripStorage,
+) -> None:
+    """A trip the replay skips (no energy) must not be given a fabricated
+    zero — NULL means "not computed", 0.0 would mean "free".
+    """
+    trip_id = await storage.async_insert(_trip(
+        started_at=T0, ended_at=T0 + timedelta(hours=1),
+        energy_kwh=None, distance_km=0.0,
+    ))
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.30)
+    t = (await _trips_by_id(storage))[trip_id]
+
+    assert t.cost_lifo is None

@@ -86,6 +86,44 @@ def _parse_stored(value: str | None) -> datetime | None:
 _CHARGE_TRIP_BOUNDARY_TOLERANCE_S: int = 60
 
 
+def _anchor_lots(lots: list[list[float]], target_kwh: float, pad_price: float) -> None:
+    """Re-anchor a LIFO lot stack to the pack's known physical content.
+
+    The pool re-anchors its QUANTITY to `soc_start` / `soc_end` because
+    energy leaves the battery without being a trip — standby drain,
+    preconditioning, driving the logger never saw. The lot stack has to
+    track the same quantity or the two figures drift apart, and the
+    per-lot number stops meaning anything.
+
+    Which lots absorb the discrepancy matters:
+
+    * Surplus (we hold more than the pack does) is trimmed from the
+      FRONT — the oldest energy. Unexplained loss is far likelier to be
+      the energy that has been sitting there for days than the charge
+      that just went in, and trimming the newest would delete the very
+      lot the caller is about to be priced against.
+    * Shortfall (the pack holds more than we know about — opening
+      inventory on a fresh install) is padded at the front at
+      `pad_price`, mirroring the pool's own "price the unknown opening
+      inventory at the incoming charge's price" rule. Pricing it at 0
+      would report that energy as free forever.
+
+    Mutates `lots` in place; each lot is `[kwh, price]`, oldest first.
+    """
+    total = sum(l[0] for l in lots)
+    if target_kwh < total:
+        excess = total - target_kwh
+        while excess > 1e-9 and lots:
+            if lots[0][0] <= excess + 1e-9:
+                excess -= lots[0][0]
+                lots.pop(0)
+            else:
+                lots[0][0] -= excess
+                excess = 0.0
+    elif target_kwh > total and pad_price > 0:
+        lots.insert(0, [target_kwh - total, pad_price])
+
+
 def _apportion_straddling_charge(
     kwh: float,
     *,
@@ -230,6 +268,7 @@ CREATE TABLE IF NOT EXISTS trips (
     -- "what did this trip actually cost per kWh" answer (mixes home
     -- tariff and external charges).
     cost_basis_per_kwh REAL,
+    cost_lifo REAL,
     -- v0.5.84: per-trip battery-capacity calibration factor. Ratio of
     -- the power-integration net energy (∫|P|·dt − 2·regen, the real
     -- kWh drawn from the battery measured at the motor) to the SoC-
@@ -412,6 +451,12 @@ class TripRecord:
     # produced for this trip. Equals cost / energy_kwh once the
     # post-insert recompute has run; None until then.
     cost_basis_per_kwh: float | None = None
+    #: v0.8.22 — what this trip's energy cost at the prices of the charges
+    #: that actually filled the battery, newest lot first. Companion to
+    #: `cost` (the blended pool), never a replacement: the pool is the
+    #: honest average, this is the answer to "what did the energy I just
+    #: bought cost me". None when the replay could not compute it.
+    cost_lifo: float | None = None
     # v0.5.84: ratio of power-integrated net energy to SoC-derived
     # nominal energy. ~1.0 when battery capacity matches nominal;
     # rolling median across many trips estimates real degradation.
@@ -657,6 +702,11 @@ class TripStorage:
         # v0.5.76: weighted-average €/kWh from the WAC pool replay.
         if "cost_basis_per_kwh" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN cost_basis_per_kwh REAL")
+        if "cost_lifo" not in trip_cols:
+            # v0.8.22 — per-lot companion to `cost`. Backfilled by the
+            # next cost replay, which runs on every startup, so no data
+            # migration is needed here.
+            conn.execute("ALTER TABLE trips ADD COLUMN cost_lifo REAL")
         # v0.5.84: per-trip battery-capacity calibration factor.
         if "calibration_factor_k" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN calibration_factor_k REAL")
@@ -1322,14 +1372,15 @@ class TripStorage:
                     COALESCE(SUM(distance_km), 0) AS distance,
                     COALESCE(SUM(energy_kwh), 0)  AS energy,
                     COALESCE(SUM(cost), 0)        AS cost,
+                    SUM(cost_lifo)                AS cost_lifo,
                     COUNT(*) AS stages
                 FROM trips WHERE journey_id = ?
                 """,
                 (journey_id,),
             ).fetchone()
-        if not row or row[5] == 0:
+        if not row or row[6] == 0:
             return None
-        started_at, ended_at, distance, energy, cost, stages = row
+        started_at, ended_at, distance, energy, cost, cost_lifo, stages = row
         return {
             "journey_id": journey_id,
             "started_at": datetime.fromisoformat(started_at) if started_at else None,
@@ -1337,6 +1388,9 @@ class TripStorage:
             "distance_km": float(distance),
             "energy_kwh": float(energy),
             "cost": float(cost),
+            # v0.8.22 — SUM, not COALESCE(...,0): a journey whose stages
+            # have no per-lot figure must read None, not a free journey.
+            "cost_lifo": float(cost_lifo) if cost_lifo is not None else None,
             "stages": int(stages),
         }
 
@@ -1370,6 +1424,7 @@ class TripStorage:
                     COALESCE(SUM(distance_km), 0) AS distance,
                     COALESCE(SUM(energy_kwh), 0)  AS energy,
                     COALESCE(SUM(cost), 0)        AS cost,
+                    SUM(cost_lifo)                AS cost_lifo,
                     COUNT(*) AS stages
                 FROM trips
                 WHERE journey_id IS NOT NULL {excl}
@@ -1387,7 +1442,11 @@ class TripStorage:
                 "distance_km": float(r[3]),
                 "energy_kwh": float(r[4]),
                 "cost": float(r[5]),
-                "stages": int(r[6]),
+                # v0.8.22 — None rather than 0.0 when no stage carries a
+                # per-lot figure; a journey that cost nothing and one the
+                # replay never priced must not read the same.
+                "cost_lifo": float(r[6]) if r[6] is not None else None,
+                "stages": int(r[7]),
             }
             for r in rows
         ]
@@ -2734,6 +2793,10 @@ class TripStorage:
 
             pool_kwh = 0.0
             pool_avg_price = 0.0
+            # v0.8.22 — the per-lot ledger, replayed in lockstep with the
+            # pool over the same charges and trips. `[kwh, price]`, oldest
+            # first; trips draw from the END.
+            lots: list[list[float]] = []
             trip_rows = conn.execute(
                 """
                 SELECT id, started_at, energy_kwh
@@ -2777,6 +2840,11 @@ class TripStorage:
                     # says exactly what was in the pack when the cable
                     # went in.
                     if capacity and c_soc_start is not None:
+                        _anchor_lots(
+                            lots, c_soc_start / 100.0 * capacity, c_price,
+                        )
+                    lots.append([c_kwh, c_price])
+                    if capacity and c_soc_start is not None:
                         if pool_avg_price <= 0:
                             # Opening inventory of unknown price — the
                             # battery was not empty when tracking began.
@@ -2805,8 +2873,15 @@ class TripStorage:
                     # exactly — soc_end — so use it and let the drift go.
                     if capacity and c_soc_end is not None:
                         pool_kwh = max(0.0, c_soc_end / 100.0 * capacity)
+                        _anchor_lots(
+                            lots, c_soc_end / 100.0 * capacity, c_price,
+                        )
                     elif capacity:
                         pool_kwh = min(pool_kwh, capacity)
+                        _anchor_lots(
+                            lots, min(sum(l[0] for l in lots), capacity),
+                            c_price,
+                        )
 
                 energy_f = float(energy)
                 from_pool = min(energy_f, pool_kwh)
@@ -2830,10 +2905,34 @@ class TripStorage:
                 )
                 pool_kwh = max(0.0, pool_kwh - energy_f)
                 basis = cost_accum / energy_f if energy_f > 0 else None
+
+                # v0.8.22 — the same withdrawal against the lot stack,
+                # newest lot first. The shortfall uses the identical
+                # `fallback_price` the pool just used, so with no lots at
+                # all the two figures agree instead of this one reading a
+                # misleading zero.
+                remaining = energy_f
+                lifo_cost = 0.0
+                while remaining > 1e-9 and lots:
+                    lot = lots[-1]
+                    take = min(lot[0], remaining)
+                    lifo_cost += take * lot[1]
+                    lot[0] -= take
+                    remaining -= take
+                    if lot[0] <= 1e-9:
+                        lots.pop()
+                if remaining > 1e-9:
+                    lifo_cost += remaining * fallback_price
+
                 cur = conn.execute(
-                    "UPDATE trips SET cost = ?, cost_basis_per_kwh = ? "
-                    "WHERE id = ?",
-                    (round(cost_accum, 4), round(basis, 6) if basis is not None else None, trip_id_),
+                    "UPDATE trips SET cost = ?, cost_basis_per_kwh = ?, "
+                    "cost_lifo = ? WHERE id = ?",
+                    (
+                        round(cost_accum, 4),
+                        round(basis, 6) if basis is not None else None,
+                        round(lifo_cost, 4),
+                        trip_id_,
+                    ),
                 )
                 if cur.rowcount:
                     updated += 1
@@ -4320,6 +4419,7 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         wind_kmh=row["wind_kmh"] if "wind_kmh" in row.keys() else None,
         precipitation_mm=row["precipitation_mm"] if "precipitation_mm" in row.keys() else None,
         cost_basis_per_kwh=row["cost_basis_per_kwh"] if "cost_basis_per_kwh" in row.keys() else None,
+        cost_lifo=row["cost_lifo"] if "cost_lifo" in row.keys() else None,
         calibration_factor_k=row["calibration_factor_k"] if "calibration_factor_k" in row.keys() else None,
         consumption_lower_kwh_100km=row["consumption_lower_kwh_100km"] if "consumption_lower_kwh_100km" in row.keys() else None,
         consumption_upper_kwh_100km=row["consumption_upper_kwh_100km"] if "consumption_upper_kwh_100km" in row.keys() else None,
