@@ -821,11 +821,24 @@ async def test_journey_does_not_open_when_starting_outside_home(
     assert coordinator.last_trip.journey_id is None
 
 
-async def test_journey_retroactively_closes_when_next_stage_starts_at_home(
+async def test_open_journey_absorbs_next_stage_that_starts_at_home(
     hass: HomeAssistant,
 ) -> None:
-    """If device_tracker missed the 'home arrival', the next stage starting at
-    home should close the previous open journey."""
+    """An open journey absorbs the next stage even when it starts at home.
+
+    v0.5.14 deliberately removed the "retroactively close the journey when a
+    stage opens from home" band-aid: it conflated GPS-noise destinations with
+    real home arrivals. The surviving invariant is that a journey closes only
+    on a trip that *ends* at a home, so a stage starting at home while a
+    journey is open joins it rather than minting a second one.
+
+    Until v0.8.27 this test asserted the removed behaviour and passed anyway:
+    the dwell guard was a bare `asyncio.sleep`, so `async_block_till_done`
+    inside the next stage awaited it and the late-arrival amend closed
+    journey 1 before the stage opened. Real HA never did that — the amend
+    bails once a trip is active. The dwell path has its own coverage in
+    `test_late_home_arrival_closes_journey_and_amends_destination`.
+    """
     hass.states.async_set(LOC, "home")
     entry = await _setup(hass, **{CONF_LOCATION: LOC})
     coordinator = hass.data[DOMAIN][entry.entry_id]
@@ -840,11 +853,15 @@ async def test_journey_retroactively_closes_when_next_stage_starts_at_home(
     hass.states.async_set(LOC, "home")
     await _run_stage(hass, odo_start=1020, odo_end=1050, soc_end=60, location_end="not_home")
 
-    # journey 1 should have been retroactively closed
+    # Journey 1 stays open and swallows stage 2 — no second journey, and
+    # nothing closed, because no trip has ended at home yet.
+    assert coordinator.current_journey_id == jid_1
+    assert coordinator.last_completed_journey_id is None
+
+    # It closes on the arrival, which is the only thing that may close it.
+    await _run_stage(hass, odo_start=1050, odo_end=1070, soc_end=50, location_end="home")
     assert coordinator.last_completed_journey_id == jid_1
-    # journey 2 should be open with this stage
-    assert coordinator.current_journey_id is not None
-    assert coordinator.current_journey_id != jid_1
+    assert coordinator.current_journey_id is None
 
 
 async def test_home_zone_resolves_zone_entity_to_friendly_name(
@@ -942,9 +959,11 @@ async def test_late_home_arrival_closes_journey_and_amends_destination(
     assert coordinator.last_trip.destination == "not_home"
     assert coordinator.last_trip.trip_id is not None
 
-    # 90 seconds later, device_tracker finally flips to 'home'.
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=90))
+    # device_tracker finally flips to 'home'. The amend is held back by the
+    # dwell guard, so advance the clock past it to let the check run.
     hass.states.async_set(LOC, "home")
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=90))
     await hass.async_block_till_done()
 
     # Journey closed retroactively, destination amended.
@@ -978,10 +997,12 @@ async def test_late_zone_arrival_amends_destination_without_closing_journey(
     assert journey_before is not None
     assert coordinator.last_trip.destination == "not_home"
 
-    # Geofence lag — 90 seconds later, device_tracker flips to 'Trabajo ele '
-    # (custom zone with a trailing space, as the user's real HA reports it).
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=90))
+    # Geofence lag — device_tracker flips to 'Trabajo ele ' (custom zone with
+    # a trailing space, as the user's real HA reports it). Advance past the
+    # dwell guard so the deferred amend runs.
     hass.states.async_set(LOC, "Trabajo ele ")
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=90))
     await hass.async_block_till_done()
 
     # Destination amended.

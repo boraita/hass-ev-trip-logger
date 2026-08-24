@@ -1152,6 +1152,10 @@ class EvTripLoggerCoordinator:
         self._unsub_stuck_watchdog: CALLBACK_TYPE | None = None
         # v0.8.19 — charge_id → cancel handle for a deferred EVSE replay.
         self._pending_evse_backfills: dict[int, CALLBACK_TYPE] = {}
+        # v0.8.27 — trip_id → cancel handle for a deferred vehicle-native
+        # energy heal. Kept so `async_stop` can drop a heal that would
+        # otherwise fire through a stopped coordinator's storage.
+        self._pending_vehicle_heals: dict[int, CALLBACK_TYPE] = {}
         # v0.6.4 — periodic refresh of `_avg_tariff_cache_per_kwh`.
         self._unsub_avg_tariff: CALLBACK_TYPE | None = None
         # Pending synthetic-trip finalize timer + baseline (start_t, start_odo,
@@ -1162,6 +1166,10 @@ class EvTripLoggerCoordinator:
         self._unsub_synth_finalize: CALLBACK_TYPE | None = None
         self._synth_baseline: tuple[datetime, float, float | None] | None = None
         self._unsub_location: CALLBACK_TYPE | None = None
+        # v0.8.27 — pending late-zone-arrival dwell timer. One slot: a
+        # second arrival inside the window replaces the first rather than
+        # arming a parallel check (see _async_location_changed).
+        self._pending_dwell_unsub: CALLBACK_TYPE | None = None
         # v0.5.16 — vehicle_on off-edge debounce. Holds the most recent
         # off-edge timestamp so a follow-up on→off within
         # _VEHICLE_ON_OFF_DEBOUNCE_S can be detected and re-coalesced.
@@ -2393,6 +2401,10 @@ class EvTripLoggerCoordinator:
             self._unsub_synth_finalize,
             self._unsub_location,
             self._unsub_stuck_watchdog,
+            # v0.8.27 — the off-edge close debounce kept its handle but was
+            # never dropped on unload; the timer then closed a trip through
+            # a stopped coordinator's storage.
+            self._pending_close_unsub,
             getattr(self, "_unsub_avg_tariff", None),
         ):
             if unsub:
@@ -2404,6 +2416,7 @@ class EvTripLoggerCoordinator:
         self._unsub_synth_finalize = None
         self._unsub_location = None
         self._unsub_stuck_watchdog = None
+        self._pending_close_unsub = None
         self._unsub_avg_tariff = None
         self._synth_baseline = None
         # v0.5.49 — make sure a deferred live-open retry doesn't fire
@@ -2411,6 +2424,11 @@ class EvTripLoggerCoordinator:
         self._cancel_pending_open()
         # v0.8.19 — same reasoning for a deferred EVSE replay.
         self._cancel_pending_evse_backfills()
+        # v0.8.27 — and for the late-zone-arrival dwell check and the
+        # vehicle-native energy heal, the last two deferred writers that
+        # could still fire after the coordinator stopped.
+        self._cancel_pending_dwell()
+        self._cancel_pending_vehicle_heals()
 
     @callback
     def _async_vehicle_on_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -2718,6 +2736,14 @@ class EvTripLoggerCoordinator:
         and re-check the state at that point. If the zone changed again
         in the interim (a flap), no amend fires. This stops the 40 s
         home→not_home→home GPS glitch from fragmenting a single drive.
+
+        v0.8.27 — the dwell used to be a bare `asyncio.sleep` inside an
+        untracked task: nothing could cancel it, so a reload inside the
+        window left a timer that amended a trip through a stopped
+        coordinator's storage. It is now an `async_call_later` whose
+        handle lives in `_pending_dwell_unsub`, and a second arrival
+        inside the window replaces the pending check instead of arming a
+        parallel one.
         """
         # v0.5.25 — every location tick feeds the GPS ring buffer
         # (used to seed trip start anchors and to populate synthetic
@@ -2736,8 +2762,8 @@ class EvTripLoggerCoordinator:
             return
         when = new_state.last_updated
 
-        async def _deferred() -> None:
-            await asyncio.sleep(_LOCATION_DWELL_MIN_S)
+        async def _dwell_elapsed(_at: datetime) -> None:
+            self._pending_dwell_unsub = None
             # Re-read NOW — if the zone changed back, this was a flap.
             current_loc = self._read_str(self._location)
             if current_loc != loc:
@@ -2748,7 +2774,18 @@ class EvTripLoggerCoordinator:
                 return
             await self._async_handle_late_zone_arrival(loc, when)
 
-        self.hass.async_create_task(_deferred())
+        # A newer arrival supersedes the one still waiting: only the latest
+        # zone reading is worth amending the trip to.
+        self._cancel_pending_dwell()
+        self._pending_dwell_unsub = async_call_later(
+            self.hass, _LOCATION_DWELL_MIN_S, _dwell_elapsed
+        )
+
+    def _cancel_pending_dwell(self) -> None:
+        """Drop a deferred late-zone-arrival check (flap, or entry unload)."""
+        if self._pending_dwell_unsub is not None:
+            self._pending_dwell_unsub()
+            self._pending_dwell_unsub = None
 
     async def _async_handle_late_zone_arrival(
         self, location: str, when: datetime
@@ -7042,15 +7079,34 @@ class EvTripLoggerCoordinator:
         sensor still hasn't refreshed when the callback fires, we leave
         the row alone (next trip's heal naturally re-checks the
         previous row by reading the row before triggering the WAC replay).
+
+        v0.8.27 — the cancel handle used to be discarded, so a reload
+        inside the delay left a heal that wrote through a stopped
+        coordinator's storage. It is now kept per trip so `async_stop`
+        can drop it, and a re-schedule for the same trip replaces the
+        pending heal rather than stacking a duplicate.
         """
         if not self._last_trip_energy_sensor:
             return
 
         @callback
         def _fire(_at: datetime) -> None:
+            self._pending_vehicle_heals.pop(trip_id, None)
             self.hass.async_create_task(self._async_heal_from_vehicle(trip_id))
 
-        async_call_later(self.hass, _VEHICLE_TRIP_HEAL_DELAY_S, _fire)
+        existing = self._pending_vehicle_heals.pop(trip_id, None)
+        if existing:
+            existing()
+        self._pending_vehicle_heals[trip_id] = async_call_later(
+            self.hass, _VEHICLE_TRIP_HEAL_DELAY_S, _fire
+        )
+
+    def _cancel_pending_vehicle_heals(self) -> None:
+        """Drop every deferred vehicle-native heal (entry unload / reload)."""
+        for unsub in list(self._pending_vehicle_heals.values()):
+            if unsub:
+                unsub()
+        self._pending_vehicle_heals.clear()
 
     async def _async_heal_from_vehicle(self, trip_id: int) -> None:
         """v0.5.77 — override `energy_kwh` from the vehicle-native sensor.
