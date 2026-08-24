@@ -1,6 +1,8 @@
 """Tests for the v0.7.5 elevation module — pure functions, no HTTP."""
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from custom_components.ev_trip_logger.elevation import (
@@ -64,7 +66,7 @@ def test_downsample_route_dedups_consecutive_identical_hits() -> None:
     pts = [(37.0, -3.6)] * 10 + [(37.1, -3.7)]  # 10 identical + 1
     sampled = downsample_route(pts, max_points=5)
     # No two consecutive entries should be equal.
-    for a, b in zip(sampled, sampled[1:]):
+    for a, b in itertools.pairwise(sampled):
         assert a != b
 
 

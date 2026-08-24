@@ -6,7 +6,7 @@ the trip lands in storage with the expected derived metrics.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -66,8 +66,8 @@ async def test_log_manual_trip_persists_and_derives_metrics(
     hass: HomeAssistant, configured_entry: MockConfigEntry
 ) -> None:
     """Replicates the user's lost trip: 25300→25318 km, 61%→56%, ~34 min."""
-    started_at = datetime(2026, 5, 28, 13, 7, 41, tzinfo=timezone.utc)
-    ended_at = datetime(2026, 5, 28, 13, 42, 4, tzinfo=timezone.utc)
+    started_at = datetime(2026, 5, 28, 13, 7, 41, tzinfo=UTC)
+    ended_at = datetime(2026, 5, 28, 13, 42, 4, tzinfo=UTC)
 
     await hass.services.async_call(
         DOMAIN,

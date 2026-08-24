@@ -1,7 +1,7 @@
 """Tests for the trip detection state machine and storage integration."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 import pytest
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNKNOWN
@@ -1825,7 +1825,7 @@ async def test_recent_trips_attr_exposes_full_schema(hass: HomeAssistant) -> Non
     coordinator._notify_trip_log_listeners()
     await hass.async_block_till_done()
 
-    state = hass.states.get(f"sensor.test_ev_recent_trips")
+    state = hass.states.get("sensor.test_ev_recent_trips")
     assert state is not None
     trips = state.attributes.get("trips") or []
     assert len(trips) >= 1
@@ -1915,7 +1915,7 @@ async def test_recent_charges_attr_exposes_full_schema(hass: HomeAssistant) -> N
     coordinator._notify_trip_log_listeners()
     await hass.async_block_till_done()
 
-    state = hass.states.get(f"sensor.test_ev_recent_charges")
+    state = hass.states.get("sensor.test_ev_recent_charges")
     assert state is not None
     charges = state.attributes.get("charges") or []
     assert len(charges) >= 1
@@ -2082,7 +2082,7 @@ async def test_v050_calendar_entity_emits_daily_events(hass: HomeAssistant) -> N
     # Two days have activity → two events.
     assert len(events) == 2
     # Today event should mention 2 trips + 23 km.
-    today_evt = [e for e in events if e.start == today.date()][0]
+    today_evt = next(e for e in events if e.start == today.date())
     assert "2 trips" in today_evt.summary
     assert "23" in today_evt.summary  # 12 + 11 km
 
@@ -2861,8 +2861,9 @@ def test_speed_stats_v95_and_highway_ratio() -> None:
 
     # Trip 206-style samples: 30-tick deque (30 s cadence over ~15 min)
     # with mostly 40-60 km/h and a couple of highway bursts.
+    # Kept as concatenation so each phase stays annotated on its own line.
     samples = (
-        [0.0, 0.0, 0.0]            # 3 idle at lights
+        [0.0, 0.0, 0.0]            # 3 idle at lights  # noqa: RUF005
         + [40.0, 50.0, 55.0, 45.0] # urban
         + [70.0, 75.0]             # extra-urban
         + [95.0, 100.0, 105.0, 117.0, 110.0, 90.0]  # highway
@@ -3176,7 +3177,7 @@ async def test_recover_segments_via_vehicle_on_handles_sparse_odo(
     entry = await _setup(hass)
     coordinator = hass.data[DOMAIN][entry.entry_id]
 
-    base = datetime(2026, 6, 25, 18, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 6, 25, 18, 0, 0, tzinfo=UTC)
     # Mock state objects with the recorder's expected shape.
     def _s(ts_min, ts_sec, state):
         ts = base + timedelta(minutes=ts_min, seconds=ts_sec)
@@ -3478,7 +3479,7 @@ def test_integrate_evse_from_recorder_masks_idle_windows() -> None:
                 {"unit_of_measurement": unit} if unit else {}
             )
 
-    t0 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+    t0 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     evse = [
         _S("7000", t0 + timedelta(minutes=m), unit="W")
         for m in range(0, 121, 10)
@@ -3800,7 +3801,7 @@ async def test_set_trip_normalises_timestamps_to_local(
     await _advance(hass, 4)
 
     trip_id = coordinator.last_trip.trip_id
-    utc_stamp = datetime(2026, 8, 19, 11, 55, 50, tzinfo=timezone.utc)
+    utc_stamp = datetime(2026, 8, 19, 11, 55, 50, tzinfo=UTC)
     await coordinator.storage.async_update_trip(
         trip_id, {"started_at": utc_stamp},
     )
@@ -4069,7 +4070,7 @@ async def test_auto_evse_backfill_scheduled_when_live_integral_empty(
 
     async def _fake_backfill(*, charge_id: int, **_kw):
         calls.append(charge_id)
-        return None
+        return
 
     monkeypatch.setattr(
         coordinator, "async_backfill_charge_evse_service", _fake_backfill,
@@ -4103,7 +4104,7 @@ async def test_no_auto_evse_backfill_without_a_wallbox_sensor(
 
     async def _fake_backfill(*, charge_id: int, **_kw):
         calls.append(charge_id)
-        return None
+        return
 
     monkeypatch.setattr(
         coordinator, "async_backfill_charge_evse_service", _fake_backfill,
@@ -4137,7 +4138,7 @@ async def test_pending_evse_backfill_cancelled_on_stop(
 
     async def _fake_backfill(*, charge_id: int, **_kw):
         calls.append(charge_id)
-        return None
+        return
 
     monkeypatch.setattr(
         coordinator, "async_backfill_charge_evse_service", _fake_backfill,
@@ -4197,7 +4198,7 @@ async def test_odometer_catchup_does_not_release_the_charge_guard(
     await hass.async_block_till_done()
     hass.states.async_set(ODO, "31074")
     await hass.async_block_till_done()
-    assert coordinator._charge_still_delivering() is True, (  # noqa: SLF001
+    assert coordinator._charge_still_delivering() is True, (
         "a car taking 87 kW is not driving away from the charger"
     )
 
@@ -4205,7 +4206,7 @@ async def test_odometer_catchup_does_not_release_the_charge_guard(
     # exactly this and must still fire.
     hass.states.async_set(POW, "12")     # discharging
     await hass.async_block_till_done()
-    assert coordinator._charge_still_delivering() is False  # noqa: SLF001
+    assert coordinator._charge_still_delivering() is False
 
 
 async def test_vehicle_heal_rejects_an_implausible_vehicle_energy(
@@ -4246,7 +4247,7 @@ async def test_vehicle_heal_rejects_an_implausible_vehicle_energy(
     # The car claims less than half of what the battery says it used.
     hass.states.async_set("sensor.car_last_trip_energy", "22.27")
     await hass.async_block_till_done()
-    await coordinator._async_heal_from_vehicle(trip_id)  # noqa: SLF001
+    await coordinator._async_heal_from_vehicle(trip_id)
 
     t = await coordinator.storage.async_get_trip_by_id(trip_id)
     assert t.energy_kwh == pytest.approx(48.78), "SoC must win over a bad sensor"
@@ -4256,7 +4257,7 @@ async def test_vehicle_heal_rejects_an_implausible_vehicle_energy(
     # more precise measurement, which is why the heal exists.
     hass.states.async_set("sensor.car_last_trip_energy", "47.10")
     await hass.async_block_till_done()
-    await coordinator._async_heal_from_vehicle(trip_id)  # noqa: SLF001
+    await coordinator._async_heal_from_vehicle(trip_id)
 
     t = await coordinator.storage.async_get_trip_by_id(trip_id)
     assert t.energy_kwh == pytest.approx(47.10)

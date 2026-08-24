@@ -199,7 +199,9 @@ def async_register_services(hass: HomeAssistant) -> None:
         # ../, and anything outside HA's writable directories.
         path = call.data["path"]
         if not hass.config.is_allowed_path(path):
-            from homeassistant.exceptions import ServiceValidationError
+            from homeassistant.exceptions import (  # noqa: PLC0415
+                ServiceValidationError,
+            )
             raise ServiceValidationError(
                 f"Path {path!r} is not allowed. Add the parent directory to "
                 "homeassistant.allowlist_external_dirs in configuration.yaml."

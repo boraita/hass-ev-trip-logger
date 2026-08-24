@@ -1412,7 +1412,9 @@ class PlugStateSensor(_BaseTripSensor):
 
     async def async_added_to_hass(self) -> None:
         # Refresh whenever the source sensors update.
-        from homeassistant.helpers.event import async_track_state_change_event
+        from homeassistant.helpers.event import (  # noqa: PLC0415
+            async_track_state_change_event,
+        )
 
         @callback
         def _refresh(_event: Any) -> None:
@@ -2489,9 +2491,7 @@ class ChargesAggregateSensor(_BaseTripSensor):
             unit = cfg["unit"]
         elif cfg.get("per_kwh_unit"):
             unit = f"{coordinator.currency}/kWh"
-        elif key == "count" or key.endswith("_count"):
-            unit = None
-        elif cfg.get("device_class") is None:
+        elif key == "count" or key.endswith("_count") or cfg.get("device_class") is None:
             unit = None
         else:
             unit = coordinator.currency

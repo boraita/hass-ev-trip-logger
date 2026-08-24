@@ -1,7 +1,7 @@
 """Tests for v0.5.43 driver capture and the zero-reading close fix."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import timedelta, UTC
 
 import pytest
 from homeassistant.const import STATE_OFF, STATE_ON
@@ -207,8 +207,8 @@ async def test_zero_soc_at_close_is_not_discarded(hass: HomeAssistant) -> None:
 # ---------------------------------------------------------------------------
 
 def _dt(h: int, m: int = 0):
-    from datetime import datetime, timezone
-    return datetime(2026, 6, 11, h, m, tzinfo=timezone.utc)
+    from datetime import datetime
+    return datetime(2026, 6, 11, h, m, tzinfo=UTC)
 
 
 def test_pick_driver_longest_overlap_wins() -> None:
@@ -367,7 +367,7 @@ async def test_charge_merge_is_conservative_without_plug_continuity(
     assert newest.charge_id != old.charge_id
     assert newest.soc_end == pytest.approx(70.0)
     # The old row is untouched.
-    untouched = [c for c in charges if c.charge_id == old.charge_id][0]
+    untouched = next(c for c in charges if c.charge_id == old.charge_id)
     assert untouched.kwh == pytest.approx(20.0)
     assert untouched.soc_end == pytest.approx(80.0)
 

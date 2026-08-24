@@ -2,6 +2,15 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.28 — 2026-08-24
+**Chore — the project had no linter; adding one turned up a missing import.** `ruff` now runs in CI alongside hassfest, HACS and pytest, with a ruleset chosen for defects rather than whitespace: pyflakes, bugbear, the async-blocking-call rules, logging correctness, pyupgrade and the simplification families. Everything it flagged is fixed; the tree is clean.
+
+The one real defect it found: `storage.py` annotated four signatures with `Sequence[str] | None` but never imported `Sequence`. `from __future__ import annotations` made the annotations lazy strings, so nothing crashed at import — but any caller of `typing.get_type_hints()` on those methods would have raised `NameError`, and the quotes around the annotation had been papering over it. Imported properly and unquoted.
+
+Also swept: 20 deliberate function-local imports had `# noqa: PLC0415` markers that no selected rule justified, so ruff's own RUF100 wanted to delete them — one of them along with the comment explaining *why* the import was local. `PLC0415` is now selected for the integration (tests are exempt, they import the module under test inside the test body on purpose) and the seven local imports that lacked a marker got one, so every intentional lazy import is documented rather than merely tolerated.
+
+**One rule is ignored with a warning attached, because its fix corrupts data here.** `SIM118` rewrites `"col" in row.keys()` to `"col" in row`. Rows in this codebase are `sqlite3.Row`, whose `__contains__` tests **values, not keys** — `"max_speed_kmh" in row` is always `False`, while `in row.keys()` is the real column check. Taking that fix on the 44 flagged sites would have silently turned every optional column into `None` on read, on every trip and charge. The rule is disabled with that reasoning in `pyproject.toml` so nobody re-enables it by reflex.
+
 ## v0.8.27 — 2026-08-24
 **Fix — three deferred writers survived an entry unload and wrote through a stopped coordinator.** Reloading the integration — which is what an options change does — stops the coordinator and closes its storage. Any timer still pending at that moment fires afterwards and writes anyway. Two of these had already been fixed for exactly this reason, `_cancel_pending_open` in v0.5.49 and `_cancel_pending_evse_backfills` in v0.8.19; a sweep of the remaining deferred paths found three more.
 

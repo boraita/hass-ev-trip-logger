@@ -17,6 +17,7 @@ instance via `CONF_ELEVATION_PROVIDER_URL` to keep data local.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Any
 
@@ -97,7 +98,7 @@ def downsample_route(
     step = (n - 1) / (max_points - 1)
     sampled: list[tuple[float, float]] = []
     for i in range(max_points):
-        idx = int(round(i * step))
+        idx = round(i * step)
         idx = min(idx, n - 1)
         sampled.append(points[idx])
     # Dedup (stride collisions can produce consecutive identical rows).
@@ -143,7 +144,7 @@ async def fetch_elevations(
                 )
                 return None
             body = await resp.json()
-    except (ClientError, TimeoutError, Exception) as exc:  # noqa: BLE001
+    except (ClientError, TimeoutError, Exception) as exc:
         _LOGGER.info(
             "Elevation fetch failed for provider=%s: %s (skipped)",
             provider, exc,
@@ -182,7 +183,7 @@ def compute_elevation_stats(
         return (None, None, None)
     gain = 0.0
     loss = 0.0
-    for a, b in zip(elevations, elevations[1:]):
+    for a, b in itertools.pairwise(elevations):
         delta = b - a
         if delta > 0:
             gain += delta

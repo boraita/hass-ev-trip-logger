@@ -7,11 +7,11 @@ from custom_components.ev_trip_logger.abrp import build_tlm
 
 
 def _base(**over):
-    args = dict(
-        soc=55.0, power_w=None, speed=None, lat=None, lon=None,
-        is_charging=None, is_parked=None, ext_temp=None, est_range=None,
-        odometer=None, car_model=None,
-    )
+    args = {
+        "soc": 55.0, "power_w": None, "speed": None, "lat": None, "lon": None,
+        "is_charging": None, "is_parked": None, "ext_temp": None, "est_range": None,
+        "odometer": None, "car_model": None,
+    }
     args.update(over)
     return build_tlm(**args)
 
@@ -110,7 +110,7 @@ class _FakeResponse:
         self._payload = payload
         self._json_raises = json_raises
 
-    async def json(self, content_type=None):  # noqa: ARG002 — mirrors aiohttp
+    async def json(self, content_type=None):
         if self._json_raises:
             raise ValueError("not json")
         return self._payload
@@ -131,10 +131,10 @@ class _FakeSession:
         self.calls.append((url, params))
         return self._responses.pop(0)
 
-    def post(self, url, *, params=None, timeout=None):  # noqa: ARG002
+    def post(self, url, *, params=None, timeout=None):
         return self._next(url, params or {})
 
-    def get(self, url, *, params=None, timeout=None):  # noqa: ARG002
+    def get(self, url, *, params=None, timeout=None):
         return self._next(url, params or {})
 
 
@@ -175,7 +175,7 @@ async def test_send_error_omits_the_redundant_error_prefix() -> None:
     )
     await client.send({"soc": 50.0})
     assert client.last_error == "bad slug"
-    client._fail_count = 0  # noqa: SLF001 — keep the second send unsuppressed
+    client._fail_count = 0
     await client.send({"soc": 50.0})
     assert client.last_error == "rate_limited: slow down"
 
