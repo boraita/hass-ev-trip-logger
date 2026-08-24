@@ -1191,6 +1191,10 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
             getattr(charge, "peak_charge_power_kw", None), 1
         ),
         "temperature_c": _r(getattr(charge, "temperature_c", None), 1),
+        # v0.8.33 — the charger's rated power, user-entered. Pairs with
+        # peak_charge_power_kw: their ratio says whether the charger or the
+        # pack was the limit, which the peak alone cannot.
+        "charger_power_kw": _r(getattr(charge, "charger_power_kw", None), 1),
         # Km driven since the previous charge — the pack-warmth proxy.
         # Only populated on the `recent_charges` path (see
         # ChargeRecord.km_before); None elsewhere, not zero, so a

@@ -414,6 +414,14 @@ CREATE TABLE IF NOT EXISTS charges (
     -- 88-94 %. DC fast: 92-97 %. Below 85 % signals lossy cable /
     -- wallbox / onboard charger derating.
     charging_efficiency_pct REAL,
+    -- v0.8.33: the charger's RATED power, as written on the unit. User
+    -- entered — no public charger publishes it to us. This is what makes
+    -- `peak_charge_power_kw` interpretable: 41 kW observed is a session
+    -- pegged at a 50 kW unit's real ceiling, or a 150 kW unit delivering
+    -- 27 % of what it promises, and those are opposite diagnoses. Guessing
+    -- the class from the observed peak cannot tell them apart, because in
+    -- the second case the peak IS the low number. NULL until entered.
+    charger_power_kw REAL,
     -- v0.6.0: peak instantaneous charge power during the session
     -- (max |power| sample from the vehicle's power sensor, or the
     -- EVSE sensor when only that is wired). Drives DCFC-stress
@@ -654,6 +662,9 @@ class ChargeRecord:
     # v0.8.14: 'power_integration' | 'soc_delta' | None (manual entry /
     # pre-v0.8.14 row). See _SCHEMA header comment for the full story.
     energy_source: str | None = None
+    # v0.8.33: the charger's rated power in kW, as written on the unit.
+    # User-entered; nothing publishes it to us.
+    charger_power_kw: float | None = None
     charge_id: int | None = field(default=None, compare=False)
     # v0.8.32 — km driven between the previous charge and this one, the
     # proxy for "the pack arrived warm" that explains most of why a DC
@@ -886,6 +897,9 @@ class TripStorage:
         # v0.8.14: which method produced `kwh` — see header comment above.
         if "energy_source" not in charge_cols:
             conn.execute("ALTER TABLE charges ADD COLUMN energy_source TEXT")
+        # v0.8.33: the charger's rated power, user-entered.
+        if "charger_power_kw" not in charge_cols:
+            conn.execute("ALTER TABLE charges ADD COLUMN charger_power_kw REAL")
         # v0.5.0: trip_positions table for route-map drilldown.
         conn.execute(
             """
@@ -2226,8 +2240,9 @@ class TripStorage:
                     started_at, ended_at, kwh, price_per_kwh, total_cost,
                     currency, soc_start, soc_end, location, notes, is_dcfc,
                     evse_energy_kwh, charging_efficiency_pct,
-                    peak_charge_power_kw, temperature_c, energy_source
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    peak_charge_power_kw, temperature_c, energy_source,
+                    charger_power_kw
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _iso_local(record.started_at) if record.started_at else None,
@@ -2246,6 +2261,7 @@ class TripStorage:
                     record.peak_charge_power_kw,
                     record.temperature_c,
                     record.energy_source,
+                    record.charger_power_kw,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -2286,6 +2302,7 @@ class TripStorage:
         location: str | None = None,
         notes: str | None = None,
         evse_energy_kwh: float | None = None,
+        charger_power_kw: float | None = None,
     ) -> ChargeRecord | None:
         """Update a specific charge by id. Same semantics as
         update_last_charge but targets the given row instead of the
@@ -2295,7 +2312,7 @@ class TripStorage:
         """
         return await self._hass.async_add_executor_job(
             self._update_charge_by_id, charge_id, price_per_kwh, total_cost,
-            location, notes, evse_energy_kwh,
+            location, notes, evse_energy_kwh, charger_power_kw,
         )
 
     # Columns the user can correct via the extended set_charge service.
@@ -2425,6 +2442,7 @@ class TripStorage:
         location: str | None,
         notes: str | None,
         evse_energy_kwh: float | None = None,
+        charger_power_kw: float | None = None,
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -2458,14 +2476,23 @@ class TripStorage:
                 if new_evse_kwh is not None and kwh and float(new_evse_kwh) > 0
                 else row["charging_efficiency_pct"]
             )
+            # v0.8.33 — the charger's rated power. Nothing publishes it, so
+            # it can only ever arrive this way, and it is what turns an
+            # observed peak into a diagnosis.
+            new_charger_kw = (
+                float(charger_power_kw)
+                if charger_power_kw is not None
+                else row["charger_power_kw"]
+            )
             conn.execute(
                 "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
                 "location = ?, notes = ?, evse_energy_kwh = ?, "
-                "charging_efficiency_pct = ?, "
+                "charging_efficiency_pct = ?, charger_power_kw = ?, "
                 "price_locked = COALESCE(?, price_locked) WHERE id = ?",
                 (
                     new_price, new_total, new_location, new_notes,
-                    new_evse_kwh, new_eff, price_locked, charge_id,
+                    new_evse_kwh, new_eff, new_charger_kw, price_locked,
+                    charge_id,
                 ),
             )
             updated = conn.execute(
@@ -2481,10 +2508,11 @@ class TripStorage:
         location: str | None = None,
         notes: str | None = None,
         evse_energy_kwh: float | None = None,
+        charger_power_kw: float | None = None,
     ) -> ChargeRecord | None:
         return await self._hass.async_add_executor_job(
             self._update_last_charge, price_per_kwh, total_cost, location, notes,
-            evse_energy_kwh,
+            evse_energy_kwh, charger_power_kw,
         )
 
     def _update_last_charge(
@@ -2494,6 +2522,7 @@ class TripStorage:
         location: str | None,
         notes: str | None,
         evse_energy_kwh: float | None = None,
+        charger_power_kw: float | None = None,
     ) -> ChargeRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -2534,14 +2563,23 @@ class TripStorage:
                 if new_evse_kwh is not None and kwh and float(new_evse_kwh) > 0
                 else row["charging_efficiency_pct"]
             )
+            # v0.8.33 — the charger's rated power. Nothing publishes it, so
+            # it can only ever arrive this way, and it is what turns an
+            # observed peak into a diagnosis.
+            new_charger_kw = (
+                float(charger_power_kw)
+                if charger_power_kw is not None
+                else row["charger_power_kw"]
+            )
             conn.execute(
                 "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
                 "location = ?, notes = ?, evse_energy_kwh = ?, "
-                "charging_efficiency_pct = ?, "
+                "charging_efficiency_pct = ?, charger_power_kw = ?, "
                 "price_locked = COALESCE(?, price_locked) WHERE id = ?",
                 (
                     new_price, new_total, new_location, new_notes,
-                    new_evse_kwh, new_eff, price_locked, row["id"],
+                    new_evse_kwh, new_eff, new_charger_kw, price_locked,
+                    row["id"],
                 ),
             )
             updated = conn.execute(
@@ -4604,6 +4642,10 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
         peak_charge_power_kw=(
             row["peak_charge_power_kw"]
             if "peak_charge_power_kw" in row.keys() else None
+        ),
+        charger_power_kw=(
+            row["charger_power_kw"]
+            if "charger_power_kw" in row.keys() else None
         ),
         temperature_c=(
             row["temperature_c"]

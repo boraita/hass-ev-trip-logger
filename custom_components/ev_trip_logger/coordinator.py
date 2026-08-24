@@ -5729,6 +5729,7 @@ class EvTripLoggerCoordinator:
         notes: str | None = None,
         charge_id: int | None = None,
         evse_energy_kwh: float | None = None,
+        charger_power_kw: float | None = None,
     ) -> ChargeRecord | None:
         """Override price / location of a charge already in storage.
 
@@ -5744,6 +5745,19 @@ class EvTripLoggerCoordinator:
         `evse_energy_kwh` lets an away charge (no EVSE sensor) get its
         AC→DC efficiency from the operator's invoice, same field/formula
         home auto-detect fills from the live EVSE integral.
+
+        v0.8.33 — `charger_power_kw` is the rated power written on the
+        unit. Nothing publishes it, so it can only arrive this way, and
+        without it `peak_charge_power_kw` cannot be read: 41 kW observed
+        is either a session pegged at a 50 kW unit's real ceiling or a
+        150 kW unit delivering a quarter of what it promises, and those
+        are opposite diagnoses. Inferring the charger's class from the
+        observed peak cannot separate them, because in the second case
+        the peak IS the low number.
+
+        The service name now understates it three times over — it sets
+        more than the price, on more than the last charge, and none of
+        this is pricing. Worth an alias, not worth a breaking rename.
         """
         if charge_id is not None:
             updated = await self.storage.async_update_charge_by_id(
@@ -5753,6 +5767,7 @@ class EvTripLoggerCoordinator:
                 location=location,
                 notes=notes,
                 evse_energy_kwh=evse_energy_kwh,
+                charger_power_kw=charger_power_kw,
             )
         else:
             updated = await self.storage.async_update_last_charge(
@@ -5761,6 +5776,7 @@ class EvTripLoggerCoordinator:
                 location=location,
                 notes=notes,
                 evse_energy_kwh=evse_energy_kwh,
+                charger_power_kw=charger_power_kw,
             )
         if updated is None:
             _LOGGER.warning("set_last_charge_price: no charge in storage to update")

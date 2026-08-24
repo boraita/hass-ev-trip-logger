@@ -2,6 +2,19 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.33 — 2026-08-24
+**Feat — you can now record the charger's rated power, which is what makes the observed peak mean anything.** New `charger_power_kw` on charges, settable through `set_last_charge_price` (with `charge_id`, so days later) and exposed on `recent_charges`.
+
+The reason it has to be a stored field rather than something inferred: **41 kW observed means two opposite things.** Pegged at a 50 kW unit's real ceiling — 380 V × 110 A on an LFP pack lands almost exactly there — is an ordinary session, and the charger was the limit. The same 41 kW out of a 150 kW unit is a problem: cold pack, a shared cabinet, or a derating charger. Guessing the charger's class from the observed peak **cannot** separate those two, because in the second case the peak *is* the low number. Nothing publishes a public charger's rating to Home Assistant, so the only way it can arrive is by hand.
+
+Measured across the author's 15 fast DC sessions: nine cluster between 40.4 and 41.7 kW and five between 120 and 150. Grouped that way the pack averages 40.0 kW on the slow class and 85.9 kW on the fast one — a 2.1× difference that has nothing to do with anything the driver controls except where they stop. With the rating recorded, that grouping stops being an inference.
+
+Setting the rating is deliberately **not** a pricing correction: it does not set `price_locked`, and it leaves `price_per_kwh` and `total_cost` alone. Both fields ride the same UPDATE, so each falls back to the stored value when the caller omits it — correcting a price later cannot wipe the rating, and recording the rating cannot overwrite a receipt.
+
+Range-capped at 700 kW. The fastest production CCS today is 600, so anything above it is a total cost or a kWh figure typed into the wrong box.
+
+Noted, not fixed: `set_last_charge_price` now understates itself three times over — it sets more than the price, on more than the last charge, and none of this is pricing. That wants an alias, not a breaking rename.
+
 ## v0.8.32 — 2026-08-24
 **Feat — the charges list can now show how fast the energy went in, and why it went in that fast.** `recent_charges` gains five per-charge fields.
 

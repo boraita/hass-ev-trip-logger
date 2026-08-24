@@ -174,6 +174,22 @@ set_last_charge_price:
           max: 500
           step: 0.01
           mode: box
+    charger_power_kw:
+      name: Charger rated power
+      description: >-
+        The power written on the charger (50, 150, 350...). Nothing
+        publishes this, so it can only be entered by hand — and without it
+        `peak_charge_power_kw` cannot be read: 41 kW observed is either a
+        session pegged at a 50 kW unit's real ceiling or a 150 kW unit
+        delivering a quarter of what it promises. Opposite diagnoses, same
+        peak.
+      selector:
+        number:
+          min: 0
+          max: 700
+          step: 1
+          mode: box
+          unit_of_measurement: "kW"
     entry_id:
       name: Entry ID
       description: Restrict the action to a specific config entry.

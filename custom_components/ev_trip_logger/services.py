@@ -69,10 +69,20 @@ _SCHEMA_SET_LAST_CHARGE_PRICE = vol.All(
             vol.Optional("notes"): cv.string,
             vol.Optional("charge_id"): vol.All(vol.Coerce(int), vol.Range(min=1)),
             vol.Optional("evse_energy_kwh"): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            # v0.8.33 — rated power of the unit. Capped at 700 kW: the
+            # fastest production CCS today is 600, so anything above is a
+            # typo (a total cost or a kWh figure in the wrong field).
+            vol.Optional("charger_power_kw"): vol.All(
+                vol.Coerce(float), vol.Range(min=0, max=700)
+            ),
         }
     ),
+    # `charger_power_kw` counts: setting only the charger's rating, with no
+    # price and no invoice, is a legitimate call — it is the field you fill
+    # in from memory days later.
     cv.has_at_least_one_key(
-        "price_per_kwh", "total_cost", "location", "notes", "evse_energy_kwh"
+        "price_per_kwh", "total_cost", "location", "notes", "evse_energy_kwh",
+        "charger_power_kw",
     ),
 )
 
@@ -233,6 +243,7 @@ def async_register_services(hass: HomeAssistant) -> None:
                 notes=call.data.get("notes"),
                 charge_id=call.data.get("charge_id"),
                 evse_energy_kwh=call.data.get("evse_energy_kwh"),
+                charger_power_kw=call.data.get("charger_power_kw"),
             )
 
     async def _purge_trips(call: ServiceCall) -> None:
