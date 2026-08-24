@@ -1,13 +1,10 @@
 """Trip detection state machine."""
 from __future__ import annotations
 
-import json
 import itertools
 import logging
-import math
 import asyncio
 from collections import deque
-from pathlib import Path
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from collections.abc import Callable, Sequence
@@ -19,8 +16,6 @@ from homeassistant.const import (
     STATE_NOT_HOME,
     STATE_OFF,
     STATE_ON,
-    STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
 )
 from homeassistant.core import (
     CALLBACK_TYPE,
@@ -65,7 +60,6 @@ from .const import (
     CONF_HOME_ZONE,
     CONF_SECONDARY_HOME_ZONES,
     CONF_SECONDARY_HOME_COORDS,
-    DEFAULT_SECONDARY_HOME_RADIUS_M,
     CONF_IDLE_TIMEOUT,
     CONF_LOCATION,
     CONF_MIN_TRIP_DISTANCE,
@@ -114,55 +108,20 @@ from .const import (
     EVENT_TRIP_STARTED,
 )
 from .storage import ChargeRecord, TripRecord, TripStorage, period_start
+from .calc import (
+    INVALID_STATES,
+    haversine_km,
+    is_zoneless,
+    parse_secondary_home_coords,
+    pick_driver_for_window,
+    route_distance_km,
+    speed_stats,
+)
+from .cohort import COHORT_BASELINES
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _load_cohort_baselines() -> dict[str, dict[str, Any]]:
-    """v0.6.3 — read the seeded `cohort_baselines.json` once at import.
-
-    Returns the {model_key: {label, chemistry, nameplate_kwh,
-    cohort_new_kwh, source}} mapping. The "_meta" key is filtered out
-    so callers can iterate values as model rows. Any read/parse error
-    degrades gracefully to an empty dict — the SoH model then keeps
-    its v0.5.x nameplate behaviour, no warnings spamming the log.
-    """
-    path = Path(__file__).with_name("cohort_baselines.json")
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception:  # pragma: no cover — defensive
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    return {k: v for k, v in raw.items() if not k.startswith("_") and isinstance(v, dict)}
-
-
-_COHORT_BASELINES: Final = _load_cohort_baselines()
-
-
-def cohort_baseline_options() -> list[tuple[str, str]]:
-    """[(model_key, human_label), …] — used by the config flow to
-    populate the optional `CONF_VEHICLE_MODEL` dropdown."""
-    rows = [
-        (k, str(v.get("label") or k))
-        for k, v in _COHORT_BASELINES.items()
-    ]
-    rows.sort(key=lambda kv: kv[1])
-    return rows
-
-
-_INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""}
-
-# Tracker states that carry no zone information. When origin/destination
-# resolves to one of these, the GPS-coords zone fallback kicks in
-# (v0.5.44) so journey open/close logic isn't blinded by a stale tracker.
-_NON_ZONE_STATES = frozenset({"not_home", "unknown", "unavailable", "none", ""})
-
-
-def _is_zoneless(location: str | None) -> bool:
-    """True when the tracker state names no zone (not_home/unknown/...)."""
-    return not location or location.strip().casefold() in _NON_ZONE_STATES
 
 
 # v0.5.47 — max age of a GPS sample for the zone-from-coords fallback.
@@ -518,141 +477,6 @@ _GPS_BUFFER_MAX = 256
 # sample within the last N minutes is recent enough to qualify as
 # "the car's position at trip start" — anything older is stale.
 _PRE_TRIP_GPS_LOOKBACK_S = 600  # 10 min
-
-
-def _haversine_km(
-    lat1: float, lon1: float, lat2: float, lon2: float
-) -> float:
-    """Great-circle distance between two lat/lon pairs in km. Mean
-    Earth radius 6371 km. Cheap (no external deps).
-    """
-    from math import radians, sin, cos, sqrt, atan2  # noqa: PLC0415
-    r1 = radians(lat1)
-    r2 = radians(lat2)
-    dphi = radians(lat2 - lat1)
-    dlam = radians(lon2 - lon1)
-    a = sin(dphi / 2) ** 2 + cos(r1) * cos(r2) * sin(dlam / 2) ** 2
-    return 2 * 6371.0 * atan2(sqrt(a), sqrt(1 - a))
-
-
-def _parse_secondary_home_coords(
-    raw: str | None,
-) -> list[tuple[float, float, float, str]]:
-    """Parse CONF_SECONDARY_HOME_COORDS free text into (lat, lon, radius_m, label).
-
-    One entry per line (blank lines / '#' comments ignored):
-    "lat,lon", "lat,lon,radius_m", or "lat,lon,radius_m,label". Radius
-    defaults to DEFAULT_SECONDARY_HOME_RADIUS_M when omitted; label
-    defaults to "secondary_home_<n>" (n = 1-based line position among
-    valid entries) so a coordinate-matched trip still gets a real
-    destination string instead of staying "not_home". Malformed lines
-    are skipped rather than raising, since this is user-typed free text
-    with no schema validation.
-    """
-    if not raw:
-        return []
-    out: list[tuple[float, float, float, str]] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
-            continue
-        try:
-            lat = float(parts[0])
-            lon = float(parts[1])
-            radius = float(parts[2]) if len(parts) >= 3 and parts[2] else DEFAULT_SECONDARY_HOME_RADIUS_M
-        except (TypeError, ValueError):
-            continue
-        label = parts[3] if len(parts) >= 4 and parts[3] else f"secondary_home_{len(out) + 1}"
-        out.append((lat, lon, radius, label))
-    return out
-
-
-def _route_distance_km(
-    samples: Sequence[tuple[Any, float, float]],
-) -> float | None:
-    """Sum haversine segments across a sequence of (ts, lat, lon).
-    None if fewer than 2 points. Accepts any indexable sequence (list,
-    deque) of (ts, lat, lon)-shaped tuples.
-    """
-    if not samples or len(samples) < 2:
-        return None
-    total = 0.0
-    for i in range(1, len(samples)):
-        _, lat1, lon1 = samples[i - 1]
-        _, lat2, lon2 = samples[i]
-        total += _haversine_km(lat1, lon1, lat2, lon2)
-    return total
-def _pick_driver_for_window(
-    timeline: Sequence[tuple[datetime, str]],
-    start: datetime,
-    end: datetime,
-) -> str | None:
-    """Pick the driver active during [start, end] from sensor history.
-
-    `timeline` is the driver sensor's (timestamp, state) changes sorted
-    ascending; it may begin before `start` (the state already active at
-    window open). Returns the valid driver name with the longest overlap
-    with the window, or None when nobody valid was connected.
-
-    v0.5.44 — needed because on cloud-polled cars (BYD) vehicle_on
-    rarely flips, so most trips take the synthetic path which never ran
-    the live driver capture.
-    """
-    overlap: dict[str, float] = {}
-    for i, (ts, raw) in enumerate(timeline):
-        seg_start = max(ts, start)
-        seg_end = min(timeline[i + 1][0], end) if i + 1 < len(timeline) else end
-        if seg_end <= seg_start:
-            continue
-        cleaned = (raw or "").strip()
-        if (
-            not cleaned
-            or cleaned in _INVALID_STATES
-            or cleaned.casefold() in DRIVER_NONE_STATES
-        ):
-            continue
-        overlap[cleaned] = (
-            overlap.get(cleaned, 0.0) + (seg_end - seg_start).total_seconds()
-        )
-    if not overlap:
-        return None
-    return max(overlap, key=lambda k: overlap[k])
-
-
-def _speed_stats(
-    samples: Sequence[float],
-    *,
-    highway_threshold_kmh: float,
-) -> tuple[float | None, float | None]:
-    """v0.7.3 — return `(v95_speed_kmh, highway_ratio_pct)` from the
-    live-tick speed sample deque.
-
-    * `v95_speed_kmh` — 95th-percentile of samples ≥ 0. Uses the
-      classic linear-interpolation nearest-rank definition: for n
-      samples, idx = ceil(0.95 × n) − 1, clamped to n − 1. Robust
-      to a single sensor spike (max_speed_kmh is already elsewhere).
-    * `highway_ratio_pct` — fraction of samples ≥ `highway_threshold_kmh`
-      × 100. Useful for the dashboard's "urban vs autopista" split.
-
-    Both return None when the deque is empty (no speed sensor wired,
-    or the trip closed before the first live-tick fired).
-    """
-    if not samples:
-        return (None, None)
-    ordered = sorted(s for s in samples if s is not None and s >= 0)
-    if not ordered:
-        return (None, None)
-    n = len(ordered)
-    idx = max(0, min(n - 1, int(0.95 * n) - (1 if 0.95 * n == int(0.95 * n) else 0)))
-    # Simpler & bias-free: nearest-rank on the ceil convention.
-    idx = min(n - 1, max(0, math.ceil(0.95 * n) - 1))
-    v95 = ordered[idx]
-    highway = sum(1 for s in ordered if s >= highway_threshold_kmh)
-    highway_pct = highway / n * 100.0
-    return (round(v95, 1), round(highway_pct, 1))
 
 
 # Minimum time a location zone must persist before we treat it as a real
@@ -1051,7 +875,7 @@ class EvTripLoggerCoordinator:
         self._cohort_baseline_kwh: float | None = None
         self._cohort_baseline_source: str | None = None
         if self._vehicle_model_key:
-            cohort = _COHORT_BASELINES.get(self._vehicle_model_key)
+            cohort = COHORT_BASELINES.get(self._vehicle_model_key)
             if cohort is not None:
                 new_kwh = cohort.get("cohort_new_kwh")
                 if isinstance(new_kwh, (int, float)) and new_kwh > 0:
@@ -1128,7 +952,7 @@ class EvTripLoggerCoordinator:
             merged.get(CONF_SECONDARY_HOME_ZONES) or []
         )
         self._secondary_home_coords: list[tuple[float, float, float]] = (
-            _parse_secondary_home_coords(merged.get(CONF_SECONDARY_HOME_COORDS))
+            parse_secondary_home_coords(merged.get(CONF_SECONDARY_HOME_COORDS))
         )
 
         self.current: TripInProgress | None = None
@@ -1342,7 +1166,7 @@ class EvTripLoggerCoordinator:
         if lat is None or lon is None or not self._secondary_home_coords:
             return None
         for home_lat, home_lon, radius_m, label in self._secondary_home_coords:
-            if _haversine_km(lat, lon, home_lat, home_lon) * 1000.0 <= radius_m:
+            if haversine_km(lat, lon, home_lat, home_lon) * 1000.0 <= radius_m:
                 return label
         return None
 
@@ -2442,7 +2266,7 @@ class EvTripLoggerCoordinator:
     @callback
     def _async_vehicle_on_changed(self, event: Event[EventStateChangedData]) -> None:
         new_state = event.data.get("new_state")
-        if new_state is None or new_state.state in _INVALID_STATES:
+        if new_state is None or new_state.state in INVALID_STATES:
             return
         is_on = new_state.state == STATE_ON
         now = dt_util.now()
@@ -2760,7 +2584,7 @@ class EvTripLoggerCoordinator:
         # circuits below — the route capture is unconditional.
         self._capture_location_sample()
         new_state = event.data.get("new_state")
-        if new_state is None or new_state.state in _INVALID_STATES:
+        if new_state is None or new_state.state in INVALID_STATES:
             return
         loc = new_state.state
         # `not_home` means "outside every known zone" — not informative.
@@ -3057,10 +2881,10 @@ class EvTripLoggerCoordinator:
         # in time to the trip boundary it represents, otherwise it can
         # be a mid-route point that resolves to the wrong zone.
         if (
-            _is_zoneless(location_end)
+            is_zoneless(location_end)
             and route
             and (ended_at - route[-1][0]) <= _ZONE_FALLBACK_MAX_AGE
-        ) or (_is_zoneless(location_end) and not route and end_lat is not None):
+        ) or (is_zoneless(location_end) and not route and end_lat is not None):
             # No-route case: end coords came from the tracker's CURRENT
             # position at finalize time, which is fresh by construction.
             zone_end = self._zone_from_coords(end_lat, end_lon)
@@ -3071,7 +2895,7 @@ class EvTripLoggerCoordinator:
             if zone_end is not None:
                 location_end = zone_end
         if (
-            _is_zoneless(location_start)
+            is_zoneless(location_start)
             and route
             and (route[0][0] - started_at) <= _ZONE_FALLBACK_MAX_AGE
             and route[0][0] >= started_at - _ZONE_FALLBACK_MAX_AGE
@@ -3125,7 +2949,7 @@ class EvTripLoggerCoordinator:
             end_lat=end_lat,
             end_lon=end_lon,
             gps_distance_km=(
-                round(_route_distance_km(route), 2)
+                round(route_distance_km(route), 2)
                 if route and len(route) >= 2 else None
             ),
             # v0.5.35 — synth path. If a polling-pause sensor is wired
@@ -3502,7 +3326,7 @@ class EvTripLoggerCoordinator:
         when one opens).
         """
         new_state = event.data.get("new_state")
-        if new_state is None or new_state.state in _INVALID_STATES:
+        if new_state is None or new_state.state in INVALID_STATES:
             return
         try:
             value = float(new_state.state)
@@ -3546,7 +3370,7 @@ class EvTripLoggerCoordinator:
     @callback
     def _async_charge_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
         new_state = event.data.get("new_state")
-        if new_state is None or new_state.state in _INVALID_STATES:
+        if new_state is None or new_state.state in INVALID_STATES:
             return
         # v0.5.61 — `state == STATE_ON` only matched binary_sensor 'on'.
         # Now accepts Tesla's `Charging`, OVMS's `charging`, etc.
@@ -4586,7 +4410,7 @@ class EvTripLoggerCoordinator:
         # v0.8.10 — no GPS route in this reconstruction path, but the
         # tracker's CURRENT coords are still worth a free-typed
         # secondary-home check when the state itself names no zone.
-        if _is_zoneless(location_end) and self._location:
+        if is_zoneless(location_end) and self._location:
             loc_state = self.hass.states.get(self._location)
             if loc_state is not None:
                 try:
@@ -4711,7 +4535,7 @@ class EvTripLoggerCoordinator:
         # v0.8.10 — no GPS route in this reconstruction path, but the
         # tracker's CURRENT coords are still worth a free-typed
         # secondary-home check when the state itself names no zone.
-        if _is_zoneless(location_end) and self._location:
+        if is_zoneless(location_end) and self._location:
             loc_state = self.hass.states.get(self._location)
             if loc_state is not None:
                 try:
@@ -5184,7 +5008,7 @@ class EvTripLoggerCoordinator:
         # v0.5.47 — only when the sample is FRESH: a stale point can be
         # mid-route and resolve to the wrong zone (worse than NULL).
         if (
-            _is_zoneless(location_end)
+            is_zoneless(location_end)
             and active.gps_samples
             and (now - active.gps_samples[-1][0]) <= _ZONE_FALLBACK_MAX_AGE
         ):
@@ -5496,11 +5320,11 @@ class EvTripLoggerCoordinator:
             ),
             # v0.7.3 — speed distribution metrics from per-tick samples.
             # Both None when no speed sensor is wired.
-            v95_speed_kmh=_speed_stats(
+            v95_speed_kmh=speed_stats(
                 active.speed_samples,
                 highway_threshold_kmh=_HIGHWAY_SPEED_KMH,
             )[0],
-            highway_ratio_pct=_speed_stats(
+            highway_ratio_pct=speed_stats(
                 active.speed_samples,
                 highway_threshold_kmh=_HIGHWAY_SPEED_KMH,
             )[1],
@@ -5525,7 +5349,7 @@ class EvTripLoggerCoordinator:
                 if active.energy_from_power_kwh > 0 else None
             ),
             gps_distance_km=(
-                round(_route_distance_km(active.gps_samples), 2)
+                round(route_distance_km(active.gps_samples), 2)
                 if active.gps_samples and len(active.gps_samples) >= 2 else None
             ),
             # v0.5.35 — live path always tags as 'live' (precise
@@ -6955,7 +6779,7 @@ class EvTripLoggerCoordinator:
         if not entity_id:
             return None
         state = self.hass.states.get(entity_id)
-        if state is None or state.state in _INVALID_STATES:
+        if state is None or state.state in INVALID_STATES:
             return None
         return state.state
 
@@ -7018,7 +6842,7 @@ class EvTripLoggerCoordinator:
         if not entity_id:
             return None
         state = self.hass.states.get(entity_id)
-        if state is None or state.state in _INVALID_STATES:
+        if state is None or state.state in INVALID_STATES:
             return None
         if (now - state.last_updated).total_seconds() > max_age_s:
             return None
@@ -7134,7 +6958,7 @@ class EvTripLoggerCoordinator:
         if trip.ended_at is None:
             return
         sensor_state = self.hass.states.get(self._last_trip_energy_sensor)
-        if sensor_state is None or sensor_state.state in _INVALID_STATES:
+        if sensor_state is None or sensor_state.state in INVALID_STATES:
             return
         if sensor_state.last_changed < trip.ended_at:
             _LOGGER.debug(
@@ -7152,7 +6976,7 @@ class EvTripLoggerCoordinator:
         # Distance cross-check (optional).
         if self._last_trip_distance_sensor:
             dist_state = self.hass.states.get(self._last_trip_distance_sensor)
-            if dist_state and dist_state.state not in _INVALID_STATES:
+            if dist_state and dist_state.state not in INVALID_STATES:
                 try:
                     vehicle_km = float(dist_state.state)
                 except (TypeError, ValueError):
@@ -7545,7 +7369,7 @@ class EvTripLoggerCoordinator:
         # who was about to drive.
         pick_start = start - timedelta(minutes=pre_window_min)
         pick_end = end + timedelta(minutes=post_window_min)
-        return _pick_driver_for_window(timeline, pick_start, pick_end)
+        return pick_driver_for_window(timeline, pick_start, pick_end)
 
     async def _async_resolve_trip_driver(
         self,
@@ -7742,11 +7566,11 @@ class EvTripLoggerCoordinator:
             # v0.7.3 — live V95 + highway-ratio from the running
             # sample deque so the tiles reflect current driving
             # pattern mid-trip.
-            "v95_speed_kmh": _speed_stats(
+            "v95_speed_kmh": speed_stats(
                 active.speed_samples,
                 highway_threshold_kmh=_HIGHWAY_SPEED_KMH,
             )[0],
-            "highway_ratio_pct": _speed_stats(
+            "highway_ratio_pct": speed_stats(
                 active.speed_samples,
                 highway_threshold_kmh=_HIGHWAY_SPEED_KMH,
             )[1],

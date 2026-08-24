@@ -212,7 +212,7 @@ def _dt(h: int, m: int = 0):
 
 
 def test_pick_driver_longest_overlap_wins() -> None:
-    from custom_components.ev_trip_logger.coordinator import _pick_driver_for_window
+    from custom_components.ev_trip_logger.calc import pick_driver_for_window
     timeline = [
         (_dt(5, 0), "none"),
         (_dt(5, 43), "Elena"),
@@ -220,14 +220,14 @@ def test_pick_driver_longest_overlap_wins() -> None:
         (_dt(6, 10), "none"),
     ]
     # Window 05:52–06:14: Elena 13 min, Rafa 5 min.
-    assert _pick_driver_for_window(timeline, _dt(5, 52), _dt(6, 14)) == "Elena"
+    assert pick_driver_for_window(timeline, _dt(5, 52), _dt(6, 14)) == "Elena"
 
 
 def test_pick_driver_state_active_at_window_start() -> None:
-    from custom_components.ev_trip_logger.coordinator import _pick_driver_for_window
+    from custom_components.ev_trip_logger.calc import pick_driver_for_window
     # Single change before the window — still drives the whole window.
     timeline = [(_dt(5, 0), "Rafa")]
-    assert _pick_driver_for_window(timeline, _dt(6, 0), _dt(6, 30)) == "Rafa"
+    assert pick_driver_for_window(timeline, _dt(6, 0), _dt(6, 30)) == "Rafa"
 
 
 def test_pick_driver_catches_pre_trip_flicker_with_widened_window() -> None:
@@ -242,8 +242,8 @@ def test_pick_driver_catches_pre_trip_flicker_with_widened_window() -> None:
     Rafa wins because his only valid segment overlaps the widened
     window.
     """
-    from custom_components.ev_trip_logger.coordinator import (
-        _pick_driver_for_window,
+    from custom_components.ev_trip_logger.calc import (
+        pick_driver_for_window,
     )
     from datetime import timedelta as _td
     trip_start = _dt(17, 25)
@@ -255,11 +255,11 @@ def test_pick_driver_catches_pre_trip_flicker_with_widened_window() -> None:
         (trip_start - _td(minutes=4, seconds=30), "none"),
     ]
     # Narrow window — what the old code did. Misses Rafa entirely.
-    assert _pick_driver_for_window(timeline, trip_start, trip_end) is None
+    assert pick_driver_for_window(timeline, trip_start, trip_end) is None
     # Widened window — what _async_driver_during now passes after
     # extending the recorder query by 5 / 2 min on each side. Rafa
     # held the sensor for ~5 min inside the widened window.
-    assert _pick_driver_for_window(
+    assert pick_driver_for_window(
         timeline,
         trip_start - _td(minutes=5),
         trip_end + _td(minutes=2),
@@ -267,14 +267,14 @@ def test_pick_driver_catches_pre_trip_flicker_with_widened_window() -> None:
 
 
 def test_pick_driver_ignores_none_and_invalid_states() -> None:
-    from custom_components.ev_trip_logger.coordinator import _pick_driver_for_window
+    from custom_components.ev_trip_logger.calc import pick_driver_for_window
     timeline = [
         (_dt(5, 0), "none"),
         (_dt(5, 30), "unavailable"),
         (_dt(5, 45), "not_connected"),
     ]
-    assert _pick_driver_for_window(timeline, _dt(5, 0), _dt(6, 0)) is None
-    assert _pick_driver_for_window([], _dt(5, 0), _dt(6, 0)) is None
+    assert pick_driver_for_window(timeline, _dt(5, 0), _dt(6, 0)) is None
+    assert pick_driver_for_window([], _dt(5, 0), _dt(6, 0)) is None
 
 
 async def test_zone_from_coords_resolves_stale_tracker(hass: HomeAssistant) -> None:
@@ -312,13 +312,13 @@ async def test_zone_from_coords_resolves_stale_tracker(hass: HomeAssistant) -> N
 
 
 def test_is_zoneless() -> None:
-    from custom_components.ev_trip_logger.coordinator import _is_zoneless
-    assert _is_zoneless("not_home")
-    assert _is_zoneless("Unknown")
-    assert _is_zoneless(None)
-    assert _is_zoneless("  ")
-    assert not _is_zoneless("home")
-    assert not _is_zoneless("Trabajo ele ")
+    from custom_components.ev_trip_logger.calc import is_zoneless
+    assert is_zoneless("not_home")
+    assert is_zoneless("Unknown")
+    assert is_zoneless(None)
+    assert is_zoneless("  ")
+    assert not is_zoneless("home")
+    assert not is_zoneless("Trabajo ele ")
 
 
 async def test_charge_merge_is_conservative_without_plug_continuity(
