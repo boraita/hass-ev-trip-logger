@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 from pathlib import Path
 from typing import Any
 
@@ -110,7 +110,7 @@ def _anchor_lots(lots: list[list[float]], target_kwh: float, pad_price: float) -
 
     Mutates `lots` in place; each lot is `[kwh, price]`, oldest first.
     """
-    total = sum(l[0] for l in lots)
+    total = sum(lot[0] for lot in lots)
     if target_kwh < total:
         excess = total - target_kwh
         while excess > 1e-9 and lots:
@@ -973,7 +973,7 @@ class TripStorage:
         "energy_source",
     })
 
-    async def async_get_trip_by_id(self, trip_id: int) -> "TripRecord | None":
+    async def async_get_trip_by_id(self, trip_id: int) -> TripRecord | None:
         """v0.5.77 — fetch a single trip by primary key."""
         return await self._hass.async_add_executor_job(
             self._get_trip_by_id, trip_id,
@@ -996,7 +996,7 @@ class TripStorage:
 
     def _trips_needing_vehicle_heal(self, hours: int) -> list[int]:
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=hours)
+            datetime.now(UTC) - timedelta(hours=hours)
         ).isoformat()
         with self._connect() as conn:
             rows = conn.execute(
@@ -1028,7 +1028,7 @@ class TripStorage:
         self, days: int, limit: int,
     ) -> list[tuple[int, datetime, datetime]]:
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=days)
+            datetime.now(UTC) - timedelta(days=days)
         ).isoformat()
         rows: list[tuple[int, datetime, datetime]] = []
         with self._connect() as conn:
@@ -1049,7 +1049,7 @@ class TripStorage:
                 rows.append((int(r[0]), s, e))
         return rows
 
-    def _get_trip_by_id(self, trip_id: int) -> "TripRecord | None":
+    def _get_trip_by_id(self, trip_id: int) -> TripRecord | None:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
@@ -1239,7 +1239,7 @@ class TripStorage:
         if not clean:
             return None
         cols = ", ".join(f"{k} = ?" for k in clean)
-        params = list(clean.values()) + [trip_id]
+        params = [*list(clean.values()), trip_id]
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(f"UPDATE trips SET {cols} WHERE id = ?", params)
@@ -1432,7 +1432,7 @@ class TripStorage:
                 ORDER BY MAX(ended_at) DESC
                 LIMIT ?
                 """,
-                params + (limit,),
+                (*params, limit),
             ).fetchall()
         return [
             {
@@ -1490,7 +1490,7 @@ class TripStorage:
 
     async def async_absorb_orphans_into_journey(
         self, journey_id: int, home_zone: str,
-        secondary_home_zones: "Sequence[str] | None" = None,
+        secondary_home_zones: Sequence[str] | None = None,
     ) -> int:
         """Retro-assign journey_id to orphan trips since the last home arrival.
 
@@ -1520,7 +1520,7 @@ class TripStorage:
 
     def _absorb_orphans_into_journey(
         self, journey_id: int, home_zone: str,
-        secondary_home_zones: "Sequence[str] | None" = None,
+        secondary_home_zones: Sequence[str] | None = None,
     ) -> int:
         slugs = [(home_zone or "home").strip().casefold()]
         slugs += [s.strip().casefold() for s in (secondary_home_zones or []) if s]
@@ -1554,7 +1554,7 @@ class TripStorage:
             return int(cur.rowcount or 0)
 
     async def async_resolve_open_journey_id(
-        self, home_zone: str, secondary_home_zones: "Sequence[str] | None" = None
+        self, home_zone: str, secondary_home_zones: Sequence[str] | None = None
     ) -> int | None:
         """Return the journey_id of the currently-open journey, if any.
 
@@ -1574,7 +1574,7 @@ class TripStorage:
         )
 
     def _resolve_open_journey_id(
-        self, home_zone: str, secondary_home_zones: "Sequence[str] | None" = None
+        self, home_zone: str, secondary_home_zones: Sequence[str] | None = None
     ) -> int | None:
         slugs = [(home_zone or "home").strip().casefold()]
         slugs += [s.strip().casefold() for s in (secondary_home_zones or []) if s]
@@ -2218,7 +2218,7 @@ class TripStorage:
         if "kwh" in clean:
             clean["energy_source"] = "manual"
         cols = ", ".join(f"{k} = ?" for k in clean)
-        params = list(clean.values()) + [charge_id]
+        params = [*list(clean.values()), charge_id]
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(f"UPDATE charges SET {cols} WHERE id = ?", params)
@@ -2625,7 +2625,7 @@ class TripStorage:
         configured home tariff (`default_price`). The
         result is written back to `cost` and `cost_basis_per_kwh`.
         """
-        from collections import deque
+        from collections import deque  # noqa: PLC0415
 
         price = float(default_price)
         with self._connect() as conn:
@@ -2887,7 +2887,7 @@ class TripStorage:
                     elif capacity:
                         pool_kwh = min(pool_kwh, capacity)
                         _anchor_lots(
-                            lots, min(sum(l[0] for l in lots), capacity),
+                            lots, min(sum(lot[0] for lot in lots), capacity),
                             c_price,
                         )
 
@@ -3480,7 +3480,7 @@ class TripStorage:
                     cols = ", ".join(f"{k} = ?" for k in updates)
                     conn.execute(
                         f"UPDATE trips SET {cols} WHERE id = ?",
-                        list(updates.values()) + [row["id"]],
+                        [*list(updates.values()), row["id"]],
                     )
 
                 prev_end_ts = end
@@ -3499,7 +3499,7 @@ class TripStorage:
         return await self._hass.async_add_executor_job(self._export_csv, path)
 
     def _export_csv(self, path: str) -> int:
-        import csv
+        import csv  # noqa: PLC0415
 
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -3705,7 +3705,7 @@ class TripStorage:
         )
 
     def _daily_km_window(self, days: int) -> list[dict[str, Any]]:
-        from datetime import timedelta as _td
+        from datetime import timedelta as _td  # noqa: PLC0415
         # dt_util.now() (HA-configured timezone), NOT datetime.now()
         # (host OS timezone) — stored timestamps come from dt_util.now(),
         # so day boundaries must use the same clock.
@@ -3744,16 +3744,16 @@ class TripStorage:
         )
 
     def _trip_patterns(self, days: int) -> dict[str, Any]:
-        from datetime import timedelta as _td
+        from datetime import timedelta as _td  # noqa: PLC0415
         cutoff = (dt_util.now() - _td(days=days)).isoformat()
         with sqlite3.connect(self._path) as conn:
             rows = conn.execute(
                 "SELECT started_at, distance_km FROM trips WHERE started_at >= ?",
                 (cutoff,),
             ).fetchall()
-        by_hour: dict[int, int] = {h: 0 for h in range(24)}
-        by_weekday: dict[int, int] = {w: 0 for w in range(7)}
-        km_by_weekday: dict[int, float] = {w: 0.0 for w in range(7)}
+        by_hour: dict[int, int] = dict.fromkeys(range(24), 0)
+        by_weekday: dict[int, int] = dict.fromkeys(range(7), 0)
+        km_by_weekday: dict[int, float] = dict.fromkeys(range(7), 0.0)
         for started_at, distance in rows:
             try:
                 ts = datetime.fromisoformat(started_at)
@@ -3785,22 +3785,19 @@ class TripStorage:
     def _avg_trip_metrics(self, since: datetime) -> dict[str, float | None]:
         with sqlite3.connect(self._path) as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT
                     AVG(distance_km) AS d,
                     AVG(duration_min) AS dur,
                     AVG(energy_kwh) AS e,
-                    {weighted_consumption} AS c,
-                    {weighted_speed} AS s,
+                    {_WEIGHTED_CONSUMPTION_SQL} AS c,
+                    {_WEIGHTED_SPEED_SQL} AS s,
                     AVG(regen_kwh) AS r,
                     SUM(duration_min) AS total_driving,
                     COUNT(*) AS n
                 FROM trips
                 WHERE started_at >= ?
-                """.format(
-                    weighted_consumption=_WEIGHTED_CONSUMPTION_SQL,
-                    weighted_speed=_WEIGHTED_SPEED_SQL,
-                ),
+                """,
                 (since.isoformat(),),
             ).fetchone()
         d, dur, e, c, s, r, total_driving, n = row
@@ -3835,19 +3832,19 @@ class TripStorage:
     def _driver_stats(self, since: datetime) -> list[dict[str, Any]]:
         with sqlite3.connect(self._path) as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     COALESCE(driver, 'unknown') AS drv,
                     COUNT(*) AS trips,
                     COALESCE(SUM(distance_km), 0) AS km,
                     COALESCE(SUM(duration_min), 0) AS minutes,
                     COALESCE(SUM(energy_kwh), 0) AS kwh,
-                    {weighted_consumption} AS cons
+                    {_WEIGHTED_CONSUMPTION_SQL} AS cons
                 FROM trips
                 WHERE started_at >= ?
                 GROUP BY drv
                 ORDER BY km DESC
-                """.format(weighted_consumption=_WEIGHTED_CONSUMPTION_SQL),
+                """,
                 (since.isoformat(),),
             ).fetchall()
         return [

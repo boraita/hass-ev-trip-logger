@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 import pytest
@@ -19,30 +19,30 @@ from custom_components.ev_trip_logger.storage import (
 
 
 def _charge(**overrides) -> ChargeRecord:
-    base: dict = dict(
-        ended_at=dt_util.now(),
-        kwh=10.0,
-        price_per_kwh=0.15,
-        total_cost=1.5,
-        currency="EUR",
-    )
+    base: dict = {
+        "ended_at": dt_util.now(),
+        "kwh": 10.0,
+        "price_per_kwh": 0.15,
+        "total_cost": 1.5,
+        "currency": "EUR",
+    }
     base.update(overrides)
     return ChargeRecord(**base)
 
 
 def _trip(**overrides) -> TripRecord:
     now = dt_util.now()
-    base: dict = dict(
-        started_at=now - timedelta(hours=1),
-        ended_at=now,
-        duration_min=60.0,
-        distance_km=10.0,
-        soc_used_pct=10.0,
-        energy_kwh=7.5,
-        consumption_kwh_100km=75.0,
-        cost=1.0,
-        currency="EUR",
-    )
+    base: dict = {
+        "started_at": now - timedelta(hours=1),
+        "ended_at": now,
+        "duration_min": 60.0,
+        "distance_km": 10.0,
+        "soc_used_pct": 10.0,
+        "energy_kwh": 7.5,
+        "consumption_kwh_100km": 75.0,
+        "cost": 1.0,
+        "currency": "EUR",
+    }
     base.update(overrides)
     return TripRecord(**base)
 
@@ -1244,15 +1244,15 @@ async def test_trip_overlaps_matches_locally_stored_rows_from_utc_bounds(
 
     # Same instants, expressed in UTC, as the recorder hands them back.
     assert await storage.async_trip_overlaps(
-        local_start.astimezone(timezone.utc),
-        local_end.astimezone(timezone.utc),
+        local_start.astimezone(UTC),
+        local_end.astimezone(UTC),
     ) is True
 
     # A genuinely different window must still report no overlap.
     far = local_start - timedelta(days=3)
     assert await storage.async_trip_overlaps(
-        far.astimezone(timezone.utc),
-        (far + timedelta(hours=1)).astimezone(timezone.utc),
+        far.astimezone(UTC),
+        (far + timedelta(hours=1)).astimezone(UTC),
     ) is False
 
 
@@ -1455,8 +1455,8 @@ async def test_charges_in_window_matches_across_mixed_timezone_bounds(
     assert local["kwh"] == pytest.approx(11.0)
 
     as_utc = await storage.async_charges_in_window(
-        (ended - timedelta(hours=2)).astimezone(timezone.utc),
-        (ended + timedelta(hours=2)).astimezone(timezone.utc),
+        (ended - timedelta(hours=2)).astimezone(UTC),
+        (ended + timedelta(hours=2)).astimezone(UTC),
     )
     assert as_utc["kwh"] == pytest.approx(11.0), "UTC bounds must match too"
 

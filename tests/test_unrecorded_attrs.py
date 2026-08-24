@@ -103,16 +103,16 @@ async def test_tracked_avg_retries_while_only_the_unit_is_missing(
     sensor.hass = hass
     # A mean is already known, but the source has not been created yet —
     # exactly the state the real restart left the sensor in.
-    sensor._mean = 19.46  # noqa: SLF001
+    sensor._mean = 19.46
     assert sensor.native_unit_of_measurement is None
-    assert sensor._retry_needed() is True, (  # noqa: SLF001
+    assert sensor._retry_needed() is True, (
         "a known value with an unknown unit must keep retrying"
     )
 
     # Source shows up with its unit: nothing left to wait for.
     hass.states.async_set(src, "25.5", {"unit_of_measurement": "kWh/100km"})
     assert sensor.native_unit_of_measurement == "kWh/100km"
-    assert sensor._retry_needed() is False  # noqa: SLF001
+    assert sensor._retry_needed() is False
 
 
 async def test_elevation_has_no_phantom_current_trip_entities(
@@ -160,16 +160,16 @@ async def test_journey_sensors_surface_cost_lifo(
     }
 
     last = LastJourneySensor(coordinator)
-    last._summary = dict(summary)  # noqa: SLF001
+    last._summary = dict(summary)
     assert "cost_lifo" in (last.extra_state_attributes or {})
     assert last.extra_state_attributes["cost_lifo"] == pytest.approx(0.62)
 
     cur = CurrentJourneySensor(coordinator)
-    cur._closed = dict(summary)  # noqa: SLF001
-    assert "cost_lifo" in cur._compute()  # noqa: SLF001
+    cur._closed = dict(summary)
+    assert "cost_lifo" in cur._compute()
 
     recent = RecentJourneysSensor(coordinator)
-    recent._journeys = [dict(summary)]  # noqa: SLF001
+    recent._journeys = [dict(summary)]
     out = recent.extra_state_attributes["journeys"][0]
     assert "cost_lifo" in out
     assert out["cost_lifo"] == pytest.approx(0.62)

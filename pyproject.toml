@@ -2,3 +2,53 @@
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+  "F",      # pyflakes — undefined names, unused imports, dead f-strings
+  "E4", "E7", "E9",  # pycodestyle errors worth having (not whitespace nits)
+  "W",      # pycodestyle warnings
+  "ASYNC",  # blocking calls inside async functions
+  "B",      # flake8-bugbear
+  "C4",     # comprehension misuse
+  "G",      # logging-format correctness
+  "LOG",    # logging API misuse
+  "PIE",    # misc lints
+  "RET",    # return-statement simplifications
+  "RUF",    # ruff-native rules
+  "SIM",    # simplifications
+  "UP",     # pyupgrade
+  # Selected on purpose: 20 imports in this codebase are deliberately
+  # function-local (lazy HA subsystem imports, keeping config_flow light)
+  # and each carries a `# noqa: PLC0415`. Without the rule selected those
+  # directives read as dead and RUF100 deletes them along with the reason.
+  "PLC0415",
+]
+ignore = [
+  # This codebase writes →, ×, ±, ≥ and Spanish accents in prose comments
+  # and docstrings on purpose; they are not homoglyph mistakes.
+  "RUF001", "RUF002", "RUF003",
+  # Class-level lookup tables are constants by convention (marked `#:`).
+  # Annotating twelve of them ClassVar is churn without a defect behind it.
+  "RUF012",
+  # Several zips are deliberately off-by-one (`zip(xs, xs[1:])` for
+  # consecutive pairs); strict=True would raise on every call.
+  "B905",
+  # `except Exception` around a defensive DB/network call is the house
+  # style; contextlib.suppress hides which call is being guarded.
+  "SIM105",
+  # DANGEROUS HERE. Rows come back as `sqlite3.Row`, whose `__contains__`
+  # tests VALUES, not keys — `"max_speed_kmh" in row` is always False,
+  # while `in row.keys()` is the real column check. Taking this rule's fix
+  # would silently turn every optional column into None on read.
+  "SIM118",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on real files, reach into private coordinator state, and
+# import the module under test inside the test body on purpose.
+"tests/*" = ["ASYNC230", "SLF001", "PLC0415"]

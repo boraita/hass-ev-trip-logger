@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import itertools
 import logging
 import math
 import asyncio
@@ -9,8 +10,8 @@ from collections import deque
 from pathlib import Path
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from collections.abc import Sequence
-from typing import Any, Callable, Final
+from collections.abc import Callable, Sequence
+from typing import Any, Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -45,7 +46,6 @@ from .elevation import (
     fetch_elevations,
 )
 from .const import (
-    ABRP_MIN_SEND_INTERVAL_S,
     DOMAIN,
     CONF_ABRP_API_KEY,
     CONF_ABRP_CAR_MODEL,
@@ -526,7 +526,7 @@ def _haversine_km(
     """Great-circle distance between two lat/lon pairs in km. Mean
     Earth radius 6371 km. Cheap (no external deps).
     """
-    from math import radians, sin, cos, sqrt, atan2
+    from math import radians, sin, cos, sqrt, atan2  # noqa: PLC0415
     r1 = radians(lat1)
     r2 = radians(lat2)
     dphi = radians(lat2 - lat1)
@@ -571,7 +571,7 @@ def _parse_secondary_home_coords(
 
 
 def _route_distance_km(
-    samples: "Sequence[tuple[Any, float, float]]",
+    samples: Sequence[tuple[Any, float, float]],
 ) -> float | None:
     """Sum haversine segments across a sequence of (ts, lat, lon).
     None if fewer than 2 points. Accepts any indexable sequence (list,
@@ -3326,7 +3326,9 @@ class EvTripLoggerCoordinator:
             prev_ts = self.current_charge._last_power_ts
             if prev_kw is not None and prev_ts is not None:
                 dt_h = (now - prev_ts).total_seconds() / 3600.0
-                if 0 < dt_h <= _MAX_POWER_TRAPEZOID_DT_H:
+                # Kept nested: the outer test is "is this sample pair
+                # spaced sanely", the inner one "is it charging at all".
+                if 0 < dt_h <= _MAX_POWER_TRAPEZOID_DT_H:  # noqa: SIM102
                     # Charge contribution: trapezoidal area on the
                     # battery-receiving side only (both samples ≤ 0).
                     if prev_kw <= 0 and value <= 0:
@@ -4592,9 +4594,7 @@ class EvTripLoggerCoordinator:
         journey_id: int | None
         if self.current_journey_id is not None:
             journey_id = self.current_journey_id
-        elif started_from_home:
-            journey_id = await self.storage.async_next_journey_id()
-        elif is_at_home_end:
+        elif started_from_home or is_at_home_end:
             journey_id = await self.storage.async_next_journey_id()
         else:
             journey_id = None
@@ -4725,9 +4725,7 @@ class EvTripLoggerCoordinator:
         journey_id: int | None
         if self.current_journey_id is not None:
             journey_id = self.current_journey_id
-        elif started_from_home:
-            journey_id = await self.storage.async_next_journey_id()
-        elif is_at_home_end:
+        elif started_from_home or is_at_home_end:
             journey_id = await self.storage.async_next_journey_id()
         else:
             journey_id = None
@@ -6319,7 +6317,7 @@ class EvTripLoggerCoordinator:
         # an on-interval.
         max_dt_h = _MAX_POWER_TRAPEZOID_DT_H
         total_kwh = 0.0
-        for (t0, kw0), (t1, kw1) in zip(samples, samples[1:]):
+        for (t0, kw0), (t1, kw1) in itertools.pairwise(samples):
             if t1 <= t0:
                 continue
             dt_full_s = (t1 - t0).total_seconds()
@@ -7419,7 +7417,7 @@ class EvTripLoggerCoordinator:
             return None
         return round(net_power / soc_delta_kwh, 3)
 
-    def _resolve_dominant_driver(self, active: "TripInProgress") -> str | None:
+    def _resolve_dominant_driver(self, active: TripInProgress) -> str | None:
         """v0.5.82 — pick the driver who held the sensor the LONGEST
         during the trip, not the brittle 'first non-empty wins' of
         v0.5.43. Fixes the BT-race-at-open case: when a passenger's
@@ -7450,11 +7448,10 @@ class EvTripLoggerCoordinator:
         # already filtered by `_read_driver` so the dict only carries
         # real driver names.
         if active.driver_samples:
-            dominant = max(
+            return max(
                 active.driver_samples,
                 key=lambda k: active.driver_samples[k],
             )
-            return dominant
         # No samples: fall through to legacy behaviour.
         if active.driver is not None:
             return active.driver
@@ -7543,7 +7540,7 @@ class EvTripLoggerCoordinator:
 
     async def _async_resolve_trip_driver(
         self,
-        active: "TripInProgress",
+        active: TripInProgress,
         start: datetime,
         end: datetime,
     ) -> str | None:
@@ -7625,7 +7622,7 @@ class EvTripLoggerCoordinator:
             # landing after a polling outage moves just as far, and on
             # 2026-08-23 it did so in the same second the charge opened.
             # Power settles it physically — see `_CHARGE_GUARD_VETO_KW`.
-            signed_kw = self.current_charge._last_power_kw_signed  # noqa: SLF001
+            signed_kw = self.current_charge._last_power_kw_signed
             if signed_kw is not None and signed_kw <= -_CHARGE_GUARD_VETO_KW:
                 _LOGGER.debug(
                     "Charge guard: %.1f km on the odometer ignored, the "
