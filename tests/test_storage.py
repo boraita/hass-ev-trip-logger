@@ -1987,3 +1987,76 @@ async def test_km_before_ignores_trips_during_the_charge_itself(
     assert recent[0].km_before == pytest.approx(50.0), (
         "the 999 km trip closed after the charge started and must not count"
     )
+
+
+async def test_charger_rated_power_round_trips_and_can_be_set_later(
+    storage: TripStorage,
+) -> None:
+    """v0.8.33 — the charger's rating survives, and can arrive days late.
+
+    Nothing publishes it, so the realistic flow is: the charge auto-logs
+    with the field empty, and the user fills it in from memory later. That
+    must work without touching the price — the row already has one, and
+    re-pricing it as a side effect would silently overwrite a receipt.
+    """
+    now = dt_util.now()
+    cid = await storage.async_insert_charge(_charge(
+        ended_at=now, kwh=42.23, price_per_kwh=0.30, total_cost=12.67,
+    ))
+    fetched = await storage.async_get_charge_by_id(cid)
+    assert fetched.charger_power_kw is None
+
+    patched = await storage.async_update_charge_by_id(cid, charger_power_kw=150.0)
+    assert patched.charger_power_kw == pytest.approx(150.0)
+    assert patched.price_per_kwh == pytest.approx(0.30), "price must be untouched"
+    assert patched.total_cost == pytest.approx(12.67)
+    assert patched.price_locked is False, (
+        "setting the charger rating is not a pricing correction and must not lock"
+    )
+
+
+async def test_charger_rated_power_separates_the_two_41_kw_cases(
+    storage: TripStorage,
+) -> None:
+    """The reason the field exists: 41 kW observed means two opposite things.
+
+    Pegged at a 50 kW unit's real ceiling is a normal session. The same
+    41 kW out of a 150 kW unit is a problem — cold pack, shared cabinet,
+    or a derating charger. Inferring the charger's class from the observed
+    peak cannot tell them apart, because in the second case the peak IS
+    the low number. Only the rating separates them.
+    """
+    now = dt_util.now()
+    ids = []
+    for rated in (50.0, 150.0):
+        ids.append(await storage.async_insert_charge(_charge(
+            ended_at=now, kwh=40.0, peak_charge_power_kw=41.0,
+            charger_power_kw=rated,
+        )))
+    got = [await storage.async_get_charge_by_id(i) for i in ids]
+    assert [c.charger_power_kw for c in got] == [50.0, 150.0]
+    # Same observed peak, ratios 82 % and 27 %.
+    ratios = [c.peak_charge_power_kw / c.charger_power_kw for c in got]
+    assert ratios[0] == pytest.approx(0.82, abs=0.01)
+    assert ratios[1] == pytest.approx(0.273, abs=0.01)
+
+
+async def test_charger_rated_power_survives_a_price_correction(
+    storage: TripStorage,
+) -> None:
+    """Correcting the price later must not wipe the rating, or vice versa.
+
+    Both fields ride the same service and the same UPDATE, so each has to
+    fall back to the stored value when the caller omits it.
+    """
+    now = dt_util.now()
+    cid = await storage.async_insert_charge(_charge(ended_at=now, kwh=40.0))
+    await storage.async_update_charge_by_id(cid, charger_power_kw=350.0)
+    patched = await storage.async_update_charge_by_id(cid, total_cost=20.0)
+    assert patched.charger_power_kw == pytest.approx(350.0)
+    assert patched.total_cost == pytest.approx(20.0)
+    assert patched.price_locked is True
+    # And the other direction.
+    again = await storage.async_update_charge_by_id(cid, charger_power_kw=150.0)
+    assert again.total_cost == pytest.approx(20.0)
+    assert again.charger_power_kw == pytest.approx(150.0)

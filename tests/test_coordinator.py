@@ -4317,3 +4317,51 @@ async def test_charge_attrs_survive_a_charge_with_no_start_time(
     assert attr["peak_charge_power_kw"] is None
     assert attr["km_before"] is None
     assert attr["kwh"] == pytest.approx(20.0)
+
+
+async def test_set_charger_power_service_is_wired(hass: HomeAssistant) -> None:
+    """v0.8.33 — the rating reaches storage through the public service.
+
+    Passing it alone, with no pricing field, has to be accepted: that is
+    the whole use case — the charge auto-logged days ago and you are
+    filling in what the unit said.
+    """
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass)
+    coord = hass.data[DOMAIN][entry.entry_id]
+    cid = await coord.storage.async_insert_charge(ChargeRecord(
+        ended_at=dt_util.now(), kwh=42.23, price_per_kwh=0.30,
+        total_cost=12.67, peak_charge_power_kw=41.0, is_dcfc=True,
+    ))
+
+    await hass.services.async_call(
+        DOMAIN, "set_last_charge_price",
+        {"charge_id": cid, "charger_power_kw": 150},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    got = await coord.storage.async_get_charge_by_id(cid)
+    assert got.charger_power_kw == pytest.approx(150.0)
+    assert got.total_cost == pytest.approx(12.67), "no pricing field was passed"
+
+
+async def test_charge_attrs_expose_the_charger_rating(hass: HomeAssistant) -> None:
+    """It has to reach the dashboard, or the verdict cannot be rendered."""
+    from custom_components.ev_trip_logger.sensor import _charge_to_attr
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    attr = _charge_to_attr(ChargeRecord(
+        ended_at=dt_util.now(), kwh=40.0, price_per_kwh=0.3, total_cost=12.0,
+        peak_charge_power_kw=41.0, charger_power_kw=150.0,
+    ))
+    assert attr["charger_power_kw"] == pytest.approx(150.0)
+    assert attr["peak_charge_power_kw"] == pytest.approx(41.0)
+
+    # Absent stays absent rather than becoming zero: "not recorded" and
+    # "a 0 kW charger" must not render the same.
+    bare = _charge_to_attr(ChargeRecord(
+        ended_at=dt_util.now(), kwh=40.0, price_per_kwh=0.3, total_cost=12.0,
+    ))
+    assert bare["charger_power_kw"] is None
