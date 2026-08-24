@@ -26,6 +26,7 @@ from homeassistant.helpers.selector import (
     TextSelectorConfig,
 )
 
+from .cohort import cohort_baseline_options
 from .const import (
     CONF_BATTERY,
     CONF_BATTERY_CAPACITY,
@@ -116,11 +117,13 @@ def _required_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
 
 
 def _cohort_options() -> list[tuple[str, str]]:
-    """Lazy import so the config_flow module load doesn't pull in
-    coordinator + its dependencies for trivial cases (HA imports
-    config_flow eagerly during entry restore)."""
-    from .coordinator import cohort_baseline_options  # noqa: PLC0415
+    """v0.8.31 — a plain call now.
 
+    The lazy import this replaced was there to keep `coordinator` out of
+    memory during entry restore. It never did: `__init__.py` imports
+    `coordinator` at module level, so it was always loaded first. The
+    baselines now live in a leaf module, so the import is a plain one.
+    """
     return cohort_baseline_options()
 
 

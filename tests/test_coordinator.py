@@ -1078,8 +1078,8 @@ async def test_secondary_home_coords_parsed_correctly() -> None:
     per line; radius defaults, label defaults to a stable auto-generated
     name; blank lines / comments / malformed lines are skipped.
     """
-    from custom_components.ev_trip_logger.coordinator import (
-        _parse_secondary_home_coords,
+    from custom_components.ev_trip_logger.calc import (
+        parse_secondary_home_coords,
     )
     from custom_components.ev_trip_logger.const import (
         DEFAULT_SECONDARY_HOME_RADIUS_M,
@@ -1092,20 +1092,20 @@ async def test_secondary_home_coords_parsed_correctly() -> None:
     40.0,-3.0,250,Casa de la playa
     not,a,coord
     """
-    parsed = _parse_secondary_home_coords(raw)
+    parsed = parse_secondary_home_coords(raw)
     assert len(parsed) == 2
     assert parsed[0] == (36.5, -4.5, DEFAULT_SECONDARY_HOME_RADIUS_M, "secondary_home_1")
     assert parsed[1] == (40.0, -3.0, 250.0, "Casa de la playa")
 
 
 async def test_secondary_home_coords_parsed_empty_for_blank_input() -> None:
-    from custom_components.ev_trip_logger.coordinator import (
-        _parse_secondary_home_coords,
+    from custom_components.ev_trip_logger.calc import (
+        parse_secondary_home_coords,
     )
 
-    assert _parse_secondary_home_coords(None) == []
-    assert _parse_secondary_home_coords("") == []
-    assert _parse_secondary_home_coords("   \n  # just a comment\n") == []
+    assert parse_secondary_home_coords(None) == []
+    assert parse_secondary_home_coords("") == []
+    assert parse_secondary_home_coords("   \n  # just a comment\n") == []
 
 
 async def test_secondary_home_coord_label_matches_within_radius(
@@ -2854,10 +2854,10 @@ async def test_auto_detect_temp_sensor_skips_own_entities(hass: HomeAssistant) -
 
 
 def test_speed_stats_v95_and_highway_ratio() -> None:
-    """v0.7.3 — `_speed_stats` returns nearest-rank V95 + fraction
+    """v0.7.3 — `speed_stats` returns nearest-rank V95 + fraction
     of samples ≥ threshold. Empty/all-None → (None, None).
     """
-    from custom_components.ev_trip_logger.coordinator import _speed_stats
+    from custom_components.ev_trip_logger.calc import speed_stats
 
     # Trip 206-style samples: 30-tick deque (30 s cadence over ~15 min)
     # with mostly 40-60 km/h and a couple of highway bursts.
@@ -2869,15 +2869,15 @@ def test_speed_stats_v95_and_highway_ratio() -> None:
         + [95.0, 100.0, 105.0, 117.0, 110.0, 90.0]  # highway
         + [55.0, 45.0, 30.0]       # slowing to town
     )
-    v95, highway = _speed_stats(samples, highway_threshold_kmh=80.0)
+    v95, highway = speed_stats(samples, highway_threshold_kmh=80.0)
     assert v95 is not None and 100.0 <= v95 <= 117.0
     # 6 samples ≥ 80 out of 18 → 33.3 %
     assert highway == pytest.approx(33.3, abs=0.1)
 
     # Empty deque → both None.
-    assert _speed_stats([], highway_threshold_kmh=80.0) == (None, None)
+    assert speed_stats([], highway_threshold_kmh=80.0) == (None, None)
     # All zeros (car idle whole trip) → V95=0, highway=0.
-    v95, highway = _speed_stats([0.0] * 5, highway_threshold_kmh=80.0)
+    v95, highway = speed_stats([0.0] * 5, highway_threshold_kmh=80.0)
     assert v95 == 0.0
     assert highway == 0.0
 
@@ -3105,7 +3105,7 @@ def test_cohort_baseline_options_returns_seeded_models() -> None:
     Used as a smoke test: a typo in the JSON or a missing seed key
     fails loud here before the config-flow renders a broken form.
     """
-    from custom_components.ev_trip_logger.coordinator import (
+    from custom_components.ev_trip_logger.cohort import (
         cohort_baseline_options,
     )
 

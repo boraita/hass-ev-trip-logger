@@ -2,6 +2,16 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.31 — 2026-08-24
+**Refactor — the first cut into `coordinator.py`, and a lazy import that was never lazy.** `coordinator.py` had grown to 7 808 lines around a single class of some 120 methods. Two modules come out of it, both leaves — nothing imports back into the coordinator:
+
+* `calc.py` — the pure helpers: `haversine_km`, `route_distance_km`, `parse_secondary_home_coords`, `pick_driver_for_window`, `speed_stats`, `is_zoneless`. Every one is a function of its arguments alone, with no Home Assistant object and no coordinator state, which is why they were the only stretch of that file readable without holding the state machine in your head. They are now testable without one too: the existing tests import them from `calc` directly.
+* `cohort.py` — the seeded per-model battery baselines and the dropdown options the config flow builds from them.
+
+That second move turned up something. `config_flow` fetched `cohort_baseline_options` through a lazy in-function import, commented as keeping `coordinator` and its dependencies out of memory during entry restore. **It never did.** `__init__.py` imports `coordinator` at module level, so by the time any config flow ran the coordinator was already loaded — the deferral was buying nothing and the comment asserted otherwise. It is a plain top-level import now, and this time the reason holds: `cohort` is one JSON read and two functions.
+
+`coordinator.py` is down to 7 632 lines. **That is a 176-line dent in a 7 800-line file and it is worth saying so plainly.** The rest of that file is a single class whose methods share state through `self`, so moving any of it means mixins, and every mixin would need the module's 74 private tuning constants — which live in `coordinator.py` and would import back into it. Breaking that cycle means relocating all 74 first. That is its own change with its own risk, and doing half of it inside a release that also ships behaviour would be the wrong way round. This release takes the part that could be lifted out cleanly and verified.
+
 ## v0.8.30 — 2026-08-24
 **Feat — capacity calibration gains a tier above the existing one, and now says which tier it used.** The measurement that anchors everything the integration reports is `kwh / ΔSoC × 100` over real charges. v0.8.14 already ranked power-integration charges above SoC-derived ones, because feeding the SoC guess into the calibration that exists to correct the SoC guess is circular. What was still missing: a measured `kwh` can be measured *badly*.
 
