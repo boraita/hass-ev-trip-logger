@@ -1605,18 +1605,26 @@ class TripStorage:
                     "picking newest. Storage may need a manual repair.",
                     sorted(int(r[0]) for r in rows),
                 )
+            # v0.8.25 — `IN (…)` over every home slug, matching the guard
+            # query above. v0.8.10 turned the single `slug` into `slugs`
+            # for secondary homes and updated the first query only; this
+            # one kept `= ?` bound to a name that no longer existed and
+            # raised NameError on every call that got this far — which is
+            # every call that found an open journey, i.e. exactly the ones
+            # whose answer mattered. Trips then closed with journey_id
+            # NULL and no journey was ever resolved.
             row = conn.execute(
-                """
+                f"""
                 SELECT journey_id FROM trips
                 WHERE journey_id IS NOT NULL
                   AND id > COALESCE(
                       (SELECT MAX(id) FROM trips
-                       WHERE LOWER(destination) = ?),
+                       WHERE LOWER(destination) IN ({placeholders})),
                       0)
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (slug,),
+                slugs,
             ).fetchone()
         return int(row[0]) if row else None
 

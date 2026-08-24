@@ -1591,3 +1591,66 @@ async def test_heal_keeps_a_consistent_energy_source_untouched(
     healed = {t.trip_id: t for t in await storage.async_recent_trips(10)}[trip_id]
     assert healed.kwh_charged_during == pytest.approx(20.0)
     assert healed.energy_source == "soc_plus_charge"
+
+
+async def test_resolve_open_journey_id_does_not_crash(storage: TripStorage) -> None:
+    """v0.8.25 — `_resolve_open_journey_id` raised NameError on every call
+    that found an open journey.
+
+    v0.8.10 taught the function about secondary homes by turning the single
+    `slug` into a list of `slugs` and the first query's `= ?` into
+    `IN (...)`. The SECOND query — the one that actually returns the id —
+    kept `LOWER(destination) = ?` bound to `(slug,)`, a name that no longer
+    existed. The first query is a guard that returns early when there is no
+    candidate, so the bug only fired when there WAS an open journey, i.e.
+    exactly when the answer mattered.
+
+    Observed on the real install: every trip closed on 2026-08-23 came out
+    with `journey_id = None`, and the traceback was in the HA log the whole
+    time — `NameError: name 'slug' is not defined. Did you mean: 'slugs'?`
+    """
+    base = dt_util.now() - timedelta(hours=6)
+    # Arrived home, closing whatever came before.
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=20),
+        duration_min=20.0, distance_km=10.0, destination="home",
+        journey_id=7, energy_kwh=2.0,
+    ))
+    # Left again: this journey is open.
+    await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=1),
+        ended_at=base + timedelta(hours=1, minutes=30),
+        duration_min=30.0, distance_km=25.0,
+        origin="home", destination="not_home",
+        journey_id=8, energy_kwh=5.0,
+    ))
+
+    assert await storage.async_resolve_open_journey_id("home") == 8
+
+    # And with a secondary home configured, the same call still works.
+    assert await storage.async_resolve_open_journey_id(
+        "home", ["casa_domi", "casa domi"],
+    ) == 8
+
+
+async def test_resolve_open_journey_id_sees_a_secondary_home_arrival(
+    storage: TripStorage,
+) -> None:
+    """A journey closed by arriving at a SECONDARY home must not be
+    reported as still open — the whole point of passing the extra slugs.
+    """
+    base = dt_util.now() - timedelta(hours=6)
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=20),
+        duration_min=20.0, distance_km=10.0,
+        destination="not_home", journey_id=9, energy_kwh=2.0,
+    ))
+    await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=1),
+        ended_at=base + timedelta(hours=1, minutes=30),
+        duration_min=30.0, distance_km=25.0,
+        destination="Casa Domi", journey_id=9, energy_kwh=5.0,
+    ))
+    assert await storage.async_resolve_open_journey_id(
+        "home", ["casa_domi", "casa domi"],
+    ) is None, "arriving at a secondary home closes the journey"

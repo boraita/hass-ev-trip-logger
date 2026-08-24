@@ -2,6 +2,19 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.25 — 2026-08-24
+**Fix — journeys stopped being resolved at all: `NameError` on every call that found one.** v0.8.10 taught `_resolve_open_journey_id` about secondary homes by turning its single `slug` into a list of `slugs` and its first query's `LOWER(destination) = ?` into `IN (…)`. The **second** query — the one that actually returns the id — kept `= ?` bound to `(slug,)`, a name that no longer existed.
+
+The first query is a guard that returns early when there is no candidate, so the crash only fired when there *was* an open journey: exactly the calls whose answer mattered. `async_resolve_open_journey_id` runs at startup and at every trip close, so from v0.8.10 onward a journey could still be minted on arrival at a home, but an open one could never be resumed.
+
+Found by reading the live HA log while investigating why a 499 km round trip produced six trips with `journey_id = NULL`. The traceback had been sitting there the whole time:
+
+    File "storage.py", line 1619, in _resolve_open_journey_id
+        (slug,),
+    NameError: name 'slug' is not defined. Did you mean: 'slugs'?
+
+Two tests now cover it: one that an open journey is returned rather than raising, and one that an arrival at a *secondary* home closes it — the case the `slugs` list exists for and the one a single-slug query silently got wrong even before the rename broke it outright.
+
 ## v0.8.24 — 2026-08-24
 **Fix — v0.8.23's unit fix was dead code.** Extending `_retry_needed()` to keep retrying while the unit is unknown was correct and did nothing, because `_schedule_startup_retry()` is called from exactly one place: the branch that runs when the recorder query *fails*. On the success path — the one the restart race actually takes, where the query works, a mean is computed, and only the source entity is missing — the retry was never scheduled at all, so the sensor still sat on `unit_of_measurement: None` until the next 1800 s tick.
 
