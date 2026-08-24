@@ -2060,3 +2060,39 @@ async def test_charger_rated_power_survives_a_price_correction(
     again = await storage.async_update_charge_by_id(cid, charger_power_kw=150.0)
     assert again.total_cost == pytest.approx(20.0)
     assert again.charger_power_kw == pytest.approx(150.0)
+
+
+async def test_charge_gps_backfill_lists_and_writes_once(
+    storage: TripStorage,
+) -> None:
+    """v0.8.34 — position is the only key that identifies a charger.
+
+    `location` reads 'not_home' at every public charger, so without
+    coordinates there is nothing to match one session against another.
+    The write is guarded so a backfill can never clobber a position
+    already recorded at close, which is the better of the two.
+    """
+    now = dt_util.now()
+    older = await storage.async_insert_charge(_charge(ended_at=now - timedelta(hours=2)))
+    live = await storage.async_insert_charge(_charge(
+        ended_at=now, charge_lat=38.42443, charge_lon=-6.41494,
+    ))
+
+    pending = await storage.async_charges_missing_gps()
+    assert [p["id"] for p in pending] == [older], (
+        "the charge that already knows where it was is not pending"
+    )
+
+    await storage.async_set_charge_gps(older, 41.52119, -5.75497)
+    got = await storage.async_get_charge_by_id(older)
+    assert got.charge_lat == pytest.approx(41.52119)
+    assert got.charge_lon == pytest.approx(-5.75497)
+    assert await storage.async_charges_missing_gps() == []
+
+    # A second pass must not move it.
+    await storage.async_set_charge_gps(older, 0.0, 0.0)
+    again = await storage.async_get_charge_by_id(older)
+    assert again.charge_lat == pytest.approx(41.52119), "already-set position is final"
+
+    kept = await storage.async_get_charge_by_id(live)
+    assert kept.charge_lat == pytest.approx(38.42443)

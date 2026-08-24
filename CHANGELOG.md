@@ -2,6 +2,17 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.34 — 2026-08-24
+**Feat — charges now record where they happened, so a charger can be recognised across sessions.** New `charge_lat` / `charge_lon`, captured from the device_tracker at close and exposed on `recent_charges`.
+
+This exists to make v0.8.33's `charger_power_kw` worth entering once instead of every time. `location` reads `not_home` at every public charger — 26 of the author's 60 charges carry that same useless string — so coordinates are the only thing that can say "this is the charger you already rated".
+
+The position is read live at close rather than through the recorder: by then the car has been parked at the charger for the whole session, so the fix has settled. Measured across 17 real charges, every one resolved and each sat **within 2 m** of its own neighbouring samples.
+
+A startup backfill fills in charges logged before this release, bounded to 50 per launch and using the tracker's history at each `ended_at`. It only reaches as far as the recorder keeps that entity — about ten days on this install, which covers 17 of 60 charges. The rest have no second source and are left alone rather than retried forever. The write is guarded (`WHERE charge_lat IS NULL`) so a backfill can never overwrite a position captured live, which is the better of the two.
+
+**What the dry-run turned up, and why the radius matters.** Grouping those 17 positions at 150 m merged two charges 56 m apart into one site — and they carried different ratings, 60 kW and 180 kW. That is an ordinary motorway service area with a slow unit and a fast one side by side, and inheriting a rating across them would hand you the wrong number. Consumers should group at roughly **40 m**, which separates that pair while keeping seven sessions at the same home spot together (they span 9 m), and should decline to suggest anything when the charges at a site disagree.
+
 ## v0.8.33 — 2026-08-24
 **Feat — you can now record the charger's rated power, which is what makes the observed peak mean anything.** New `charger_power_kw` on charges, settable through `set_last_charge_price` (with `charge_id`, so days later) and exposed on `recent_charges`.
 

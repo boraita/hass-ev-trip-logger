@@ -1195,6 +1195,11 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         # peak_charge_power_kw: their ratio says whether the charger or the
         # pack was the limit, which the peak alone cannot.
         "charger_power_kw": _r(getattr(charge, "charger_power_kw", None), 1),
+        # v0.8.34 — position at close. `location` reads 'not_home' at every
+        # public charger, so coordinates are the only thing that can say
+        # "this is the charger you rated last time".
+        "charge_lat": _r(getattr(charge, "charge_lat", None), 5),
+        "charge_lon": _r(getattr(charge, "charge_lon", None), 5),
         # Km driven since the previous charge — the pack-warmth proxy.
         # Only populated on the `recent_charges` path (see
         # ChargeRecord.km_before); None elsewhere, not zero, so a
