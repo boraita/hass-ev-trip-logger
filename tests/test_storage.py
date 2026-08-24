@@ -1654,3 +1654,117 @@ async def test_resolve_open_journey_id_sees_a_secondary_home_arrival(
     assert await storage.async_resolve_open_journey_id(
         "home", ["casa_domi", "casa domi"],
     ) is None, "arriving at a secondary home closes the journey"
+
+
+async def test_impossible_efficiency_is_excluded_from_the_rolling_median(
+    storage: TripStorage,
+) -> None:
+    """v0.8.29 — a row above 100 % must not enter the efficiency median.
+
+    Energy reaching the battery cannot exceed what the meter delivered,
+    so `charging_efficiency_pct > 100` means one of the two figures is
+    wrong — in practice `kwh` came from the SoC estimate, not a
+    measurement. Two such rows sat in the user's real database at
+    106.0 % and 156.8 %. The old query filtered only `> 0`, so they
+    both averaged in AND consumed a window slot each.
+    """
+    now = dt_util.now()
+    good = (88.0, 90.0, 92.0)
+    for i, eff in enumerate(good):
+        await storage.async_insert_charge(_charge(
+            ended_at=now - timedelta(hours=10 + i),
+            kwh=10.0, evse_energy_kwh=10.0 / eff * 100.0,
+            charging_efficiency_pct=eff,
+        ))
+    median, n = await storage.async_avg_charging_efficiency_pct()
+    assert (median, n) == (90.0, 3)
+
+    # The impossible rows are the most recent, so an unfiltered query
+    # would put them at the front of the window.
+    for i, eff in enumerate((106.0, 156.8)):
+        await storage.async_insert_charge(_charge(
+            ended_at=now - timedelta(minutes=i),
+            kwh=10.0, evse_energy_kwh=10.0 / eff * 100.0,
+            charging_efficiency_pct=eff,
+        ))
+    median_after, n_after = await storage.async_avg_charging_efficiency_pct()
+    assert (median_after, n_after) == (90.0, 3), (
+        "impossible rows must change neither the median nor the count"
+    )
+
+
+async def test_implausibly_low_efficiency_is_excluded_too(
+    storage: TripStorage,
+) -> None:
+    """Losing over half the delivered energy is not a charge session.
+
+    The band is symmetric on purpose: 30 % is as much a broken
+    measurement as 156 % is, and averaging it in would report the
+    wallbox as failing when the real fault is a bad `kwh`.
+    """
+    now = dt_util.now()
+    for i, eff in enumerate((88.0, 90.0, 92.0)):
+        await storage.async_insert_charge(_charge(
+            ended_at=now - timedelta(hours=10 + i),
+            kwh=10.0, evse_energy_kwh=10.0 / eff * 100.0,
+            charging_efficiency_pct=eff,
+        ))
+    await storage.async_insert_charge(_charge(
+        ended_at=now, kwh=3.0, evse_energy_kwh=10.0,
+        charging_efficiency_pct=30.0,
+    ))
+    assert await storage.async_avg_charging_efficiency_pct() == (90.0, 3)
+
+
+async def test_efficiency_just_over_100_is_kept_as_measurement_slop(
+    storage: TripStorage,
+) -> None:
+    """101 % is meter resolution plus ±1 % SoC quantization, not a fault.
+
+    The band tops out at 105 % rather than 100 so a genuinely-99 %
+    session that rounds over the line still counts. Excluding it would
+    bias the median downward on exactly the best-measured charges.
+    """
+    now = dt_util.now()
+    for i, eff in enumerate((99.0, 101.0, 103.0)):
+        await storage.async_insert_charge(_charge(
+            ended_at=now - timedelta(hours=i),
+            kwh=10.0, evse_energy_kwh=10.0 / eff * 100.0,
+            charging_efficiency_pct=eff,
+        ))
+    assert await storage.async_avg_charging_efficiency_pct() == (101.0, 3)
+
+
+async def test_paired_evse_aggregate_drops_impossible_rows(
+    storage: TripStorage,
+) -> None:
+    """v0.8.29 — the paired kwh/evse sums honour the same band.
+
+    v0.5.101 introduced the paired sums so the period efficiency was a
+    properly weighted ratio, and its docstring promised "always 0-100 %".
+    That held only while every row's kwh really came from a measurement.
+    A row whose kwh came from the SoC estimate can exceed its own meter
+    reading — the user's real database held 1.65 kWh against a metered
+    1.05 — and it landed in the numerator, so the promise did not hold.
+    """
+    now = dt_util.now()
+    # Two honest rows: 18/20 and 9/10, i.e. 27/30 = 90 %.
+    await storage.async_insert_charge(_charge(
+        ended_at=now, kwh=18.0, evse_energy_kwh=20.0,
+    ))
+    await storage.async_insert_charge(_charge(
+        ended_at=now, kwh=9.0, evse_energy_kwh=10.0,
+    ))
+    agg = await storage.async_charges_aggregates_since(now - timedelta(days=30))
+    assert agg["evse_count"] == 2
+    assert agg["charging_efficiency_pct"] == pytest.approx(90.0, abs=0.1)
+
+    # An impossible row must not join either sum.
+    await storage.async_insert_charge(_charge(
+        ended_at=now, kwh=1.65, evse_energy_kwh=1.05,
+    ))
+    agg = await storage.async_charges_aggregates_since(now - timedelta(days=30))
+    assert agg["evse_count"] == 2, "impossible row must not be counted"
+    assert agg["charging_efficiency_pct"] == pytest.approx(90.0, abs=0.1)
+    # It still counts as delivered energy — only the efficiency pair drops it.
+    assert agg["kwh"] == pytest.approx(28.65)
