@@ -3528,6 +3528,11 @@ class BatterySohSensor(_BaseTripSensor):
                 round(calibrated, 2) if calibrated is not None else None
             ),
             "calibration_charges": coord._battery_capacity_calibration_n,
+            # v0.8.30 — which pool the number came from. "metered" and
+            # "grounded" are measurements; "soc" is the tautology pool
+            # (kwh/ΔSoC returns the capacity that produced kwh), kept
+            # only so a young install shows something plausible.
+            "calibration_source": coord._battery_capacity_calibration_source,
             # v0.6.5 — per-gate reject counts from the last
             # calibration sweep (Tessie ΔkWh > 5 + temperature
             # window). Lets the dashboard render "9 considered, 4

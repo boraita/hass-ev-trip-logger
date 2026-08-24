@@ -764,7 +764,7 @@ async def test_effective_capacity_below_threshold(storage: TripStorage) -> None:
             kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
             soc_start=soc_s, soc_end=soc_e,
         ))
-    cap, n, _rejects = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects, _src = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert cap is None
@@ -792,7 +792,7 @@ async def test_effective_capacity_median_of_eligible_charges(
             kwh=kwh, price_per_kwh=0.2, total_cost=kwh * 0.2,
             soc_start=s0, soc_end=s1,
         ))
-    cap, n, _rejects = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects, _src = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert n == 5
@@ -835,7 +835,7 @@ async def test_effective_capacity_gates_min_kwh_and_temperature(
             temperature_c=t,
         ))
     # Use min_charges=1 so the small N doesn't suppress the result.
-    cap, n, rejects = await storage.async_effective_capacity_kwh(
+    cap, n, rejects, _src = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=1,
     )
     # Two samples survive: the 22 °C row and the temp=NULL row.
@@ -866,7 +866,7 @@ async def test_effective_capacity_filters_small_top_ups(
             kwh=40.0, price_per_kwh=0.2, total_cost=8.0,
             soc_start=20.0, soc_end=80.0,  # 60 % Δ → 66.67 kWh
         ))
-    cap, n, _rejects = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects, _src = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5
     )
     assert n == 5
@@ -901,7 +901,7 @@ async def test_effective_capacity_prefers_power_integration_samples(
             soc_start=20.0, soc_end=70.0,  # 50 % Δ → 90 kWh
             energy_source="soc_delta",
         ))
-    cap, n, _rejects = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects, _src = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5,
     )
     assert n == 5
@@ -933,7 +933,7 @@ async def test_effective_capacity_falls_back_when_not_enough_grounded_samples(
             soc_start=20.0, soc_end=70.0,  # 50 % Δ → 70 kWh
             energy_source=None,
         ))
-    cap, n, _rejects = await storage.async_effective_capacity_kwh(
+    cap, n, _rejects, _src = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5,
     )
     assert n == 5
@@ -1768,3 +1768,121 @@ async def test_paired_evse_aggregate_drops_impossible_rows(
     assert agg["charging_efficiency_pct"] == pytest.approx(90.0, abs=0.1)
     # It still counts as delivered energy — only the efficiency pair drops it.
     assert agg["kwh"] == pytest.approx(28.65)
+
+
+async def _cap_charge(**over) -> ChargeRecord:
+    """A charge big enough to clear every capacity gate but the new one."""
+    base = {
+        "started_at": dt_util.now() - timedelta(hours=1),
+        "ended_at": dt_util.now(),
+        "price_per_kwh": 0.2,
+        "temperature_c": 20.0,
+    }
+    base.update(over)
+    base.setdefault("total_cost", base["kwh"] * 0.2)
+    return ChargeRecord(**base)
+
+
+async def test_metered_tier_wins_and_excludes_under_integrated_charges(
+    storage: TripStorage,
+) -> None:
+    """v0.8.30 — a measured `kwh` that its own meter contradicts is out.
+
+    `kwh` is the shared numerator of the efficiency and of the capacity
+    sample, so an under-integrated power measurement drags both down
+    together. On the author's real history, sessions at 76-83 %
+    efficiency implied a 76-78 kWh pack and sessions at 91-97 % implied
+    87-90 kWh — the same physical battery. Five well-metered 82 kWh
+    charges plus three under-integrated 70 kWh ones must calibrate to
+    82, not to the median of all eight.
+    """
+    for _ in range(5):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=41.0, soc_start=10.0, soc_end=60.0,   # 82.0 kWh implied
+            evse_energy_kwh=43.6, energy_source="power_integration",
+        ))                                            # 94.0 % efficiency
+    for _ in range(3):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=35.0, soc_start=10.0, soc_end=60.0,   # 70.0 kWh implied
+            evse_energy_kwh=43.6, energy_source="power_integration",
+        ))                                            # 80.3 % efficiency
+    cap, n, _rejects, src = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5,
+    )
+    assert src == "metered"
+    assert n == 5, "the three under-integrated charges must not be samples"
+    assert cap == pytest.approx(82.0, abs=0.05)
+
+
+async def test_metered_tier_falls_through_when_too_few_qualify(
+    storage: TripStorage,
+) -> None:
+    """Below `min_charges` the metered tier yields to the old behaviour.
+
+    This is what makes the new tier safe to add: it can only ever
+    improve on the previous release, never take a calibration away. An
+    install with three well-metered charges keeps calibrating from all
+    of its power-integration charges, exactly as v0.8.14 did.
+    """
+    for _ in range(3):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=41.0, soc_start=10.0, soc_end=60.0,
+            evse_energy_kwh=43.6, energy_source="power_integration",
+        ))
+    for _ in range(3):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=35.0, soc_start=10.0, soc_end=60.0,
+            evse_energy_kwh=43.6, energy_source="power_integration",
+        ))
+    cap, n, _rejects, src = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5,
+    )
+    assert src == "grounded"
+    assert n == 6
+    assert cap == pytest.approx(76.0, abs=0.05)  # median of 82 and 70
+
+
+async def test_charges_without_a_meter_are_not_counted_as_rejects(
+    storage: TripStorage,
+) -> None:
+    """No meter wired means never a candidate for the metered tier.
+
+    Counting those as rejects would make the reject totals unreadable —
+    every install without an EVSE sensor would show its whole history
+    as rejected. They fall through to `grounded` instead.
+    """
+    for _ in range(6):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=41.0, soc_start=10.0, soc_end=60.0,
+            energy_source="power_integration",     # no evse_energy_kwh
+        ))
+    cap, n, rejects, src = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5,
+    )
+    assert src == "grounded"
+    assert n == 6
+    assert cap == pytest.approx(82.0, abs=0.05)
+    assert sum(rejects.values()) == 0
+
+
+async def test_soc_pool_is_labelled_as_the_tautology_it_is(
+    storage: TripStorage,
+) -> None:
+    """The last-resort pool must be identifiable from the outside.
+
+    For a row whose `kwh` was itself computed as ΔSoC × capacity, the
+    sample `kwh / ΔSoC × 100` returns the capacity it started from. The
+    number is not wrong, it is simply not evidence, and until v0.8.30
+    nothing distinguished it from a measured one.
+    """
+    for _ in range(5):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=41.25, soc_start=10.0, soc_end=60.0,   # 82.5 × 50 %
+            energy_source=None,
+        ))
+    cap, n, _rejects, src = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5,
+    )
+    assert src == "soc"
+    assert n == 5
+    assert cap == pytest.approx(82.5, abs=0.05)

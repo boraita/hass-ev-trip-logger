@@ -1071,6 +1071,9 @@ class EvTripLoggerCoordinator:
         # Surfaced in the BatterySohSensor attributes so a user can see
         # "9 charges considered, 4 used, 3 too-small, 2 cold".
         self._battery_capacity_calibration_rejects: dict[str, int] = {}
+        # Which capacity pool last produced a value — see
+        # storage.CapacityCalibration for what each name means.
+        self._battery_capacity_calibration_source: str = "none"
         # v0.6.4 — kWh-weighted avg €/kWh over the trailing 30d.
         # Cached so `_trip_to_attr` (a sync-context attribute builder)
         # can compute `cost_at_avg_tariff` without an async storage
@@ -1999,15 +2002,21 @@ class EvTripLoggerCoordinator:
         suggest an impossibly small or large pack.
         """
         try:
-            median, n, rejects = await self.storage.async_effective_capacity_kwh(
-                min_delta_pct=_CAPACITY_MIN_DELTA_PCT,
-                min_charges=_CAPACITY_MIN_CHARGES,
-                window=_CAPACITY_CHARGE_WINDOW,
+            median, n, rejects, source = (
+                await self.storage.async_effective_capacity_kwh(
+                    min_delta_pct=_CAPACITY_MIN_DELTA_PCT,
+                    min_charges=_CAPACITY_MIN_CHARGES,
+                    window=_CAPACITY_CHARGE_WINDOW,
+                )
             )
         except Exception as exc:  # pragma: no cover — defensive
             _LOGGER.debug("effective capacity query failed: %s", exc)
             return
         self._battery_capacity_calibration_n = n
+        # v0.8.30 — which pool produced the number. Without this the
+        # calibrated figure looks equally authoritative whether it came
+        # from meter-corroborated measurements or from the SoC tautology.
+        self._battery_capacity_calibration_source = source
         # v0.6.5 — cache the per-gate reject counts so the SoH sensor
         # can surface them as attributes (transparency: explains why a
         # given charge didn't contribute to the calibration).
@@ -2030,8 +2039,8 @@ class EvTripLoggerCoordinator:
             shown = new_value if new_value is not None else self._battery_capacity_declared
             _LOGGER.info(
                 "Effective battery capacity: %.2f kWh "
-                "(n=%d charges, declared=%.2f)",
-                shown, n, self._battery_capacity_declared,
+                "(n=%d charges, source=%s, declared=%.2f)",
+                shown, n, source, self._battery_capacity_declared,
             )
             # v0.5.51 — backfill historical trips so the new capacity
             # applies to old rows too, otherwise the dashboard would

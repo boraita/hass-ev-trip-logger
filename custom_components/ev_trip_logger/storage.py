@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -97,6 +97,44 @@ _CHARGE_TRIP_BOUNDARY_TOLERANCE_S: int = 60
 # a known-bad measurement cannot move a number the user reads as truth.
 _EFFICIENCY_MIN_PCT: float = 50.0
 _EFFICIENCY_MAX_PCT: float = 105.0
+
+# v0.8.30 — a charge only qualifies for the top capacity tier when its
+# measured efficiency says its `kwh` can be trusted. `kwh` is the shared
+# numerator of both efficiency and the capacity sample, so when the power
+# integration misses samples BOTH drop together — measured on the author's
+# 60-charge history, sessions at 76-83 % efficiency implied 76-78 kWh of
+# pack while sessions at 91-97 % implied 87-90 kWh. The same physical pack.
+# A real DC session runs 92-97 % and a real AC one 88-93 %, so below this
+# threshold the shortfall is in the measurement, not in the battery.
+_CAPACITY_MIN_EFFICIENCY_PCT: float = 88.0
+
+
+class CapacityCalibration(NamedTuple):
+    """Result of `async_effective_capacity_kwh`.
+
+    `source` names which pool produced `median`, which is the only way to
+    tell a grounded number from a tautological one from the outside:
+
+      * `metered`  — power-integration charges whose measured efficiency
+                     clears `_CAPACITY_MIN_EFFICIENCY_PCT`, so `kwh` is a
+                     measurement corroborated by an independent meter.
+      * `grounded` — power-integration charges, efficiency unknown or
+                     below the threshold. `kwh` is measured but
+                     uncorroborated.
+      * `soc`      — every eligible charge. For rows whose `kwh` was
+                     itself derived as `ΔSoC × capacity`, the sample
+                     `kwh / ΔSoC × 100` returns the capacity it started
+                     from: a tautology, not evidence. Kept only so an
+                     install with too few grounded charges keeps a
+                     plausible number instead of none.
+      * `none`     — not enough samples in any pool; keep the declared
+                     capacity.
+    """
+
+    median: float | None
+    n: int
+    rejects: dict[str, int]
+    source: str
 
 #: SQL predicate for "this charge has a usable EVSE meter reading" —
 #: shared by every paired kwh/evse sum so the ratio between them cannot
@@ -1752,11 +1790,11 @@ class TripStorage:
         min_kwh: float = 5.0,
         temp_min_c: float | None = 5.0,
         temp_max_c: float | None = 35.0,
-    ) -> tuple[float | None, int, dict[str, int]]:
+    ) -> CapacityCalibration:
         """v0.5.51 — derive effective pack capacity from real charges.
 
-        Returns `(median_kwh, n_used, reject_counts)`. Each eligible
-        charge yields a sample `kwh / (soc_end - soc_start) × 100`.
+        Returns `(median_kwh, n_used, reject_counts, source)`. Each
+        eligible charge yields a sample `kwh / (soc_end - soc_start) × 100`.
 
         Gates:
           * `soc_start`, `soc_end`, `kwh` all populated
@@ -1793,27 +1831,41 @@ class TripStorage:
         min_kwh: float,
         temp_min_c: float | None,
         temp_max_c: float | None,
-    ) -> tuple[float | None, int, dict[str, int]]:
-        # v0.8.14 — try grounded-only samples first (charges whose kwh
-        # came from the power-integration measurement, not the SoC-delta
-        # guess this calibration exists to correct — the original query
-        # was circular, since most of its input WAS that same guess).
-        # Only fall back to every eligible charge (pre-v0.8.14 behaviour)
-        # when there aren't yet enough grounded ones, so existing users
-        # don't lose calibration on upgrade while it accrues.
+    ) -> CapacityCalibration:
+        # Three pools, best first, each falling through only when it
+        # cannot muster `min_charges` samples. Falling through never
+        # makes the answer worse than the previous release's: a tier is
+        # only ever *added* above what already existed.
+        #
+        # v0.8.30 — `metered` on top. A power-integration `kwh` is a
+        # measurement, but an under-integrated one (missed polling
+        # samples) is a measurement that reads low, and it drags the
+        # capacity sample down with it because `kwh` is the shared
+        # numerator of both. An independent meter reading is the check:
+        # see _CAPACITY_MIN_EFFICIENCY_PCT.
+        #
+        # v0.8.14 — `grounded` over `soc`, because most of the original
+        # query's input WAS the SoC guess this calibration exists to
+        # correct, making it circular.
+        metered = self._effective_capacity_kwh_query(
+            min_delta_pct, window, min_kwh, temp_min_c, temp_max_c,
+            energy_source="power_integration", require_efficiency=True,
+        )
+        if metered[1] >= min_charges:
+            return CapacityCalibration(*metered, source="metered")
         grounded = self._effective_capacity_kwh_query(
             min_delta_pct, window, min_kwh, temp_min_c, temp_max_c,
             energy_source="power_integration",
         )
         if grounded[1] >= min_charges:
-            return grounded
+            return CapacityCalibration(*grounded, source="grounded")
         median, n, rejects = self._effective_capacity_kwh_query(
             min_delta_pct, window, min_kwh, temp_min_c, temp_max_c,
             energy_source=None,
         )
         if n < min_charges:
-            return (None, n, rejects)
-        return (median, n, rejects)
+            return CapacityCalibration(None, n, rejects, "none")
+        return CapacityCalibration(median, n, rejects, "soc")
 
     def _effective_capacity_kwh_query(
         self,
@@ -1824,8 +1876,18 @@ class TripStorage:
         temp_max_c: float | None,
         *,
         energy_source: str | None,
+        require_efficiency: bool = False,
     ) -> tuple[float | None, int, dict[str, int]]:
         source_clause = " AND energy_source = ? " if energy_source else ""
+        # The efficiency gate lives in SQL rather than the Python loop
+        # because a charge without a meter reading must not count as a
+        # reject — it was never a candidate for this tier at all, and
+        # counting it would make the reject totals unreadable.
+        eff_clause = (
+            "  AND evse_energy_kwh IS NOT NULL AND evse_energy_kwh > 0 "
+            f"  AND kwh / evse_energy_kwh * 100.0 >= {_CAPACITY_MIN_EFFICIENCY_PCT} "
+            f"  AND kwh / evse_energy_kwh * 100.0 <= {_EFFICIENCY_MAX_PCT} "
+        ) if require_efficiency else ""
         params: tuple[Any, ...] = (
             (min_delta_pct, energy_source, window)
             if energy_source else (min_delta_pct, window)
@@ -1836,7 +1898,7 @@ class TripStorage:
                 "WHERE kwh IS NOT NULL AND kwh > 0 "
                 "  AND soc_start IS NOT NULL AND soc_end IS NOT NULL "
                 "  AND (soc_end - soc_start) >= ? "
-                + source_clause +
+                + source_clause + eff_clause +
                 # v0.8.13 — chronological order, not insertion id (a
                 # backfilled/reconstructed charge gets a fresh high id
                 # despite an old ended_at and would otherwise crowd out

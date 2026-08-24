@@ -2,6 +2,17 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.30 — 2026-08-24
+**Feat — capacity calibration gains a tier above the existing one, and now says which tier it used.** The measurement that anchors everything the integration reports is `kwh / ΔSoC × 100` over real charges. v0.8.14 already ranked power-integration charges above SoC-derived ones, because feeding the SoC guess into the calibration that exists to correct the SoC guess is circular. What was still missing: a measured `kwh` can be measured *badly*.
+
+Measured across 60 real charges: sessions whose charging efficiency came out at 76–83 % implied a **76–78 kWh** pack, while sessions at 91–97 % implied **87–90 kWh**. Same physical battery, two months apart. The correlation is not a coincidence — `kwh` is the shared numerator of both figures, so when the power integration misses polling samples the efficiency and the capacity sample fall together. A real DC session runs 92–97 % and a real AC one 88–93 %, so below that the shortfall is in the measurement, not in the pack.
+
+So there is now a `metered` tier on top: power-integration charges whose `kwh` is corroborated by an independent meter reading at ≥ 88 % efficiency. Charges with no meter wired are not candidates and are *not* counted as rejects — otherwise every install without an EVSE sensor would report its entire history as rejected. Crucially the tier only fires when it can muster the full `min_charges`; below that it yields to the previous behaviour, so this can improve a calibration but never take one away.
+
+**And the number now declares its own provenance.** `sensor.<name>_battery_soh` carries a new `calibration_source` attribute with one of four values: `metered` (meter-corroborated measurements), `grounded` (measured, uncorroborated — the v0.8.14 pool), `soc` (every eligible charge, including rows whose `kwh` was itself `ΔSoC × capacity`, for which the sample returns the capacity it started from — a tautology, not evidence), or `none`. The log line says it too. Until now a calibrated capacity looked equally authoritative whichever pool produced it; the tautological case was invisible from the outside, which is exactly the case a user would want to know about.
+
+Effect on the author's install: **none yet, by design.** Three charges qualify for the metered tier (91.4 %, 95.5 %, 96.5 %) against a `min_charges` of 5, so it falls through and the capacity stays at 82.68 kWh with `calibration_source: grounded`. The tier activates as more well-metered deep charges accrue.
+
 ## v0.8.29 — 2026-08-24
 **Fix — a charging efficiency above 100 % is impossible, and two of them were being averaged in as if they were data.** Efficiency is `battery kWh / charger kWh × 100`. Energy reaching the pack can never exceed what the meter delivered, so anything over 100 % means one of the two figures is wrong — in practice `kwh` came from the SoC estimate rather than a measurement. The live database held two: **106.0 %** and **156.8 %** (1.65 kWh claimed against a metered 1.05).
 
