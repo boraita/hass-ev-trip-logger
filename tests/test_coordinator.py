@@ -4262,3 +4262,58 @@ async def test_vehicle_heal_rejects_an_implausible_vehicle_energy(
     t = await coordinator.storage.async_get_trip_by_id(trip_id)
     assert t.energy_kwh == pytest.approx(47.10)
     assert t.energy_source == "vehicle"
+
+
+async def test_charge_attrs_expose_rate_and_context(hass: HomeAssistant) -> None:
+    """v0.8.32 — the charges tab needs the rate and the reasons for it.
+
+    `peak_charge_power_kw` and `temperature_c` had been persisted since
+    v0.6.0 and v0.6.5 but were never serialised, so no dashboard could
+    read them. Duration and average power are derived here instead of
+    stored, being pure functions of the two timestamps and kwh.
+    """
+    from custom_components.ev_trip_logger.sensor import _charge_to_attr
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    started = dt_util.now() - timedelta(minutes=21)
+    rec = ChargeRecord(
+        started_at=started, ended_at=started + timedelta(minutes=21),
+        kwh=13.23, price_per_kwh=0.3696, total_cost=4.89,
+        soc_start=37.0, soc_end=54.0, is_dcfc=True,
+        peak_charge_power_kw=40.37, temperature_c=28.4,
+        evse_energy_kwh=16.3, charging_efficiency_pct=81.2,
+    )
+    rec.km_before = 197.0
+    attr = _charge_to_attr(rec)
+
+    assert attr["duration_min"] == pytest.approx(21.0)
+    # 13.23 kWh over 21 min = 37.8 kW.
+    assert attr["avg_power_kw"] == pytest.approx(37.8, abs=0.1)
+    assert attr["peak_charge_power_kw"] == pytest.approx(40.4)
+    assert attr["temperature_c"] == pytest.approx(28.4)
+    assert attr["km_before"] == pytest.approx(197.0)
+
+
+async def test_charge_attrs_survive_a_charge_with_no_start_time(
+    hass: HomeAssistant,
+) -> None:
+    """`log_charge` can write a row with no `started_at`.
+
+    Duration and average power must come back None rather than raise or
+    report zero — a rate of 0 kW would read as "the charger delivered
+    nothing", which is a different claim from "we do not know how long
+    it took". `km_before` is None for the same reason: it is only
+    populated on the `recent_charges` path.
+    """
+    from custom_components.ev_trip_logger.sensor import _charge_to_attr
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    attr = _charge_to_attr(ChargeRecord(
+        ended_at=dt_util.now(), kwh=20.0,
+        price_per_kwh=0.2, total_cost=4.0,
+    ))
+    assert attr["duration_min"] is None
+    assert attr["avg_power_kw"] is None
+    assert attr["peak_charge_power_kw"] is None
+    assert attr["km_before"] is None
+    assert attr["kwh"] == pytest.approx(20.0)

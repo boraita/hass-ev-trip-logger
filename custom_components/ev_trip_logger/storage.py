@@ -655,6 +655,15 @@ class ChargeRecord:
     # pre-v0.8.14 row). See _SCHEMA header comment for the full story.
     energy_source: str | None = None
     charge_id: int | None = field(default=None, compare=False)
+    # v0.8.32 — km driven between the previous charge and this one, the
+    # proxy for "the pack arrived warm" that explains most of why a DC
+    # session was fast or slow. DERIVED ON READ, never stored: it depends
+    # on the *previous* charge, so a row inserted out of order (a manual
+    # recovery lands with a fresh high id and an old timestamp — charges
+    # 62 and 63 in the author's db) would silently stale the stored value
+    # on its neighbour. `_recent_charges` fills it; everywhere else it is
+    # None.
+    km_before: float | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2104,7 +2113,40 @@ class TripStorage:
                 "SELECT * FROM charges ORDER BY ended_at DESC, id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [_row_to_charge(r) for r in rows]
+            # v0.8.32 — km driven since the previous charge, per charge,
+            # in one query rather than one per row. LAG gives each charge
+            # the previous one's end, and the join sums the trips that
+            # closed inside that gap. Computed over the whole table, not
+            # just this window, so the oldest charge in the window still
+            # sees the charge before it.
+            km = {
+                r["id"]: r["km_before"]
+                for r in conn.execute(
+                    """
+                    WITH bounds AS (
+                        SELECT id, started_at, ended_at,
+                               LAG(ended_at) OVER (
+                                   ORDER BY ended_at, id
+                               ) AS prev_end
+                        FROM charges
+                    )
+                    SELECT b.id AS id,
+                           COALESCE(SUM(t.distance_km), 0) AS km_before
+                    FROM bounds b
+                    LEFT JOIN trips t
+                        ON t.ended_at > b.prev_end
+                       AND t.ended_at <= COALESCE(b.started_at, b.ended_at)
+                    WHERE b.prev_end IS NOT NULL
+                    GROUP BY b.id
+                    """
+                ).fetchall()
+            }
+        out: list[ChargeRecord] = []
+        for r in rows:
+            rec = _row_to_charge(r)
+            rec.km_before = km.get(r["id"])
+            out.append(rec)
+        return out
 
     async def async_aggregates_since(self, since: datetime) -> dict[str, float | int]:
         """Aggregate distance / energy / cost / count from `since`."""

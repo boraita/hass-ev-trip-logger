@@ -2,6 +2,17 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.32 — 2026-08-24
+**Feat — the charges list can now show how fast the energy went in, and why it went in that fast.** `recent_charges` gains five per-charge fields.
+
+Two were already being persisted and had simply never been serialised, so no dashboard could read them: `peak_charge_power_kw` (since v0.6.0) and `temperature_c` (since v0.6.5). Two more are derived at serialisation time from data already present — `duration_min` and `avg_power_kw` — because they are pure functions of the two timestamps and `kwh` and storing them would only create a second thing to keep in sync. `avg_power_kw` is deliberately the honest average *including* any mid-session pause: a session that idled for twenty minutes really did average less power, and `peak_charge_power_kw` is there to say what the charger managed while it was actually delivering.
+
+The fifth is new: **`km_before`, the kilometres driven between the previous charge and this one.** Driving warms the pack and a warm pack accepts more power, so alongside the ambient temperature and the starting SoC this is most of the answer to why one DC session pulled 150 kW and the next one 40.
+
+**It is derived on read rather than stored, and that is the interesting part.** `km_before` depends on the *previous* charge, and charges do not always arrive in order — a manually recovered session lands with a fresh high `id` and an old timestamp, which is exactly what charges 62 and 63 are in the author's database. A stored value on the neighbouring row would have gone quietly stale with nothing to notice it. One `LAG()` window query computes it for the whole window at once, so it is always current, needs no migration, and applies retroactively to every charge already logged.
+
+`km_before` is `None` when there is no previous charge to measure from, and `0` when there genuinely was no driving in between — those are different answers and a dashboard should be able to tell them apart, because "the pack had no chance to warm up" is a diagnosis and "we do not know" is not.
+
 ## v0.8.31 — 2026-08-24
 **Refactor — the first cut into `coordinator.py`, and a lazy import that was never lazy.** `coordinator.py` had grown to 7 808 lines around a single class of some 120 methods. Two modules come out of it, both leaves — nothing imports back into the coordinator:
 
