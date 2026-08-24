@@ -422,6 +422,13 @@ CREATE TABLE IF NOT EXISTS charges (
     -- the class from the observed peak cannot tell them apart, because in
     -- the second case the peak IS the low number. NULL until entered.
     charger_power_kw REAL,
+    -- v0.8.34: where the car was when the session ended, from the
+    -- device_tracker. Charges carry no coordinates of their own, and
+    -- `location` is 'not_home' for every public charger, so this is the
+    -- only key that can say "same charger as last time" — which is what
+    -- lets the UI offer the rating you already entered here.
+    charge_lat REAL,
+    charge_lon REAL,
     -- v0.6.0: peak instantaneous charge power during the session
     -- (max |power| sample from the vehicle's power sensor, or the
     -- EVSE sensor when only that is wired). Drives DCFC-stress
@@ -665,6 +672,9 @@ class ChargeRecord:
     # v0.8.33: the charger's rated power in kW, as written on the unit.
     # User-entered; nothing publishes it to us.
     charger_power_kw: float | None = None
+    # v0.8.34: position at close. Identifies the charger across sessions.
+    charge_lat: float | None = None
+    charge_lon: float | None = None
     charge_id: int | None = field(default=None, compare=False)
     # v0.8.32 — km driven between the previous charge and this one, the
     # proxy for "the pack arrived warm" that explains most of why a DC
@@ -900,6 +910,10 @@ class TripStorage:
         # v0.8.33: the charger's rated power, user-entered.
         if "charger_power_kw" not in charge_cols:
             conn.execute("ALTER TABLE charges ADD COLUMN charger_power_kw REAL")
+        # v0.8.34: position at charge close — the "same charger" key.
+        for col in ("charge_lat", "charge_lon"):
+            if col not in charge_cols:
+                conn.execute(f"ALTER TABLE charges ADD COLUMN {col} REAL")
         # v0.5.0: trip_positions table for route-map drilldown.
         conn.execute(
             """
@@ -2241,8 +2255,8 @@ class TripStorage:
                     currency, soc_start, soc_end, location, notes, is_dcfc,
                     evse_energy_kwh, charging_efficiency_pct,
                     peak_charge_power_kw, temperature_c, energy_source,
-                    charger_power_kw
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    charger_power_kw, charge_lat, charge_lon
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _iso_local(record.started_at) if record.started_at else None,
@@ -2262,6 +2276,8 @@ class TripStorage:
                     record.temperature_c,
                     record.energy_source,
                     record.charger_power_kw,
+                    record.charge_lat,
+                    record.charge_lon,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -2586,6 +2602,45 @@ class TripStorage:
                 "SELECT * FROM charges WHERE id = ?", (row["id"],)
             ).fetchone()
         return _row_to_charge(updated)
+
+    async def async_charges_missing_gps(self, limit: int = 50) -> list[dict[str, Any]]:
+        """v0.8.34 — charges with no recorded position, newest first.
+
+        Bounded like the trip equivalent. The tracker's history only
+        survives as long as the recorder keeps it (about ten days on a
+        default install, measured), so charges older than that will never
+        resolve and are simply left alone rather than retried forever.
+        """
+        return await self._hass.async_add_executor_job(
+            self._charges_missing_gps, limit
+        )
+
+    def _charges_missing_gps(self, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, ended_at FROM charges "
+                "WHERE charge_lat IS NULL AND ended_at IS NOT NULL "
+                "ORDER BY ended_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def async_set_charge_gps(
+        self, charge_id: int, lat: float, lon: float
+    ) -> None:
+        """Write a backfilled position. Never overwrites one already set."""
+        await self._hass.async_add_executor_job(
+            self._set_charge_gps, charge_id, lat, lon
+        )
+
+    def _set_charge_gps(self, charge_id: int, lat: float, lon: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE charges SET charge_lat = ?, charge_lon = ? "
+                "WHERE id = ? AND charge_lat IS NULL",
+                (lat, lon, charge_id),
+            )
 
     async def async_trips_missing_gps(self, limit: int = 50) -> list[dict[str, Any]]:
         """Trips with NULL start_lat AND NULL end_lat — for GPS backfill.
@@ -4647,6 +4702,8 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
             row["charger_power_kw"]
             if "charger_power_kw" in row.keys() else None
         ),
+        charge_lat=row["charge_lat"] if "charge_lat" in row.keys() else None,
+        charge_lon=row["charge_lon"] if "charge_lon" in row.keys() else None,
         temperature_c=(
             row["temperature_c"]
             if "temperature_c" in row.keys() else None
