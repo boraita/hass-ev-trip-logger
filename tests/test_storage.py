@@ -1886,3 +1886,104 @@ async def test_soc_pool_is_labelled_as_the_tautology_it_is(
     assert src == "soc"
     assert n == 5
     assert cap == pytest.approx(82.5, abs=0.05)
+
+
+async def test_km_before_sums_trips_between_consecutive_charges(
+    storage: TripStorage,
+) -> None:
+    """v0.8.32 — each charge reports the km driven since the previous one.
+
+    That figure is the practical proxy for "the pack arrived warm", which
+    is what explains most of why one DC session accepted 150 kW and the
+    next one 40 kW. It is derived on read rather than stored precisely
+    because it depends on the *previous* charge: a manual recovery lands
+    with a fresh id and an old timestamp, and a stored value on its
+    neighbour would go stale without anything noticing.
+    """
+    base = dt_util.now() - timedelta(days=2)
+
+    async def charge(hours: float, **over) -> None:
+        await storage.async_insert_charge(_charge(
+            started_at=base + timedelta(hours=hours),
+            ended_at=base + timedelta(hours=hours, minutes=30),
+            kwh=over.pop("kwh", 40.0), **over,
+        ))
+
+    async def trip(hours: float, km: float) -> None:
+        await storage.async_insert(TripRecord(
+            started_at=base + timedelta(hours=hours),
+            ended_at=base + timedelta(hours=hours, minutes=45),
+            duration_min=45.0, distance_km=km, energy_kwh=km * 0.2,
+        ))
+
+    await charge(0)                 # first charge: no previous, so no window
+    await trip(2, 120.0)
+    await trip(5, 77.0)
+    await charge(8)                 # 197 km since the first charge
+    await trip(20, 30.0)
+    await charge(24)                # 30 km since the second
+
+    recent = await storage.async_recent_charges(limit=10)
+    by_start = {c.started_at.hour: c for c in recent}
+    assert len(recent) == 3
+    # Newest first: 30 km, then 197 km, then the first charge with no
+    # predecessor at all.
+    assert [c.km_before for c in recent] == [
+        pytest.approx(30.0), pytest.approx(197.0), None,
+    ]
+    assert by_start[base.hour].km_before is None, (
+        "the oldest charge has no previous charge to measure from"
+    )
+
+
+async def test_km_before_is_zero_not_none_when_the_car_did_not_move(
+    storage: TripStorage,
+) -> None:
+    """Zero km and no data are different answers and must look different.
+
+    A charge right after another with no driving in between really is
+    0 km — the pack had no chance to warm up, which is exactly the
+    diagnosis. `None` is reserved for "there is no previous charge".
+    """
+    base = dt_util.now() - timedelta(days=1)
+    for h in (0, 4):
+        await storage.async_insert_charge(_charge(
+            started_at=base + timedelta(hours=h),
+            ended_at=base + timedelta(hours=h, minutes=30),
+            kwh=10.0,
+        ))
+    recent = await storage.async_recent_charges(limit=5)
+    assert [c.km_before for c in recent] == [pytest.approx(0.0), None]
+
+
+async def test_km_before_ignores_trips_during_the_charge_itself(
+    storage: TripStorage,
+) -> None:
+    """The window ends when the charge starts, not when it ends.
+
+    Km logged while the session was open belong to the *next* charge's
+    window. Counting them here would credit warmth to a charge that had
+    already begun cold.
+    """
+    base = dt_util.now() - timedelta(days=1)
+    await storage.async_insert_charge(_charge(
+        started_at=base, ended_at=base + timedelta(minutes=30), kwh=10.0,
+    ))
+    await storage.async_insert(TripRecord(     # before the 2nd charge starts
+        started_at=base + timedelta(hours=1),
+        ended_at=base + timedelta(hours=2),
+        duration_min=60.0, distance_km=50.0, energy_kwh=10.0,
+    ))
+    await storage.async_insert_charge(_charge(
+        started_at=base + timedelta(hours=3),
+        ended_at=base + timedelta(hours=5), kwh=40.0,
+    ))
+    await storage.async_insert(TripRecord(     # DURING that 2nd charge
+        started_at=base + timedelta(hours=3, minutes=30),
+        ended_at=base + timedelta(hours=4),
+        duration_min=30.0, distance_km=999.0, energy_kwh=10.0,
+    ))
+    recent = await storage.async_recent_charges(limit=5)
+    assert recent[0].km_before == pytest.approx(50.0), (
+        "the 999 km trip closed after the charge started and must not count"
+    )

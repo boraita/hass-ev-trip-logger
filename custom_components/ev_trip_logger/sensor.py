@@ -1127,6 +1127,31 @@ def _trip_to_attr(
     }
 
 
+def _charge_duration_min(charge: Any) -> float | None:
+    """Wall-clock length of the session, None if it has no start."""
+    started = getattr(charge, "started_at", None)
+    ended = getattr(charge, "ended_at", None)
+    if started is None or ended is None:
+        return None
+    minutes = (ended - started).total_seconds() / 60.0
+    return minutes if minutes > 0 else None
+
+
+def _charge_avg_power_kw(charge: Any) -> float | None:
+    """Mean power over the session — kwh over its own duration.
+
+    This is the honest average including any mid-session pause, which is
+    the point: a session that idled for 20 minutes really did average
+    less power, and `peak_charge_power_kw` is there to show what the
+    charger managed when it was actually delivering.
+    """
+    minutes = _charge_duration_min(charge)
+    kwh = getattr(charge, "kwh", None)
+    if not minutes or kwh is None:
+        return None
+    return float(kwh) / (minutes / 60.0)
+
+
 def _charge_to_attr(charge: Any) -> dict[str, Any]:
     """Serialise a ChargeRecord. Same `id`/`charge_id` dual-alias as trips."""
     return {
@@ -1155,6 +1180,22 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         # Lets a dashboard flag "this figure is a SoC estimate" instead
         # of presenting every kwh value with the same implied precision.
         "energy_source": getattr(charge, "energy_source", None),
+        # v0.8.32 — how fast the energy went in, and the context that
+        # explains why. Peak power and ambient temperature were already
+        # persisted but had never been serialised; duration and average
+        # power are derived here rather than stored, being pure functions
+        # of the two timestamps and kwh.
+        "duration_min": _r(_charge_duration_min(charge), 1),
+        "avg_power_kw": _r(_charge_avg_power_kw(charge), 1),
+        "peak_charge_power_kw": _r(
+            getattr(charge, "peak_charge_power_kw", None), 1
+        ),
+        "temperature_c": _r(getattr(charge, "temperature_c", None), 1),
+        # Km driven since the previous charge — the pack-warmth proxy.
+        # Only populated on the `recent_charges` path (see
+        # ChargeRecord.km_before); None elsewhere, not zero, so a
+        # template can tell "no data" from "the car did not move".
+        "km_before": _r(getattr(charge, "km_before", None), 1),
     }
 
 
