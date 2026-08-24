@@ -2,6 +2,15 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.29 — 2026-08-24
+**Fix — a charging efficiency above 100 % is impossible, and two of them were being averaged in as if they were data.** Efficiency is `battery kWh / charger kWh × 100`. Energy reaching the pack can never exceed what the meter delivered, so anything over 100 % means one of the two figures is wrong — in practice `kwh` came from the SoC estimate rather than a measurement. The live database held two: **106.0 %** and **156.8 %** (1.65 kWh claimed against a metered 1.05).
+
+Both fed the rolling median behind `avg_charging_efficiency_30d`, and each also consumed one of the query's 30 window slots, pushing a good sample out of the window entirely. The query filtered `> 0` and nothing else. There is now a plausibility band, 50–105 %: the ceiling sits above 100 rather than at it so meter resolution and ±1 % SoC quantization can round a genuinely-99 % session over the line without being thrown away, and the floor rejects the mirror-image nonsense — losing over half the delivered energy is not a charge session either.
+
+The same band now applies to the paired `kwh_with_evse` / `evse_kwh` sums behind the monthly and yearly efficiency figures. v0.5.101 added those sums precisely so the ratio would be properly weighted, and its docstring promised the result was "always 0-100 %"; that held only while every row's `kwh` was a real measurement. All three paired sums share one predicate now, so the numerator and denominator can never come from different sets of rows, and the predicate tests the ratio itself rather than the derived `charging_efficiency_pct` column — a row whose derived column was never written still counts.
+
+Effect on the author's install: `avg_charging_efficiency_30d` moves 89.4 % → 89.1 % and its `sample_count` 27 → 25. Small today because a median resists one outlier; the point is that the two rows were never eligible to be in it.
+
 ## v0.8.28 — 2026-08-24
 **Chore — the project had no linter; adding one turned up a missing import.** `ruff` now runs in CI alongside hassfest, HACS and pytest, with a ruleset chosen for defects rather than whitespace: pyflakes, bugbear, the async-blocking-call rules, logging correctness, pyupgrade and the simplification families. Everything it flagged is fixed; the tree is clean.
 

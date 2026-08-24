@@ -85,6 +85,29 @@ def _parse_stored(value: str | None) -> datetime | None:
 #: costs nothing while the missing `before` cost a SoC anchor.
 _CHARGE_TRIP_BOUNDARY_TOLERANCE_S: int = 60
 
+# v0.8.29 — plausibility band for `charging_efficiency_pct`
+# (= battery kWh / charger kWh × 100). Energy reaching the battery can
+# never exceed what the meter delivered, so anything above 100 % is
+# physically impossible; the headroom to _EFFICIENCY_MAX_PCT covers
+# meter resolution and the ±1 % SoC quantization that can push a
+# genuinely-99 % session slightly over. Below _EFFICIENCY_MIN_PCT means
+# over half the delivered energy went somewhere other than the pack,
+# which no charge session does — it means one of the two figures is
+# wrong. Rows outside the band are excluded from the rolling median so
+# a known-bad measurement cannot move a number the user reads as truth.
+_EFFICIENCY_MIN_PCT: float = 50.0
+_EFFICIENCY_MAX_PCT: float = 105.0
+
+#: SQL predicate for "this charge has a usable EVSE meter reading" —
+#: shared by every paired kwh/evse sum so the ratio between them cannot
+#: fall outside the plausibility band above.
+_EVSE_USABLE_SQL = (
+    "evse_energy_kwh IS NOT NULL AND evse_energy_kwh > 0 "
+    "AND kwh IS NOT NULL "
+    f"AND kwh / evse_energy_kwh >= {_EFFICIENCY_MIN_PCT / 100.0} "
+    f"AND kwh / evse_energy_kwh <= {_EFFICIENCY_MAX_PCT / 100.0}"
+)
+
 
 def _anchor_lots(lots: list[list[float]], target_kwh: float, pad_price: float) -> None:
     """Re-anchor a LIFO lot stack to the pack's known physical content.
@@ -1896,11 +1919,16 @@ class TripStorage:
                 # importing historical charges via `log_charge` gives
                 # them ids above every live row, so this "recent N"
                 # window would be computed entirely from the import.
+                # v0.8.29 — the band, not just `> 0`. An impossible row
+                # (kwh from the SoC estimate against a real meter can
+                # read 156 %) used to both enter the median and consume
+                # one of the `window` slots, pushing a good sample out.
                 "SELECT charging_efficiency_pct FROM charges "
                 "WHERE charging_efficiency_pct IS NOT NULL "
-                "  AND charging_efficiency_pct > 0 "
+                "  AND charging_efficiency_pct >= ? "
+                "  AND charging_efficiency_pct <= ? "
                 "ORDER BY ended_at DESC, id DESC LIMIT ?",
-                (window,),
+                (_EFFICIENCY_MIN_PCT, _EFFICIENCY_MAX_PCT, window),
             ).fetchall()
         samples = [float(r[0]) for r in rows if r[0] is not None]
         n = len(samples)
@@ -3088,7 +3116,7 @@ class TripStorage:
         # impossible 700-800 % efficiency numbers.
         with self._connect() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT
                     COALESCE(SUM(kwh), 0) AS kwh,
                     COALESCE(SUM(total_cost), 0) AS cost,
@@ -3103,18 +3131,24 @@ class TripStorage:
                     -- convention _lifetime_dcfc_ratio already documents.
                     COALESCE(SUM(CASE WHEN COALESCE(is_dcfc, 0) = 0 THEN kwh ELSE 0 END), 0) AS ac_kwh,
                     COALESCE(SUM(CASE WHEN COALESCE(is_dcfc, 0) = 0 THEN total_cost ELSE 0 END), 0) AS ac_cost,
+                    -- v0.8.29 — all three sums share ONE predicate, and
+                    -- it now includes the plausibility band. Gating on
+                    -- the ratio itself rather than the stored
+                    -- charging_efficiency_pct keeps a row whose derived
+                    -- column was never written. Without the band a row
+                    -- whose kwh came from the SoC estimate (the user's
+                    -- real db held 1.65 kwh against a metered 1.05)
+                    -- pushed the numerator above the denominator, so
+                    -- the "always 0-100 %" paired ratio was not.
                     COALESCE(SUM(
-                        CASE WHEN evse_energy_kwh IS NOT NULL
-                                  AND evse_energy_kwh > 0
+                        CASE WHEN {_EVSE_USABLE_SQL}
                              THEN kwh ELSE 0 END
                     ), 0) AS kwh_with_evse,
                     COALESCE(SUM(
-                        CASE WHEN evse_energy_kwh IS NOT NULL
-                                  AND evse_energy_kwh > 0
+                        CASE WHEN {_EVSE_USABLE_SQL}
                              THEN evse_energy_kwh ELSE 0 END
                     ), 0) AS evse_kwh,
-                    SUM(CASE WHEN evse_energy_kwh IS NOT NULL
-                                  AND evse_energy_kwh > 0
+                    SUM(CASE WHEN {_EVSE_USABLE_SQL}
                              THEN 1 ELSE 0 END
                     ) AS evse_count,
                     -- v0.6.0: high-power-stress accounting. Sessions

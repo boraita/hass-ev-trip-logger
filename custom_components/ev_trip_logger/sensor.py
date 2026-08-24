@@ -3610,11 +3610,15 @@ class AvgChargingEfficiencySensor(_BaseTripSensor):
         return {
             "sample_count": self._n,
             "window_charges": 30,
+            "plausible_band_pct": [50, 105],
             "interpretation": (
                 "AC home charger typical 88-94 %, DCFC 92-97 %. "
                 "Below 85 % signals lossy cable / wallbox derating "
                 "/ onboard charger inefficiency. Only charges with "
-                "an EVSE power sensor wired contribute."
+                "an EVSE power sensor wired contribute, and only "
+                "those inside plausible_band_pct — a row above 100 % "
+                "is physically impossible and is excluded rather "
+                "than averaged in."
             ),
         }
 
