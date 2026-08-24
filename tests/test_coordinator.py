@@ -38,6 +38,7 @@ from custom_components.ev_trip_logger.const import (
     SERVICE_DELETE_LAST_TRIP,
     SERVICE_END_TRIP,
     SERVICE_LOG_CHARGE,
+    CONF_LAST_TRIP_ENERGY_SENSOR,
 )
 
 CHG = "binary_sensor.byd_charging"
@@ -4184,3 +4185,58 @@ async def test_odometer_catchup_does_not_release_the_charge_guard(
     hass.states.async_set(POW, "12")     # discharging
     await hass.async_block_till_done()
     assert coordinator._charge_still_delivering() is False  # noqa: SLF001
+
+
+async def test_vehicle_heal_rejects_an_implausible_vehicle_energy(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.26 — the vehicle-native heal had no plausibility check.
+
+    Real case, 2026-08-23: a 197 km motorway leg ran 65 % -> 6 % of an
+    82.68 kWh pack, i.e. 48.8 kWh, and the driver's own figure was
+    24.8 kWh/100km. The car's `last_trip_energy` sensor read 22.27 kWh —
+    11.3 kWh/100km, physically impossible for that drive. The heal's two
+    guards (sensor newer than the trip, distance within tolerance) both
+    passed, so it overrode the SoC-derived energy with the bad number, and
+    a reload re-applied it to a SECOND trip whose 185 km was inside the
+    12 km distance tolerance.
+
+    SoC is the cross-check the guards were missing: it comes from the
+    physical pack and cannot be off by half.
+    """
+    hass.states.async_set(ODO, "1000")
+    hass.states.async_set(BAT, "65")
+    entry = await _setup(hass, bat=65.0, **{
+        CONF_LAST_TRIP_ENERGY_SENSOR: "sensor.car_last_trip_energy",
+    })
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    from custom_components.ev_trip_logger.storage import TripRecord
+
+    trip_id = await coordinator.storage.async_insert(TripRecord(
+        started_at=dt_util.now() - timedelta(hours=2),
+        ended_at=dt_util.now() - timedelta(minutes=30),
+        duration_min=90.0, distance_km=197.0,
+        soc_start=65.0, soc_end=6.0, soc_used_pct=59.0,
+        energy_kwh=48.78, energy_source="soc",
+        consumption_kwh_100km=24.8,
+    ))
+
+    # The car claims less than half of what the battery says it used.
+    hass.states.async_set("sensor.car_last_trip_energy", "22.27")
+    await hass.async_block_till_done()
+    await coordinator._async_heal_from_vehicle(trip_id)  # noqa: SLF001
+
+    t = await coordinator.storage.async_get_trip_by_id(trip_id)
+    assert t.energy_kwh == pytest.approx(48.78), "SoC must win over a bad sensor"
+    assert t.energy_source == "soc"
+
+    # A vehicle figure that AGREES with SoC is still adopted: it is the
+    # more precise measurement, which is why the heal exists.
+    hass.states.async_set("sensor.car_last_trip_energy", "47.10")
+    await hass.async_block_till_done()
+    await coordinator._async_heal_from_vehicle(trip_id)  # noqa: SLF001
+
+    t = await coordinator.storage.async_get_trip_by_id(trip_id)
+    assert t.energy_kwh == pytest.approx(47.10)
+    assert t.energy_source == "vehicle"

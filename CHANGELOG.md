@@ -2,6 +2,15 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.26 — 2026-08-24
+**Fix — the vehicle-native energy heal had no plausibility check and rewrote good rows with an impossible number.** `_async_heal_from_vehicle` adopts the car's own `last_trip_energy` because it is normally the more precise measurement. Its two guards establish that the sensor refers to *this* trip — it changed after the trip closed, and its distance matches within tolerance — but neither asks whether the value is possible.
+
+Measured on 2026-08-23: a 197 km motorway leg ran 65 % → 6 % of an 82.68 kWh pack, i.e. 48.8 kWh and 24.8 kWh/100 km. The car's sensor read **22.27 kWh — 11.3 kWh/100 km**, which no EV does over 197 km. Both guards passed and the heal overwrote the SoC-derived row. Worse, the sweep runs on every startup, so a later reload re-applied the same 22.27 kWh to a *second* trip whose 185 km sat inside the 20 % distance tolerance — two rows, identical energy, both wrong.
+
+SoC is the cross-check the guards were missing: it comes from the physical pack and cannot be wrong by half. The heal now refuses a vehicle figure more than ±40 % from `soc_used_pct × capacity`, and logs why. The tolerance matches `_CHARGE_ENERGY_TOLERANCE`, which does the same job for the charge-side power integration — wide enough that a genuinely better vehicle measurement still wins, which is the whole point of the heal, and narrow enough to catch a number that belongs to some other trip.
+
+Note for anyone whose rows were already overwritten: `set_trip` can restore `energy_kwh` but cannot clear `energy_source`, so a repaired row keeps its `vehicle` label. That is harmless — both this heal and `heal_history` skip `vehicle`-sourced rows, so the restored figure is protected.
+
 ## v0.8.25 — 2026-08-24
 **Fix — journeys stopped being resolved at all: `NameError` on every call that found one.** v0.8.10 taught `_resolve_open_journey_id` about secondary homes by turning its single `slug` into a list of `slugs` and its first query's `LOWER(destination) = ?` into `IN (…)`. The **second** query — the one that actually returns the id — kept `= ?` bound to `(slug,)`, a name that no longer existed.
 

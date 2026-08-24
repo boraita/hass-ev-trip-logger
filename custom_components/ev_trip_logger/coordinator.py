@@ -203,6 +203,21 @@ _VEHICLE_TRIP_HEAL_DELAY_S = 240.0
 # relative — both must be exceeded to reject the override.
 _VEHICLE_TRIP_DIST_TOL_KM = 1.0
 _VEHICLE_TRIP_DIST_TOL_PCT = 0.20
+# v0.8.26 — how far the vehicle's own last_trip_energy may sit from the
+# SoC-derived figure before the heal refuses to adopt it. The heal's other
+# two guards only establish that the sensor refers to THIS trip; neither
+# asks whether the number is possible. Measured 2026-08-23: a 197 km
+# motorway leg ran 65 % -> 6 % of an 82.68 kWh pack (48.8 kWh, 24.8
+# kWh/100km) and the car reported 22.27 kWh — 11.3 kWh/100km. Both guards
+# passed and the bad value overwrote the row; a later reload re-applied it
+# to a second trip whose 185 km sat inside the 20 % distance tolerance.
+#
+# SoC comes from the physical pack and cannot be wrong by half, so it is
+# the sanity check. ±40 % matches `_CHARGE_ENERGY_TOLERANCE`, which does
+# the same job for the charge-side power integration: wide enough that a
+# genuinely better vehicle measurement still wins (that is why the heal
+# exists), narrow enough to catch a figure that is not of this trip.
+_VEHICLE_TRIP_ENERGY_TOL = 0.4
 # How long after a trip closes we still accept a late device_tracker
 # transition as "the trip actually ended at <that zone>" (and use it to
 # amend the trip's destination, plus close the journey when the new
@@ -7092,6 +7107,24 @@ class EvTripLoggerCoordinator:
                             trip_id, vehicle_km, trip.distance_km,
                         )
                         return
+        # Plausibility cross-check against the physical pack. See
+        # `_VEHICLE_TRIP_ENERGY_TOL`.
+        soc_used = trip.soc_used_pct
+        if soc_used is not None and float(soc_used) > 0:
+            soc_kwh = float(soc_used) / 100.0 * self.battery_capacity
+            if soc_kwh > 0:
+                lo = (1.0 - _VEHICLE_TRIP_ENERGY_TOL) * soc_kwh
+                hi = (1.0 + _VEHICLE_TRIP_ENERGY_TOL) * soc_kwh
+                if not (lo <= vehicle_kwh <= hi):
+                    _LOGGER.warning(
+                        "Vehicle heal skipped for trip %s: the car reports "
+                        "%.2f kWh but the battery moved %.1f pp = %.2f kWh "
+                        "(outside ±%.0f %%). Keeping the SoC-derived value.",
+                        trip_id, vehicle_kwh, float(soc_used), soc_kwh,
+                        _VEHICLE_TRIP_ENERGY_TOL * 100.0,
+                    )
+                    return
+
         # All guards passed — override.
         old_energy = trip.energy_kwh
         new_consumption = vehicle_kwh / trip.distance_km * 100.0
