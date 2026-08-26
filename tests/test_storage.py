@@ -2005,6 +2005,115 @@ async def test_km_before_sums_trips_between_consecutive_charges(
     )
 
 
+async def test_a_live_charge_labels_its_evse_figure_as_metered(
+    storage: TripStorage,
+) -> None:
+    """v0.8.41 — the provenance survives a round trip through storage."""
+    charge_id = await storage.async_insert_charge(_charge(
+        kwh=15.33, soc_start=20.0, soc_end=38.0,
+        evse_energy_kwh=15.74, evse_source="meter",
+    ))
+    rec = await storage.async_get_charge_by_id(charge_id)
+    assert rec is not None
+    assert rec.evse_source == "meter"
+
+
+async def test_correcting_a_charge_marks_its_evse_figure_as_an_invoice(
+    storage: TripStorage,
+) -> None:
+    """A figure arriving through the correction path is a receipt.
+
+    This is the distinction the v0.8.30 capacity tier could not make, and
+    the reason it was wrong about its own name: on the author's install
+    the wallbox integrated to exactly 0.00 kWh during all eight away
+    sessions, yet those rows carried an `evse_energy_kwh`, and four of the
+    five samples in that "metered" pool rested on invoice figures.
+    """
+    charge_id = await storage.async_insert_charge(_charge(
+        kwh=64.18, soc_start=11.0, soc_end=85.0,
+    ))
+    updated = await storage.async_update_charge_by_id(
+        charge_id, evse_energy_kwh=67.23,
+    )
+    assert updated is not None
+    assert updated.evse_energy_kwh == pytest.approx(67.23)
+    assert updated.evse_source == "invoice"
+
+
+async def test_a_price_only_edit_keeps_an_existing_meter_label(
+    storage: TripStorage,
+) -> None:
+    """Correcting the price must not downgrade a real measurement.
+
+    The label only changes when a new EVSE figure is actually supplied;
+    otherwise a user fixing a tariff would silently turn every metered
+    charge into an invoiced one.
+    """
+    charge_id = await storage.async_insert_charge(_charge(
+        kwh=15.33, soc_start=20.0, soc_end=38.0,
+        evse_energy_kwh=15.74, evse_source="meter",
+    ))
+    updated = await storage.async_update_charge_by_id(
+        charge_id, price_per_kwh=0.07,
+    )
+    assert updated is not None
+    assert updated.evse_source == "meter"
+
+
+async def test_a_backfilled_label_never_overwrites_a_recorded_one(
+    storage: TripStorage,
+) -> None:
+    """The backfill infers; the writer knew. The writer wins.
+
+    Same rule as `async_set_charge_gps`: a retroactive guess must not be
+    able to overwrite something recorded at the time by the code that
+    actually had the answer.
+    """
+    charge_id = await storage.async_insert_charge(_charge(
+        kwh=15.33, soc_start=20.0, soc_end=38.0,
+        evse_energy_kwh=15.74, evse_source="meter",
+    ))
+    await storage.async_set_evse_source(charge_id, "invoice")
+    rec = await storage.async_get_charge_by_id(charge_id)
+    assert rec is not None
+    assert rec.evse_source == "meter"
+
+
+async def test_only_unlabelled_charges_with_a_figure_await_backfill(
+    storage: TripStorage,
+) -> None:
+    """The backfill queue excludes what it cannot or need not decide."""
+    started = dt_util.now() - timedelta(hours=2)
+    labelled = await storage.async_insert_charge(_charge(
+        started_at=started, kwh=10.0, soc_start=20.0, soc_end=32.0,
+        evse_energy_kwh=11.0, evse_source="meter",
+    ))
+    no_figure = await storage.async_insert_charge(_charge(
+        started_at=started, kwh=10.0, soc_start=20.0, soc_end=32.0,
+    ))
+    # No start time means no window to replay the sensor over, so this
+    # one can never be decided and must not sit in the queue forever.
+    no_window = await storage.async_insert_charge(_charge(
+        kwh=10.0, soc_start=20.0, soc_end=32.0, evse_energy_kwh=11.0,
+    ))
+    pending_id = await storage.async_insert_charge(_charge(
+        started_at=started, kwh=10.0, soc_start=20.0, soc_end=32.0,
+        evse_energy_kwh=11.0,
+    ))
+    # A pre-v0.8.41 row: a figure, and nothing saying where it came from.
+    with storage._connect() as conn:
+        conn.execute(
+            "UPDATE charges SET evse_source = NULL WHERE id = ?",
+            (pending_id,),
+        )
+
+    ids = {r["id"] for r in await storage.async_charges_missing_evse_source()}
+    assert pending_id in ids
+    assert labelled not in ids, "already decided"
+    assert no_figure not in ids, "nothing to decide"
+    assert no_window not in ids, "nothing to decide it with"
+
+
 def test_plausible_efficiency_pct_refuses_the_impossible() -> None:
     """v0.8.40 — energy into the battery cannot exceed energy delivered.
 
