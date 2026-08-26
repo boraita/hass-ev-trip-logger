@@ -1786,15 +1786,28 @@ async def _cap_charge(**over) -> ChargeRecord:
 async def test_metered_tier_wins_and_excludes_under_integrated_charges(
     storage: TripStorage,
 ) -> None:
-    """v0.8.30 — a measured `kwh` that its own meter contradicts is out.
+    """v0.8.38 — efficiency must NOT select which charges become samples.
 
-    `kwh` is the shared numerator of the efficiency and of the capacity
-    sample, so an under-integrated power measurement drags both down
-    together. On the author's real history, sessions at 76-83 %
-    efficiency implied a 76-78 kWh pack and sessions at 91-97 % implied
-    87-90 kWh — the same physical battery. Five well-metered 82 kWh
-    charges plus three under-integrated 70 kWh ones must calibrate to
-    82, not to the median of all eight.
+    This test previously asserted the opposite, and the fixture it used
+    is the clearest possible statement of why that was wrong. It sets up
+    five charges at 94 % efficiency implying 82.0 kWh and three at 80 %
+    implying 70.0 kWh, then asked for 82.0 — i.e. it asserted that high
+    efficiency identifies the correct capacity. But every charge here
+    shares one `evse_energy_kwh` and one SoC window, so `kwh` is the only
+    thing that varies, and `kwh` is the numerator of BOTH the efficiency
+    and the capacity sample. "Efficiency 94 %" and "capacity 82" are the
+    same fact stated twice. The fixture cannot distinguish "the gate
+    finds good measurements" from "the gate keeps the high numbers",
+    because in it those are identical operations.
+
+    Measured on the author's real charges, they are identical there too:
+    r(efficiency, implied capacity) = +0.80, admitted mean 85.56 kWh
+    against a rejected mean of 79.36. The gate deleted the low tail and
+    nothing else, and produced a pool whose median sat above both the
+    nameplate and an independent wall-meter bound of 79.8-83.4 kWh.
+
+    So the invariant is now the reverse: every power-integration charge
+    is a sample, and the median falls where the samples put it.
     """
     for _ in range(5):
         await storage.async_insert_charge(await _cap_charge(
@@ -1809,20 +1822,73 @@ async def test_metered_tier_wins_and_excludes_under_integrated_charges(
     cap, n, _rejects, src = await storage.async_effective_capacity_kwh(
         min_delta_pct=30.0, min_charges=5,
     )
-    assert src == "metered"
-    assert n == 5, "the three under-integrated charges must not be samples"
-    assert cap == pytest.approx(82.0, abs=0.05)
+    assert src == "grounded", "the metered tier is gone"
+    assert n == 8, "all eight are samples; efficiency selects nothing"
+    assert cap == pytest.approx(82.0, abs=0.05), (
+        "median of five 82s and three 70s — the same answer as before, "
+        "but reached by counting rather than by filtering"
+    )
 
 
-async def test_metered_tier_falls_through_when_too_few_qualify(
+async def test_a_low_efficiency_charge_still_pulls_the_median_down(
     storage: TripStorage,
 ) -> None:
-    """Below `min_charges` the metered tier yields to the old behaviour.
+    """The retired gate's whole effect, pinned so it cannot come back.
 
-    This is what makes the new tier safe to add: it can only ever
-    improve on the previous release, never take a calibration away. An
-    install with three well-metered charges keeps calibrating from all
-    of its power-integration charges, exactly as v0.8.14 did.
+    Four charges implying 70 kWh and four implying 82 must land in
+    between, not on 82. Under-integration is a real failure mode and
+    this is what tolerating it costs; the alternative — filtering by a
+    statistic that shares `kwh` with the estimate — cost more, in the
+    one direction that mattered.
+    """
+    for _ in range(4):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=41.0, soc_start=10.0, soc_end=60.0,   # 82.0 kWh
+            evse_energy_kwh=43.6, energy_source="power_integration",
+        ))
+    for _ in range(4):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=35.0, soc_start=10.0, soc_end=60.0,   # 70.0 kWh
+            evse_energy_kwh=43.6, energy_source="power_integration",
+        ))
+    cap, n, _rejects, src = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5,
+    )
+    assert src == "grounded"
+    assert n == 8
+    assert cap == pytest.approx(76.0, abs=0.05), "median of 82 and 70"
+
+
+async def test_no_pool_is_ever_labelled_metered_again(
+    storage: TripStorage,
+) -> None:
+    """`metered` was a v0.8.30-v0.8.37 label and must not reappear.
+
+    Stored capacity history from those releases still carries it, so the
+    string stays documented — but nothing may produce it now.
+    """
+    for _ in range(6):
+        await storage.async_insert_charge(await _cap_charge(
+            kwh=41.0, soc_start=10.0, soc_end=60.0,
+            evse_energy_kwh=43.6, energy_source="power_integration",
+        ))
+    _cap, _n, _rejects, src = await storage.async_effective_capacity_kwh(
+        min_delta_pct=30.0, min_charges=5,
+    )
+    assert src == "grounded"
+
+
+async def test_mixed_efficiency_charges_all_count_as_samples(
+    storage: TripStorage,
+) -> None:
+    """v0.8.38 — was `test_metered_tier_falls_through_when_too_few_qualify`.
+
+    That test existed to prove the metered tier could never take a
+    calibration away: below `min_charges` it yielded to the unfiltered
+    pool. With the tier retired the unfiltered pool is the only one, so
+    what is left to pin is that a mixed bag of efficiencies produces one
+    pool of every sample — which is also, by coincidence of the same
+    fixture, the answer the fall-through used to give.
     """
     for _ in range(3):
         await storage.async_insert_charge(await _cap_charge(
@@ -1845,11 +1911,14 @@ async def test_metered_tier_falls_through_when_too_few_qualify(
 async def test_charges_without_a_meter_are_not_counted_as_rejects(
     storage: TripStorage,
 ) -> None:
-    """No meter wired means never a candidate for the metered tier.
+    """A missing meter is not a rejected charge.
 
-    Counting those as rejects would make the reject totals unreadable —
-    every install without an EVSE sensor would show its whole history
-    as rejected. They fall through to `grounded` instead.
+    Written for the metered tier (v0.8.30): counting meter-less charges
+    as rejects would have made the totals unreadable, since every
+    install without an EVSE sensor would show its whole history as
+    rejected. The tier is gone as of v0.8.38 and the guarantee is now
+    trivially true, but it is worth keeping asserted: the reject counters
+    are user-facing, and a future gate must not resurrect the problem.
     """
     for _ in range(6):
         await storage.async_insert_charge(await _cap_charge(

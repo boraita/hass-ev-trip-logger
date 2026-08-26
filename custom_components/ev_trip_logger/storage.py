@@ -98,15 +98,33 @@ _CHARGE_TRIP_BOUNDARY_TOLERANCE_S: int = 60
 _EFFICIENCY_MIN_PCT: float = 50.0
 _EFFICIENCY_MAX_PCT: float = 105.0
 
-# v0.8.30 — a charge only qualifies for the top capacity tier when its
-# measured efficiency says its `kwh` can be trusted. `kwh` is the shared
-# numerator of both efficiency and the capacity sample, so when the power
-# integration misses samples BOTH drop together — measured on the author's
-# 60-charge history, sessions at 76-83 % efficiency implied 76-78 kWh of
-# pack while sessions at 91-97 % implied 87-90 kWh. The same physical pack.
-# A real DC session runs 92-97 % and a real AC one 88-93 %, so below this
-# threshold the shortfall is in the measurement, not in the battery.
-_CAPACITY_MIN_EFFICIENCY_PCT: float = 88.0
+# v0.8.38 — RETIRED. This gated the v0.8.30 `metered` capacity tier, and
+# it has to stay documented rather than merely deleted, because the
+# argument for it is persuasive and wrong.
+#
+# The argument: `kwh` is the shared numerator of both charging efficiency
+# and the capacity sample, so when the power integration misses samples
+# BOTH drop together. Measured on the author's history, sessions at
+# 76-83 % efficiency implied 76-78 kWh of pack and sessions at 91-97 %
+# implied 87-90 kWh, for the same physical battery. A real DC session
+# runs 92-97 % and an AC one 88-93 %, so below 88 % the shortfall looked
+# like it had to be in the measurement.
+#
+# What that reasoning misses is that the shared numerator makes the gate
+# an instrument on the very thing being estimated, not a check on it. For
+# a fixed meter reading and SoC window, "high efficiency" and "high
+# implied capacity" are the same statement, so the gate deletes the low
+# tail of the capacity distribution and keeps the high one. Measured
+# across the ten charges carrying a meter: r = +0.80, admitted mean
+# 85.56 kWh against a rejected mean of 79.36. It removed 6.2 kWh of
+# downside and none of the upside, and the surviving median (85.16) sat
+# above both the nameplate and an independent wall-meter bound of
+# 79.8-83.4 kWh.
+#
+# Under-integration is still a real failure mode. Detecting it needs a
+# statistic that does not contain `kwh` — coverage of power samples
+# across the session, for instance. Until such an instrument exists, no
+# gate is better than a one-sided one.
 
 
 class CapacityCalibration(NamedTuple):
@@ -115,12 +133,14 @@ class CapacityCalibration(NamedTuple):
     `source` names which pool produced `median`, which is the only way to
     tell a grounded number from a tautological one from the outside:
 
-      * `metered`  — power-integration charges whose measured efficiency
-                     clears `_CAPACITY_MIN_EFFICIENCY_PCT`, so `kwh` is a
-                     measurement corroborated by an independent meter.
-      * `grounded` — power-integration charges, efficiency unknown or
-                     below the threshold. `kwh` is measured but
-                     uncorroborated.
+      * `grounded` — power-integration charges. `kwh` is measured rather
+                     than inferred from SoC. No efficiency filter: see
+                     the retired `_CAPACITY_MIN_EFFICIENCY_PCT` above for
+                     why ranking these by `kwh / evse_energy_kwh` biased
+                     the estimate upward instead of improving it.
+                     `metered`, the tier that did, existed from v0.8.30
+                     to v0.8.37 and may still appear in stored capacity
+                     history from those releases.
       * `soc`      — every eligible charge. For rows whose `kwh` was
                      itself derived as `ΔSoC × capacity`, the sample
                      `kwh / ΔSoC × 100` returns the capacity it started
@@ -1875,27 +1895,39 @@ class TripStorage:
         temp_min_c: float | None,
         temp_max_c: float | None,
     ) -> CapacityCalibration:
-        # Three pools, best first, each falling through only when it
-        # cannot muster `min_charges` samples. Falling through never
-        # makes the answer worse than the previous release's: a tier is
-        # only ever *added* above what already existed.
-        #
-        # v0.8.30 — `metered` on top. A power-integration `kwh` is a
-        # measurement, but an under-integrated one (missed polling
-        # samples) is a measurement that reads low, and it drags the
-        # capacity sample down with it because `kwh` is the shared
-        # numerator of both. An independent meter reading is the check:
-        # see _CAPACITY_MIN_EFFICIENCY_PCT.
+        # Two pools, best first, falling through only when the top one
+        # cannot muster `min_charges` samples.
         #
         # v0.8.14 — `grounded` over `soc`, because most of the original
         # query's input WAS the SoC guess this calibration exists to
         # correct, making it circular.
-        metered = self._effective_capacity_kwh_query(
-            min_delta_pct, window, min_kwh, temp_min_c, temp_max_c,
-            energy_source="power_integration", require_efficiency=True,
-        )
-        if metered[1] >= min_charges:
-            return CapacityCalibration(*metered, source="metered")
+        #
+        # v0.8.38 — the `metered` tier that sat on top of this from
+        # v0.8.30 is GONE, and the reasoning is worth keeping so nobody
+        # rebuilds it. Its premise was sound: an under-integrated `kwh`
+        # (missed polling samples) reads low and drags the capacity
+        # sample down with it. Its instrument was not. It ranked charges
+        # by `kwh / evse_energy_kwh`, and `kwh` is the numerator of the
+        # capacity sample too — so for a given meter reading and SoC
+        # window, "high efficiency" and "high implied capacity" are the
+        # same statement. Filtering on one filters on the other, in one
+        # direction only: it deletes the low tail and keeps the high one.
+        #
+        # Measured on the author's ten metered charges: r(efficiency,
+        # implied capacity) = +0.80, admitted mean 85.56 kWh against a
+        # rejected mean of 79.36 — the gate removed 6.2 kWh of downside
+        # and nothing of the upside. The pool it produced (n=5, median
+        # 85.16) sat above the nameplate and above an independent
+        # wall-meter bound of 79.8-83.4 kWh, while the unfiltered pool
+        # (n=8, median 84.50) sat closer to it. Admitting the low samples
+        # moves the estimate toward the truth, not away from it.
+        #
+        # The lesson generalises past this codebase: a quality filter
+        # whose statistic shares a term with the quantity being
+        # estimated is not a filter, it is a thumb on the scale. Fixing
+        # under-integration needs an instrument that does not contain
+        # `kwh` — sample coverage over the session, say — not a ratio
+        # that does.
         grounded = self._effective_capacity_kwh_query(
             min_delta_pct, window, min_kwh, temp_min_c, temp_max_c,
             energy_source="power_integration",
@@ -1919,18 +1951,8 @@ class TripStorage:
         temp_max_c: float | None,
         *,
         energy_source: str | None,
-        require_efficiency: bool = False,
     ) -> tuple[float | None, int, dict[str, int]]:
         source_clause = " AND energy_source = ? " if energy_source else ""
-        # The efficiency gate lives in SQL rather than the Python loop
-        # because a charge without a meter reading must not count as a
-        # reject — it was never a candidate for this tier at all, and
-        # counting it would make the reject totals unreadable.
-        eff_clause = (
-            "  AND evse_energy_kwh IS NOT NULL AND evse_energy_kwh > 0 "
-            f"  AND kwh / evse_energy_kwh * 100.0 >= {_CAPACITY_MIN_EFFICIENCY_PCT} "
-            f"  AND kwh / evse_energy_kwh * 100.0 <= {_EFFICIENCY_MAX_PCT} "
-        ) if require_efficiency else ""
         params: tuple[Any, ...] = (
             (min_delta_pct, energy_source, window)
             if energy_source else (min_delta_pct, window)
@@ -1941,7 +1963,7 @@ class TripStorage:
                 "WHERE kwh IS NOT NULL AND kwh > 0 "
                 "  AND soc_start IS NOT NULL AND soc_end IS NOT NULL "
                 "  AND (soc_end - soc_start) >= ? "
-                + source_clause + eff_clause +
+                + source_clause +
                 # v0.8.13 — chronological order, not insertion id (a
                 # backfilled/reconstructed charge gets a fresh high id
                 # despite an old ended_at and would otherwise crowd out
