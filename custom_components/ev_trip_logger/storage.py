@@ -2183,6 +2183,12 @@ class TripStorage:
                 "SELECT calibration_factor_k FROM trips "
                 "WHERE calibration_factor_k IS NOT NULL "
                 "  AND calibration_factor_k > 0 "
+                # v0.8.44 — K's numerator is `energy_from_power`, the
+                # same integral the charger polluted, so a
+                # charge-overlapped trip produces a K of whatever the
+                # charging power happened to be. Same exclusion, same
+                # reason.
+                "  AND COALESCE(kwh_charged_during, 0) <= 0 "
                 "ORDER BY ended_at DESC, id DESC LIMIT ?",
                 (window,),
             ).fetchall()
@@ -2319,11 +2325,30 @@ class TripStorage:
                         AND energy_kwh > 0 AND distance_km IS NOT NULL
                         AND distance_km > 0 THEN energy_kwh END), 0)
                         AS measured_energy,
+                    -- v0.8.44 — a trip that overlapped a charge has the
+                    -- CHARGER's power folded into its own integral. The
+                    -- trip's sign convention reads that as regeneration,
+                    -- so both halves of the split are contaminated and
+                    -- neither can feed a ratio.
+                    --
+                    -- Note what this deliberately does NOT exclude:
+                    -- `regen_kwh > discharge_kwh` on its own is not an
+                    -- error. A net-descent trip really does recover more
+                    -- than it spends, and the author's history has two
+                    -- such rows (10 km at SoC 70->74 %, 3 km flat) that
+                    -- are perfectly good data. The one row that IS wrong
+                    -- (74 km, 28.01 kWh "regen", a gross throughput of
+                    -- 67 kWh/100 km) is wrong because a charge ran inside
+                    -- it, and `kwh_charged_during` says so exactly. That
+                    -- single row moved the reported regen ratio from
+                    -- ~7.3 % to ~10.8 %.
                     COALESCE(SUM(CASE WHEN regen_kwh IS NOT NULL
                         AND discharge_kwh IS NOT NULL AND discharge_kwh > 0
+                        AND COALESCE(kwh_charged_during, 0) <= 0
                         THEN regen_kwh END), 0) AS paired_regen,
                     COALESCE(SUM(CASE WHEN regen_kwh IS NOT NULL
                         AND discharge_kwh IS NOT NULL AND discharge_kwh > 0
+                        AND COALESCE(kwh_charged_during, 0) <= 0
                         THEN discharge_kwh END), 0) AS paired_discharge
                 FROM trips WHERE started_at >= ?
                 """,

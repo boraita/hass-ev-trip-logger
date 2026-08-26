@@ -2005,6 +2005,65 @@ async def test_km_before_sums_trips_between_consecutive_charges(
     )
 
 
+async def test_a_charge_overlapped_trip_is_kept_out_of_the_regen_ratio(
+    storage: TripStorage,
+) -> None:
+    """v0.8.44 — a charger's power is not regeneration.
+
+    When a charge runs inside an open trip, the charger's power lands in
+    the trip's own integral, and the trip's sign convention reads it as
+    regeneration. Both halves of the regen/discharge split are then
+    contaminated, so neither can feed a ratio.
+
+    The real row this is for: 74 km, 28.01 kWh of "regen", a gross
+    throughput of 67 kWh/100 km, and `kwh_charged_during = 23.93`. On its
+    own it moved the reported regen ratio from ~7.3 % to ~10.8 %.
+    """
+    base = dt_util.now() - timedelta(hours=6)
+
+    async def trip(hours: float, regen: float, discharge: float, **over):
+        await storage.async_insert(TripRecord(
+            started_at=base + timedelta(hours=hours),
+            ended_at=base + timedelta(hours=hours, minutes=45),
+            duration_min=45.0, distance_km=50.0, energy_kwh=10.0,
+            regen_kwh=regen, discharge_kwh=discharge, **over,
+        ))
+
+    await trip(0, 1.0, 10.0)                              # clean
+    await trip(1, 1.0, 10.0)                              # clean
+    await trip(2, 28.01, 21.53, kwh_charged_during=23.93)  # contaminated
+
+    agg = await storage.async_aggregates_since(base - timedelta(hours=1))
+    assert agg["regen_ratio"] == pytest.approx(2.0 / 20.0), (
+        "only the two clean trips pair: 2 recovered of 20 spent"
+    )
+
+
+async def test_a_net_descent_trip_is_not_treated_as_corrupt(
+    storage: TripStorage,
+) -> None:
+    """Recovering more than you spent is real, and must stay in the ratio.
+
+    The first draft of v0.8.44 excluded `regen_kwh > discharge_kwh` as
+    "physically impossible". It is not: a long descent genuinely puts
+    more back than it takes, and the SoC rising over the trip is the
+    confirmation. The author's history has two such rows — 10 km at
+    SoC 70->74 %, and 3 km flat — and both are good data. Throwing them
+    away would have been a fix that deleted evidence to tidy a number.
+    """
+    base = dt_util.now() - timedelta(hours=6)
+    await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=20),
+        duration_min=20.0, distance_km=10.0, energy_kwh=2.0,
+        soc_start=70.0, soc_end=74.0, soc_used_pct=-4.0,
+        regen_kwh=3.24, discharge_kwh=1.29,
+    ))
+    agg = await storage.async_aggregates_since(base - timedelta(hours=1))
+    assert agg["regen_ratio"] == pytest.approx(3.24 / 1.29), (
+        "a ratio above 1.0 is the honest reading of a descent"
+    )
+
+
 async def test_a_live_charge_labels_its_evse_figure_as_metered(
     storage: TripStorage,
 ) -> None:
