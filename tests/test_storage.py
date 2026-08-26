@@ -2005,6 +2005,99 @@ async def test_km_before_sums_trips_between_consecutive_charges(
     )
 
 
+async def test_a_hand_corrected_trip_energy_survives_a_capacity_heal(
+    storage: TripStorage,
+) -> None:
+    """v0.8.45 — the bulk heals must not overwrite a human's correction.
+
+    `_recompute_energy_from_capacity` rewrites every SoC-derived trip
+    whenever the battery calibration moves, and it had no way to know one
+    of them had been corrected by hand. A 3 % capacity move rewrote 209
+    trips on the author's install; any hand-edit among them would have
+    gone with them, with nothing in the log to say so.
+    """
+    trip_id = await storage.async_insert(_trip(
+        distance_km=100.0, soc_used_pct=50.0, energy_kwh=41.25,
+        consumption_kwh_100km=41.25, energy_source="soc",
+    ))
+    untouched = await storage.async_insert(_trip(
+        distance_km=100.0, soc_used_pct=50.0, energy_kwh=41.25,
+        consumption_kwh_100km=41.25, energy_source="soc",
+    ))
+    # The user corrects the energy from a known-good figure.
+    patched = await storage.async_update_trip(trip_id, {"energy_kwh": 38.0})
+    assert patched is not None
+    assert patched.energy_locked is True, "correcting it locks it"
+
+    await storage.async_recompute_energy_from_capacity(70.0)
+
+    kept = await storage.async_get_trip_by_id(trip_id)
+    assert kept is not None
+    assert kept.energy_kwh == pytest.approx(38.0), "the correction survives"
+
+    healed = await storage.async_get_trip_by_id(untouched)
+    assert healed is not None
+    assert healed.energy_kwh == pytest.approx(35.0), (
+        "an untouched trip is still healed: 50 % of 70 kWh"
+    )
+
+
+async def test_a_hand_corrected_trip_cost_survives_a_cost_heal(
+    storage: TripStorage,
+) -> None:
+    """The second heal, and the second lock.
+
+    Two flags rather than one, because the corrections mean different
+    things: fixing the energy SHOULD let the cost re-derive from the
+    corrected figure, while a cost taken off a receipt should not be
+    recomputed from anything.
+    """
+    trip_id = await storage.async_insert(_trip(
+        distance_km=100.0, soc_used_pct=50.0, energy_kwh=41.25,
+        consumption_kwh_100km=41.25, energy_source="soc", cost=12.0,
+    ))
+    patched = await storage.async_update_trip(trip_id, {"cost": 7.5})
+    assert patched is not None
+    assert patched.cost_locked is True
+    assert patched.energy_locked is False, (
+        "correcting the cost must not lock the energy as well"
+    )
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.30)
+
+    kept = await storage.async_get_trip_by_id(trip_id)
+    assert kept is not None
+    assert kept.cost == pytest.approx(7.5)
+
+
+async def test_correcting_the_energy_leaves_the_cost_free_to_re_derive(
+    storage: TripStorage,
+) -> None:
+    """The whole reason there are two flags and not one.
+
+    A user fixing the energy wants the cost to follow from the corrected
+    figure. A single combined lock would freeze the cost at a value
+    derived from the wrong energy.
+    """
+    trip_id = await storage.async_insert(_trip(
+        distance_km=100.0, soc_used_pct=50.0, energy_kwh=41.25,
+        consumption_kwh_100km=41.25, energy_source="soc", cost=12.0,
+    ))
+    patched = await storage.async_update_trip(trip_id, {"energy_kwh": 20.0})
+    assert patched is not None
+    assert patched.energy_locked is True
+    assert patched.cost_locked is False
+
+    await storage.async_recompute_trip_costs_from_charges(default_price=0.30)
+
+    rec = await storage.async_get_trip_by_id(trip_id)
+    assert rec is not None
+    assert rec.energy_kwh == pytest.approx(20.0), "still the corrected energy"
+    assert rec.cost != pytest.approx(12.0), (
+        "the cost re-derived from the corrected energy"
+    )
+
+
 async def test_a_charge_overlapped_trip_is_kept_out_of_the_regen_ratio(
     storage: TripStorage,
 ) -> None:

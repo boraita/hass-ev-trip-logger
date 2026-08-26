@@ -2,6 +2,26 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.45 — 2026-08-26
+**Feat — a trip figure you corrected by hand is no longer overwritten by a bulk heal.** New `energy_locked` and `cost_locked` on trips, the equivalent of `charges.price_locked`.
+
+Two heals rewrite trip rows in bulk: `_recompute_energy_from_capacity` whenever the battery calibration moves, and `_recompute_trip_costs_from_charges` whenever the charge pool changes. Neither had any way to know a human had already corrected the row. **A 3 % capacity move rewrote 209 trips on the author's install** during the v0.8.37 work — any hand-edit among them would have gone with them, with nothing in the log to say so.
+
+`set_trip` can patch `energy_kwh`, `consumption_kwh_100km` and `cost`, so all three were reachable. A correction through that path now locks what it corrected, stickily, and every heal write respects it:
+
+- `_recompute_energy_from_capacity` — skips locked rows entirely
+- the missing-energy backfill inside the cost heal — same
+- the v0.5.13 poison reset, which nulls energy on trips reading above 50 kWh/100 km — because on a locked row that figure is the user's, not the old regression's, and nulling it would delete the correction
+- the cost assignment — leaves a locked `cost` alone
+
+**Two flags rather than one, deliberately.** The corrections mean different things: fixing the energy *should* let the cost re-derive from the corrected figure (cost = energy × price), while a cost taken off a receipt should not be recomputed from anything. A single combined lock would freeze the cost at a value derived from the energy the user had just declared wrong.
+
+`cost_basis_per_kwh` and `cost_lifo` are deliberately left outside the lock: they are derived diagnostics describing the charge pool rather than the figure the user corrected, and freezing them would make a locked row's diagnostics permanently stale.
+
+Both flags are exposed on `recent_trips` so a card can show a row as locked, instead of leaving the user to wonder why a value stopped moving with the calibration.
+
+Three new tests: a corrected energy survives a capacity heal while an untouched trip is still healed (50 % of 70 kWh = 35.0), a corrected cost survives the cost heal, and correcting the energy leaves the cost free to re-derive. The first two were verified to fail without the locks. 342 pass.
+
 ## v0.8.44 — 2026-08-26
 **Fix — a charger's power is not regeneration.** Trips that overlapped a charge are excluded from the regen ratio and from the K median.
 

@@ -347,6 +347,21 @@ CREATE TABLE IF NOT EXISTS trips (
     -- to v0.5.18 mutex (trip force-closes on charging=on), but
     -- non-zero in edge cases — manual logs, force-close races, etc.
     kwh_charged_during REAL,
+    -- v0.8.45: the trip equivalent of `charges.price_locked`. Two heals
+    -- rewrite trip rows in bulk — `_recompute_energy_from_capacity`
+    -- whenever the battery calibration moves, and
+    -- `_recompute_trip_costs_from_charges` whenever the charge pool
+    -- changes — and neither had any way to know a human had already
+    -- corrected the row by hand. A capacity move of 3 % silently
+    -- overwrote 209 trips on the author's install; any hand-edit among
+    -- them would have gone with them, with nothing in the log.
+    --
+    -- Two flags, not one, because the two corrections mean different
+    -- things. Fixing the energy SHOULD let the cost re-derive from the
+    -- corrected figure (cost = energy × price); fixing the cost from a
+    -- receipt should not be recomputed from anything.
+    energy_locked INTEGER,
+    cost_locked INTEGER,
     -- v0.5.35: detection-quality flag.
     --   'live'                          → captured via vehicle_on
     --                                     transitions (precise times,
@@ -587,6 +602,10 @@ class TripRecord:
     gps_distance_km: float | None = None
     kwh_charged_before: float | None = None
     kwh_charged_during: float | None = None
+    # v0.8.45: True once a human corrected the figure by hand, which stops
+    # the bulk heals rewriting it. Same idiom as `ChargeRecord.price_locked`.
+    energy_locked: bool = False
+    cost_locked: bool = False
     confidence: str | None = None
     # v0.5.43: driver identity captured from the configured driver sensor.
     driver: str | None = None
@@ -866,6 +885,10 @@ class TripStorage:
             conn.execute("ALTER TABLE trips ADD COLUMN energy_from_power REAL")
         if "gps_distance_km" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN gps_distance_km REAL")
+        # v0.8.45: locks protecting hand corrections from the bulk heals.
+        for col in ("energy_locked", "cost_locked"):
+            if col not in trip_cols:
+                conn.execute(f"ALTER TABLE trips ADD COLUMN {col} INTEGER")
         for col in ("kwh_charged_before", "kwh_charged_during"):
             if col not in trip_cols:
                 conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
@@ -1443,6 +1466,13 @@ class TripStorage:
                 clean[k] = v
         if not clean:
             return None
+        # v0.8.45 — a hand correction locks what it corrected, so the
+        # bulk heals leave it alone. Sticky: set once, never cleared here,
+        # exactly like `charges.price_locked`.
+        if {"energy_kwh", "consumption_kwh_100km"} & clean.keys():
+            clean["energy_locked"] = 1
+        if "cost" in clean:
+            clean["cost_locked"] = 1
         cols = ", ".join(f"{k} = ?" for k in clean)
         params = [*list(clean.values()), trip_id]
         with self._connect() as conn:
@@ -3023,6 +3053,9 @@ class TripStorage:
                   -- publish.
                   AND (energy_source IS NULL
                        OR energy_source IN ('soc', 'estimated'))
+                  -- v0.8.45 — never overwrite a hand-corrected figure.
+                  -- v0.8.45 — never overwrite a hand-corrected figure.
+                  AND COALESCE(energy_locked, 0) = 0
                 """,
                 (new_capacity_kwh, new_capacity_kwh),
             )
@@ -3084,6 +3117,11 @@ class TripStorage:
                     energy_from_power = NULL
                 WHERE energy_source = 'power_integration'
                   AND consumption_kwh_100km > 50
+                  -- v0.8.45 — if a human corrected this row, the
+                  -- consumption above 50 kWh/100km is their figure, not
+                  -- the v0.5.13 regression's, and nulling it would
+                  -- delete the correction.
+                  AND COALESCE(energy_locked, 0) = 0
                 """
             ).rowcount or 0
             if poisoned:
@@ -3134,6 +3172,7 @@ class TripStorage:
                         energy_source = 'estimated'
                     WHERE (energy_kwh IS NULL OR energy_kwh <= 0)
                       AND distance_km IS NOT NULL AND distance_km > 0
+                      AND COALESCE(energy_locked, 0) = 0   -- v0.8.45
                       AND COALESCE(confidence, '') != 'orphan_odo_only'
                       -- v0.8.17 — never overwrite measured provenance. A
                       -- row that genuinely measured 0 kWh via power
@@ -3372,8 +3411,17 @@ class TripStorage:
                 if remaining > 1e-9:
                     lifo_cost += remaining * fallback_price
 
+                # v0.8.45 — a cost the user entered from a receipt is
+                # not ours to recompute. `cost_basis_per_kwh` and
+                # `cost_lifo` are left out of the lock on purpose: they
+                # are derived diagnostics describing the charge pool, not
+                # the figure the user corrected, and freezing them would
+                # make a locked row's diagnostics permanently stale.
                 cur = conn.execute(
-                    "UPDATE trips SET cost = ?, cost_basis_per_kwh = ?, "
+                    "UPDATE trips SET "
+                    "cost = CASE WHEN COALESCE(cost_locked, 0) = 0 "
+                    "            THEN ? ELSE cost END, "
+                    "cost_basis_per_kwh = ?, "
                     "cost_lifo = ? WHERE id = ?",
                     (
                         round(cost_accum, 4),
@@ -4860,6 +4908,14 @@ def _row_to_record(row: sqlite3.Row) -> TripRecord:
         gps_distance_km=row["gps_distance_km"] if "gps_distance_km" in row.keys() else None,
         kwh_charged_before=row["kwh_charged_before"] if "kwh_charged_before" in row.keys() else None,
         kwh_charged_during=row["kwh_charged_during"] if "kwh_charged_during" in row.keys() else None,
+        # `in row.keys()`, not `in row` — sqlite3.Row.__contains__ tests
+        # VALUES. See the SIM118 note in pyproject.toml.
+        energy_locked=bool(
+            row["energy_locked"] if "energy_locked" in row.keys() else 0
+        ),
+        cost_locked=bool(
+            row["cost_locked"] if "cost_locked" in row.keys() else 0
+        ),
         confidence=row["confidence"] if "confidence" in row.keys() else None,
         driver=row["driver"] if "driver" in row.keys() else None,
         ambient_temp_c=row["ambient_temp_c"] if "ambient_temp_c" in row.keys() else None,
