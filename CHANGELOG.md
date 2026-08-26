@@ -2,6 +2,30 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.37 — 2026-08-26
+**Fix — the capacity calibration can no longer claim a pack larger than the one you declared.** The upper clamp goes from `1.5 × declared` to `1.0 × declared`. The floor stays at `0.5`.
+
+The old bound let the calibration adopt 123.75 kWh on a car sold with 82.5. That is not a sanity guard: no measurement error of that size is worth adopting, and every value above the nameplate is already known to be wrong, because a pack does not gain capacity with use. Above the nameplate, the estimator is the thing that moved.
+
+This is policy rather than physics, and deliberately so. The nameplate is a user-entered setting, so a car whose real usable pack genuinely exceeds what its owner typed in is served by correcting that setting — not by having the integration invent capacity nobody declared. It keeps the failure mode legible: one number the user controls, instead of a silent upward drift through every energy, consumption and cost figure. The asymmetry with the 0.5 floor is the point — capacity loss is a real thing to measure and report, capacity gain is not.
+
+On the author's install the calibration had reached **85.16 kWh against an 82.5 kWh nameplate** and was adopted whole, inflating every SoC-derived trip by 3.2 %. A clamped value now also logs a warning: a clamped figure is otherwise indistinguishable from a measurement that happened to land on the nameplate, and the difference matters — the first means the capacity pool is biased and needs looking at.
+
+**This release rewrites history.** Moving the capacity triggers the existing energy heal, which recomputes `energy_kwh` and `consumption_kwh_100km` for SoC-derived trips. Dry-run against the author's real 60 trips before release:
+
+| | |
+|---|---|
+| rows rewritten | 41 of 60 |
+| distance covered | 2 064 km |
+| energy | 475.2 → 460.3 kWh (−14.9) |
+| aggregate consumption | 23.02 → 22.30 kWh/100 km (−3.1 %) |
+
+Rows with `energy_source` of `power_integration`, `vehicle` or `soc_plus_charge` are untouched — the first two were measured, and the third already folds a metered charge into its energy, so rescaling it by capacity alone would corrupt it. A `NULL` consumption stays `NULL`, preserving the deliberate suppressions from v0.8.15 and v0.8.17. Trips with `soc_used_pct <= 0` are skipped by an existing guard, which matters here: two such rows exist in the author's data and a rewrite would have given them negative energy. Trip costs are re-derived afterwards by the heal's existing second pass.
+
+One honest limit: this closes a 3.2 % gap, not the whole discrepancy. The integration's own 30-day average consumption sits around 22.4 kWh/100 km against 19.3-21.4 from the vehicle's own sensors; only part of that is this defect, and the rest is a difference in scope, not a bug fixed here.
+
+Tests: two new — the real 85.16-implying pool clamped to the nameplate, and a genuinely degraded pool (75 kWh implied) adopted untouched with its 90.9 % SoH, so the ceiling cannot flatten real degradation. The v0.8.36 SoH tests were rewritten: a calibration above the nameplate can no longer be the route to a >100 % reading, so they now overshoot via a cohort baseline below the nameplate, which is the remaining live path.
+
 ## v0.8.36 — 2026-08-26
 **Fix — stop publishing a battery health above 100 %, which route planners read as a pack better than new.** `sensor.<device>_battery_soh` and the `soh` field pushed to ABRP are now capped at 100.
 

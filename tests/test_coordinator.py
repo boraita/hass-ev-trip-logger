@@ -2375,6 +2375,67 @@ async def test_battery_capacity_calibrates_from_real_charges(
     assert coordinator.battery_capacity == pytest.approx(70.0)
 
 
+async def test_capacity_calibration_never_exceeds_the_nameplate(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.37 — the ceiling is the declared capacity, not 1.5× it.
+
+    The old bound allowed the calibration to claim 123.75 kWh on a car
+    sold with 82.5. That is not a sanity guard: no measurement error of
+    that size is worth adopting, and every value above the nameplate is
+    already known to be wrong, because a pack does not gain capacity
+    with use.
+
+    This is the exact case that broke the author's install: a pool
+    median of 85.16 kWh against an 82.5 kWh nameplate, adopted whole,
+    which inflated every SoC-derived trip energy by 3.2 % and went to
+    ABRP as a battery better than new.
+    """
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Six charges implying 85.164 kWh — the real pool, to the decimal.
+    for _ in range(6):
+        await coordinator.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=2),
+            ended_at=dt_util.now() - timedelta(hours=1),
+            kwh=33.214, price_per_kwh=0.3, total_cost=9.96,
+            soc_start=26.0, soc_end=65.0,   # 39 % Δ → 85.16 kWh
+        ))
+    await coordinator._async_refresh_battery_capacity()
+
+    assert coordinator.battery_capacity == pytest.approx(82.5), (
+        "clamped to the nameplate, not the 85.16 the pool asked for"
+    )
+
+
+async def test_capacity_calibration_below_the_nameplate_is_adopted(
+    hass: HomeAssistant,
+) -> None:
+    """The ceiling must not flatten a genuinely degraded pack.
+
+    The asymmetry is deliberate: capacity loss is a real thing to
+    measure and report, capacity gain is not.
+    """
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    for _ in range(6):
+        await coordinator.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=2),
+            ended_at=dt_util.now() - timedelta(hours=1),
+            kwh=37.5, price_per_kwh=0.3, total_cost=11.25,
+            soc_start=20.0, soc_end=70.0,   # 50 % Δ → 75.0 kWh
+        ))
+    await coordinator._async_refresh_battery_capacity()
+
+    assert coordinator.battery_capacity == pytest.approx(75.0)
+    assert coordinator.battery_soh_pct == pytest.approx(90.91, abs=0.01)
+
+
 async def test_soh_is_capped_at_100_but_the_overshoot_stays_visible(
     hass: HomeAssistant,
 ) -> None:
@@ -2397,22 +2458,26 @@ async def test_soh_is_capped_at_100_but_the_overshoot_stays_visible(
     entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
     coordinator = hass.data[DOMAIN][entry.entry_id]
 
-    # Six charges implying 86.625 kWh against an 82.5 kWh nameplate, i.e.
-    # a 105 % ratio — the same shape as the live 85.16/82.5 = 103.23 %.
+    # v0.8.37 closed the route this defect originally took (a calibration
+    # above the nameplate is now clamped), so the surviving one is a
+    # cohort baseline BELOW the nameplate: "observed as-new capacity for
+    # cars like yours" can sit under what the manufacturer printed, and
+    # then a perfectly legal calibration still divides out above 100 %.
+    coordinator._cohort_baseline_kwh = 78.0
     for _ in range(6):
         await coordinator.storage.async_insert_charge(ChargeRecord(
             started_at=dt_util.now() - timedelta(hours=2),
             ended_at=dt_util.now() - timedelta(hours=1),
-            kwh=43.3125, price_per_kwh=0.3, total_cost=12.99,
-            soc_start=20.0, soc_end=70.0,   # 50 % Δ → 86.625 kWh
+            kwh=41.25, price_per_kwh=0.3, total_cost=12.38,
+            soc_start=20.0, soc_end=70.0,   # 50 % Δ → 82.5 kWh
         ))
     await coordinator._async_refresh_battery_capacity()
 
-    assert coordinator.battery_capacity == pytest.approx(86.625, abs=0.01), (
+    assert coordinator.battery_capacity == pytest.approx(82.5, abs=0.01), (
         "the capacity estimate itself is untouched by this change"
     )
     assert coordinator.battery_soh_pct == 100.0, "health cannot exceed as-new"
-    assert coordinator.battery_soh_pct_raw == pytest.approx(105.0, abs=0.01), (
+    assert coordinator.battery_soh_pct_raw == pytest.approx(105.77, abs=0.01), (
         "the overshoot is the diagnostic and must not be swallowed"
     )
 
@@ -2466,12 +2531,13 @@ async def test_abrp_never_sends_a_soh_above_100(hass: HomeAssistant) -> None:
 
     entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
     coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator._cohort_baseline_kwh = 78.0
     for _ in range(6):
         await coordinator.storage.async_insert_charge(ChargeRecord(
             started_at=dt_util.now() - timedelta(hours=2),
             ended_at=dt_util.now() - timedelta(hours=1),
-            kwh=43.3125, price_per_kwh=0.3, total_cost=12.99,
-            soc_start=20.0, soc_end=70.0,   # 50 % Δ → 86.625 kWh
+            kwh=41.25, price_per_kwh=0.3, total_cost=12.38,
+            soc_start=20.0, soc_end=70.0,   # 50 % Δ → 82.5 kWh
         ))
     await coordinator._async_refresh_battery_capacity()
     assert coordinator.battery_soh_pct_raw > 100.0, "fixture must overshoot"
@@ -2494,7 +2560,7 @@ async def test_abrp_never_sends_a_soh_above_100(hass: HomeAssistant) -> None:
 
     assert sent, "no telemetry frame was built"
     assert sent[-1]["soh"] == 100.0
-    assert sent[-1]["capacity"] == pytest.approx(86.625, abs=0.01), (
+    assert sent[-1]["capacity"] == pytest.approx(82.5, abs=0.01), (
         "capacity is a separate defect, fixed separately; not silently "
         "changed by the SoH cap"
     )

@@ -384,7 +384,23 @@ _SCORE_BASELINE_BOUNDS: tuple[float, float] = (
 # corrupted charge from suggesting an impossible 200 kWh pack.
 _CAPACITY_MIN_DELTA_PCT = 30.0
 _CAPACITY_MIN_CHARGES = 5
-_CAPACITY_BOUNDS_RATIO: tuple[float, float] = (0.5, 1.5)
+# v0.8.37 — the upper bound is 1.0, not 1.5. It used to allow the
+# calibration to claim 1.5 × the nameplate, i.e. a 123.75 kWh pack on a
+# car sold with 82.5, which is not a sanity guard at all: no measurement
+# error that large is worth adopting, and every value above 1.0 is
+# already known to be wrong. A pack does not gain capacity with use, so
+# above the nameplate the estimator is the thing that moved.
+#
+# This is policy, not physics, and deliberately so: the nameplate is a
+# user-entered setting. A car whose real usable pack genuinely exceeds
+# what the owner typed in is served by correcting that setting, not by
+# having the integration invent capacity nobody declared. That keeps the
+# failure mode legible — one number the user controls — instead of a
+# silent upward drift in every energy, consumption and cost figure.
+#
+# The floor stays at 0.5: a badly degraded pack is a real thing to
+# measure, and the asymmetry is the point.
+_CAPACITY_BOUNDS_RATIO: tuple[float, float] = (0.5, 1.0)
 _CAPACITY_CHARGE_WINDOW = 30  # last N eligible charges
 # v0.8.14 — coverage-aware trust for the power-integration kWh estimate.
 # A public/DCFC session often gets only a handful of cloud-relayed power
@@ -1936,6 +1952,18 @@ class EvTripLoggerCoordinator:
             lo = self._battery_capacity_declared * _CAPACITY_BOUNDS_RATIO[0]
             hi = self._battery_capacity_declared * _CAPACITY_BOUNDS_RATIO[1]
             new_value = max(lo, min(hi, median))
+            # v0.8.37 — say so when the ceiling bites. A clamped value is
+            # indistinguishable from a measurement that happened to land
+            # on the nameplate, and the difference matters: the first
+            # means the capacity pool is biased and needs looking at.
+            if median > hi:
+                _LOGGER.warning(
+                    "Capacity calibration clamped: pool median %.2f kWh "
+                    "exceeds the %.2f kWh nameplate (source=%s, n=%d). "
+                    "A pack does not grow with use — treat the estimate "
+                    "as biased, not the battery as improved.",
+                    median, hi, source, n,
+                )
         prev = self._battery_capacity_calibrated
         changed = (
             (prev is None) != (new_value is None)
