@@ -2005,6 +2005,93 @@ async def test_km_before_sums_trips_between_consecutive_charges(
     )
 
 
+def test_plausible_efficiency_pct_refuses_the_impossible() -> None:
+    """v0.8.40 — energy into the battery cannot exceed energy delivered.
+
+    The two real rows this was written for: 1.65 kWh from 1.05 kWh
+    delivered (156.8 %) and 13.20 from 12.45 (106.0 %). Both were stored
+    as numbers and read as measurements. Outside the band the honest
+    answer is None — "one of these two figures is wrong and we do not
+    know which" — not a smaller wrong number.
+    """
+    from custom_components.ev_trip_logger.storage import (
+        plausible_efficiency_pct,
+    )
+
+    assert plausible_efficiency_pct(1.65, 1.05) is None      # 156.8 %
+    assert plausible_efficiency_pct(13.20, 12.45) is None    # 106.0 %
+    assert plausible_efficiency_pct(9.0, 20.0) is None       # 45 %, under the floor
+    # The band's edges are inclusive: 105 % is the deliberate headroom for
+    # meter resolution and ±1 % SoC quantization on a genuinely-99 %
+    # session, so it must pass rather than be rounded away.
+    assert plausible_efficiency_pct(105.0, 100.0) == pytest.approx(105.0)
+    assert plausible_efficiency_pct(50.0, 100.0) == pytest.approx(50.0)
+    assert plausible_efficiency_pct(41.25, 45.0) == pytest.approx(91.7)
+    # Nothing to divide, nothing to publish.
+    for kwh, evse in ((None, 10.0), (10.0, None), (10.0, 0.0), (0.0, 10.0)):
+        assert plausible_efficiency_pct(kwh, evse) is None
+
+
+async def test_correcting_a_charge_cannot_mint_an_impossible_efficiency(
+    storage: TripStorage,
+) -> None:
+    """The guard has to hold on the manual-correction path too.
+
+    A hand-entered invoice figure produces an impossible ratio just as
+    easily as a bad sensor, and this is the path the user actually
+    touches — the pencil on the charges row.
+    """
+    charge_id = await storage.async_insert_charge(_charge(
+        kwh=13.2, soc_start=83.0, soc_end=99.0, evse_energy_kwh=14.9,
+    ))
+    # 13.2 / 12.45 = 106.0 %: impossible, so no efficiency is recorded.
+    patched = await storage.async_patch_charge(
+        charge_id, {"evse_energy_kwh": 12.45},
+    )
+    assert patched is not None
+    assert patched.evse_energy_kwh == pytest.approx(12.45), (
+        "the meter/invoice figure is kept — only the ratio is refused"
+    )
+    assert patched.charging_efficiency_pct is None
+
+    # A plausible correction still records normally.
+    fixed = await storage.async_patch_charge(
+        charge_id, {"evse_energy_kwh": 14.5},
+    )
+    assert fixed is not None
+    assert fixed.charging_efficiency_pct == pytest.approx(91.0, abs=0.1)
+
+
+async def test_startup_clears_stored_impossible_efficiencies(
+    storage: TripStorage,
+) -> None:
+    """v0.8.40 — rows written before the guard are cleaned on open.
+
+    Written by reaching past the API into the table, because that is the
+    only way to reproduce a pre-v0.8.40 row: every current write path
+    now refuses the value.
+    """
+    charge_id = await storage.async_insert_charge(_charge(
+        kwh=1.65, soc_start=46.0, soc_end=48.0, evse_energy_kwh=1.05,
+    ))
+    with storage._connect() as conn:
+        conn.execute(
+            "UPDATE charges SET charging_efficiency_pct = 156.8 WHERE id = ?",
+            (charge_id,),
+        )
+    dirty = await storage.async_get_charge_by_id(charge_id)
+    assert dirty is not None
+    assert dirty.charging_efficiency_pct == pytest.approx(156.8)
+
+    await storage.async_init()          # re-runs the migrations
+
+    clean = await storage.async_get_charge_by_id(charge_id)
+    assert clean is not None
+    assert clean.charging_efficiency_pct is None
+    assert clean.kwh == pytest.approx(1.65), "the inputs are not touched"
+    assert clean.evse_energy_kwh == pytest.approx(1.05)
+
+
 async def test_min_before_measures_driving_time_not_distance(
     storage: TripStorage,
 ) -> None:

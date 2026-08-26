@@ -107,7 +107,13 @@ from .const import (
     EVENT_TRIP_ENDED,
     EVENT_TRIP_STARTED,
 )
-from .storage import ChargeRecord, TripRecord, TripStorage, period_start
+from .storage import (
+    ChargeRecord,
+    TripRecord,
+    TripStorage,
+    period_start,
+    plausible_efficiency_pct,
+)
 from .calc import (
     INVALID_STATES,
     haversine_km,
@@ -5822,9 +5828,24 @@ class EvTripLoggerCoordinator:
                     is_dcfc = avg_kw > self._dcfc_threshold_kw
 
         # v0.5.90 — AC→DC efficiency from the EVSE-side integral.
-        charging_eff_pct: float | None = None
-        if evse_energy_kwh is not None and evse_energy_kwh > 0:
-            charging_eff_pct = round(kwh / evse_energy_kwh * 100.0, 1)
+        # v0.8.40 — routed through the plausibility band instead of
+        # storing whatever the division produced. A ratio above 100 %
+        # means more energy reached the battery than the charger
+        # delivered, which cannot happen; storing it as a number
+        # published a false measurement to every consumer of the column.
+        charging_eff_pct = plausible_efficiency_pct(kwh, evse_energy_kwh)
+        if (
+            charging_eff_pct is None
+            and evse_energy_kwh is not None
+            and evse_energy_kwh > 0
+            and kwh > 0
+        ):
+            _LOGGER.warning(
+                "Charge efficiency not stored: %.3f kWh battery from "
+                "%.3f kWh delivered is %.1f %%, outside the plausible "
+                "band — one of the two figures is wrong.",
+                kwh, evse_energy_kwh, kwh / evse_energy_kwh * 100.0,
+            )
         charge_lat, charge_lon = self._current_lat_lon()
         record = ChargeRecord(
             started_at=started_at,

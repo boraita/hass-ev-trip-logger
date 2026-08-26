@@ -98,6 +98,42 @@ _CHARGE_TRIP_BOUNDARY_TOLERANCE_S: int = 60
 _EFFICIENCY_MIN_PCT: float = 50.0
 _EFFICIENCY_MAX_PCT: float = 105.0
 
+
+def plausible_efficiency_pct(
+    kwh: float | None, evse_energy_kwh: float | None
+) -> float | None:
+    """`kwh / evse × 100`, or None when the pair cannot be an efficiency.
+
+    v0.8.40 — the band above existed only as a READ filter, excluding bad
+    rows from the rolling median. The rows themselves were still written
+    with whatever the division produced, so a charge could sit in the
+    history reading **156.8 %** — more energy into the battery than the
+    charger delivered — and every consumer that reads the column directly
+    (the charges list, a template, a card) presented it as a measurement.
+
+    A ratio outside the band is not a bad efficiency. It is the statement
+    "one of these two figures is wrong and we do not know which", and
+    None is the only honest record of that. `evse_energy_kwh` is left
+    intact: it may still be a correct invoice or meter reading, and it is
+    used for costing — only the derived ratio is unpublishable.
+
+    Every write path routes through here, including the manual
+    corrections, because a hand-entered invoice figure can mint an
+    impossible ratio just as easily as a bad sensor.
+    """
+    if kwh is None or evse_energy_kwh is None:
+        return None
+    try:
+        kwh_f, evse_f = float(kwh), float(evse_energy_kwh)
+    except (TypeError, ValueError):
+        return None
+    if evse_f <= 0 or kwh_f <= 0:
+        return None
+    pct = round(kwh_f / evse_f * 100.0, 1)
+    if pct < _EFFICIENCY_MIN_PCT or pct > _EFFICIENCY_MAX_PCT:
+        return None
+    return pct
+
 # v0.8.38 — RETIRED. This gated the v0.8.30 `metered` capacity tier, and
 # it has to stay documented rather than merely deleted, because the
 # argument for it is persuasive and wrong.
@@ -940,6 +976,22 @@ class TripStorage:
         for col in ("charge_lat", "charge_lon"):
             if col not in charge_cols:
                 conn.execute(f"ALTER TABLE charges ADD COLUMN {col} REAL")
+        # v0.8.40: clear efficiencies that were never physically possible.
+        # Until this release the plausibility band was only a read filter,
+        # so rows were stored with whatever the division produced — the
+        # author's history carried one at 156.8 % (1.65 kWh into the
+        # battery from 1.05 kWh delivered) and one at 106.0 %. Every
+        # consumer reading the column directly showed those as measured
+        # facts. Idempotent, and it only nulls the derived ratio: `kwh`
+        # and `evse_energy_kwh` are left exactly as they were, because
+        # one of them is wrong and this migration cannot tell which.
+        conn.execute(
+            "UPDATE charges SET charging_efficiency_pct = NULL "
+            "WHERE charging_efficiency_pct IS NOT NULL "
+            "  AND (charging_efficiency_pct > ? "
+            "       OR charging_efficiency_pct < ?)",
+            (_EFFICIENCY_MAX_PCT, _EFFICIENCY_MIN_PCT),
+        )
         # v0.5.0: trip_positions table for route-map drilldown.
         conn.execute(
             """
@@ -2461,20 +2513,18 @@ class TripStorage:
                     "SELECT kwh, evse_energy_kwh FROM charges WHERE id = ?",
                     (charge_id,),
                 ).fetchone()
-                if (
-                    row is not None
-                    and row["evse_energy_kwh"] is not None
-                    and float(row["evse_energy_kwh"]) > 0
-                    and row["kwh"] is not None
-                ):
-                    eff = round(
-                        float(row["kwh"]) / float(row["evse_energy_kwh"]) * 100.0,
-                        1,
-                    )
+                if row is not None:
+                    # v0.8.40 — an implausible ratio is stored as NULL,
+                    # not as a number. See `plausible_efficiency_pct`.
                     conn.execute(
                         "UPDATE charges SET charging_efficiency_pct = ? "
                         "WHERE id = ?",
-                        (eff, charge_id),
+                        (
+                            plausible_efficiency_pct(
+                                row["kwh"], row["evse_energy_kwh"]
+                            ),
+                            charge_id,
+                        ),
                     )
             row = conn.execute(
                 "SELECT * FROM charges WHERE id = ?", (charge_id,),
@@ -2518,8 +2568,10 @@ class TripStorage:
                 if evse_energy_kwh is not None
                 else row["evse_energy_kwh"]
             )
+            # v0.8.40 — guarded: correcting a charge's invoiced kWh must
+            # not be able to mint an impossible efficiency either.
             new_eff = (
-                round(kwh / new_evse_kwh * 100.0, 1)
+                plausible_efficiency_pct(kwh, new_evse_kwh)
                 if new_evse_kwh is not None and kwh and float(new_evse_kwh) > 0
                 else row["charging_efficiency_pct"]
             )
@@ -2605,8 +2657,10 @@ class TripStorage:
                 if evse_energy_kwh is not None
                 else row["evse_energy_kwh"]
             )
+            # v0.8.40 — guarded: correcting a charge's invoiced kWh must
+            # not be able to mint an impossible efficiency either.
             new_eff = (
-                round(kwh / new_evse_kwh * 100.0, 1)
+                plausible_efficiency_pct(kwh, new_evse_kwh)
                 if new_evse_kwh is not None and kwh and float(new_evse_kwh) > 0
                 else row["charging_efficiency_pct"]
             )
@@ -3279,10 +3333,8 @@ class TripStorage:
                 new_evse = round(cur_evse + float(extra_evse_kwh), 3)
             else:
                 new_evse = cur_evse if cur_evse > 0 else None
-            new_eff = (
-                round(new_kwh / new_evse * 100.0, 1)
-                if new_evse and new_evse > 0 else None
-            )
+            # v0.8.40 — guarded like every other write path.
+            new_eff = plausible_efficiency_pct(new_kwh, new_evse)
             # v0.6.0 — peak power survives merges: keep the max of the
             # existing row's value and the new pulse's peak.
             cur_peak = (
