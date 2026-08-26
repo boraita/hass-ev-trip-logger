@@ -1093,6 +1093,44 @@ class EvTripLoggerCoordinator:
         return self._battery_capacity_declared
 
     @property
+    def battery_soh_pct_raw(self) -> float | None:
+        """v0.8.36 — the calibration's own opinion of pack health, uncapped.
+
+        Kept separate from `battery_soh_pct` so an over-estimating
+        calibration stays visible as a diagnostic instead of being
+        silently rounded down to a healthy-looking 100 %. None until a
+        calibration exists.
+        """
+        baseline = self.battery_capacity_baseline
+        if self._battery_capacity_calibrated is None or baseline <= 0:
+            return None
+        return round(self._battery_capacity_calibrated / baseline * 100.0, 2)
+
+    @property
+    def battery_soh_pct(self) -> float:
+        """v0.8.36 — pack health in %, capped at 100.
+
+        A usable pack does not hold more energy than it did new, so a
+        reading above 100 % is never a measurement — it is the capacity
+        estimator running high, and publishing it as health inverts its
+        meaning: a route planner fed 103 % reads it as a battery 3 %
+        BETTER than new and plans a longer range than the car has.
+
+        That is not hypothetical. This install published 103.23 % (an
+        85.16 kWh calibration against an 82.5 kWh nameplate) while the
+        wall-meter evidence bounded the real pack at 79.8-83.4 kWh, and
+        the figure went to A Better Route Planner on every telemetry
+        push. Capping here is a floor under the damage, not a fix for
+        the estimator: `battery_soh_pct_raw` still carries the overshoot
+        so it can be seen and diagnosed.
+
+        Reads 100 % before any calibration exists, which is the honest
+        answer for a pack we have not measured yet.
+        """
+        raw = self.battery_soh_pct_raw
+        return 100.0 if raw is None else min(100.0, raw)
+
+    @property
     def vehicle_model_key(self) -> str | None:
         """Picked cohort key, or None when the user hasn't selected one."""
         return self._vehicle_model_key
@@ -3601,12 +3639,10 @@ class EvTripLoggerCoordinator:
         # would be misleading; the calibrated figure is grounded in this
         # vehicle's own observed charge behaviour and gracefully reads
         # 100 % before enough charges have accumulated to calibrate.
-        baseline = self.battery_capacity_baseline
-        soh = (
-            round(self.battery_capacity / baseline * 100.0, 2)
-            if baseline > 0
-            else None
-        )
+        # v0.8.36 — capped at 100 (see `battery_soh_pct`). ABRP reads a
+        # SoH above 100 as a pack better than new and plans a longer
+        # range than the car has; this install was sending 103.23.
+        soh = self.battery_soh_pct if self.battery_capacity_baseline > 0 else None
         kwh_charged = (
             self.current_charge.energy_added_kwh
             if self.current_charge is not None

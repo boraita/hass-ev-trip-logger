@@ -2375,6 +2375,131 @@ async def test_battery_capacity_calibrates_from_real_charges(
     assert coordinator.battery_capacity == pytest.approx(70.0)
 
 
+async def test_soh_is_capped_at_100_but_the_overshoot_stays_visible(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.36 — a pack never holds more than it did new.
+
+    A calibration above the baseline is the estimator running high, not a
+    battery that improved, and publishing it as health inverts the
+    meaning: a route planner fed 103 % reads a pack 3 % BETTER than new
+    and plans a longer range than the car has. That happened on the
+    author's install — 85.16 kWh calibrated against an 82.5 kWh
+    nameplate, pushed to ABRP as 103.23 % on every telemetry frame while
+    wall-meter evidence bounded the real pack at 79.8-83.4 kWh.
+
+    Capping is a floor under the damage, not a fix for the estimator, so
+    the uncapped ratio has to survive somewhere: it is the single best
+    signal that the calibration is wrong.
+    """
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    # Six charges implying 86.625 kWh against an 82.5 kWh nameplate, i.e.
+    # a 105 % ratio — the same shape as the live 85.16/82.5 = 103.23 %.
+    for _ in range(6):
+        await coordinator.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=2),
+            ended_at=dt_util.now() - timedelta(hours=1),
+            kwh=43.3125, price_per_kwh=0.3, total_cost=12.99,
+            soc_start=20.0, soc_end=70.0,   # 50 % Δ → 86.625 kWh
+        ))
+    await coordinator._async_refresh_battery_capacity()
+
+    assert coordinator.battery_capacity == pytest.approx(86.625, abs=0.01), (
+        "the capacity estimate itself is untouched by this change"
+    )
+    assert coordinator.battery_soh_pct == 100.0, "health cannot exceed as-new"
+    assert coordinator.battery_soh_pct_raw == pytest.approx(105.0, abs=0.01), (
+        "the overshoot is the diagnostic and must not be swallowed"
+    )
+
+
+async def test_soh_below_100_is_published_unchanged(
+    hass: HomeAssistant,
+) -> None:
+    """The cap must not touch a real degradation reading.
+
+    A one-sided clamp that also flattened genuine losses would hide the
+    thing the sensor exists to report.
+    """
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 100.0})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    for _ in range(6):
+        await coordinator.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=2),
+            ended_at=dt_util.now() - timedelta(hours=1),
+            kwh=54.0, price_per_kwh=0.2, total_cost=10.8,
+            soc_start=10.0, soc_end=70.0,   # 90 kWh implied
+        ))
+    await coordinator._async_refresh_battery_capacity()
+
+    assert coordinator.battery_soh_pct == pytest.approx(90.0)
+    assert coordinator.battery_soh_pct_raw == pytest.approx(90.0)
+
+
+async def test_soh_reads_100_before_any_calibration_exists(
+    hass: HomeAssistant,
+) -> None:
+    """No calibration is "not measured yet", not "degraded"."""
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator.battery_soh_pct == 100.0
+    assert coordinator.battery_soh_pct_raw is None, (
+        "None, not 100: nothing has been measured to compare against"
+    )
+
+
+async def test_abrp_never_sends_a_soh_above_100(hass: HomeAssistant) -> None:
+    """The payload is the whole reason the cap exists.
+
+    ABRP holds its own as-new figure for the car model; a SoH above 100
+    tells it this pack beats that, and it plans accordingly. This pins
+    the field at its source rather than trusting the sensor to be the
+    only consumer.
+    """
+    from custom_components.ev_trip_logger.storage import ChargeRecord
+
+    entry = await _setup(hass, **{CONF_BATTERY_CAPACITY: 82.5})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    for _ in range(6):
+        await coordinator.storage.async_insert_charge(ChargeRecord(
+            started_at=dt_util.now() - timedelta(hours=2),
+            ended_at=dt_util.now() - timedelta(hours=1),
+            kwh=43.3125, price_per_kwh=0.3, total_cost=12.99,
+            soc_start=20.0, soc_end=70.0,   # 50 % Δ → 86.625 kWh
+        ))
+    await coordinator._async_refresh_battery_capacity()
+    assert coordinator.battery_soh_pct_raw > 100.0, "fixture must overshoot"
+
+    sent: list[dict] = []
+
+    class _CaptureClient:
+        async def send(self, tlm: dict) -> bool:
+            sent.append(tlm)
+            return True
+
+    # SoC is the one field the push refuses to send without.
+    hass.states.async_set("sensor.fake_battery", "50.0")
+    coordinator._battery = "sensor.fake_battery"
+    coordinator._abrp = _CaptureClient()
+    coordinator.abrp_push_enabled = True
+    coordinator._abrp_last_send = 0.0
+    coordinator._abrp_interval_s = 0
+    await coordinator._async_maybe_send_abrp()
+
+    assert sent, "no telemetry frame was built"
+    assert sent[-1]["soh"] == 100.0
+    assert sent[-1]["capacity"] == pytest.approx(86.625, abs=0.01), (
+        "capacity is a separate defect, fixed separately; not silently "
+        "changed by the SoH cap"
+    )
+
+
 async def test_battery_capacity_clamped_to_declared_bounds(
     hass: HomeAssistant,
 ) -> None:
