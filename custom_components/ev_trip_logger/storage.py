@@ -685,6 +685,12 @@ class ChargeRecord:
     # on its neighbour. `_recent_charges` fills it; everywhere else it is
     # None.
     km_before: float | None = field(default=None, compare=False)
+    # v0.8.35 — minutes of driving in that same gap, the companion to
+    # km_before. Distance and time are not interchangeable here: 200 km of
+    # motorway warms the pack far more than 200 km of town driving spread
+    # over a whole day, and only the pair can tell those apart. Derived on
+    # read for the same reason km_before is, and filled in the same place.
+    min_before: float | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2147,8 +2153,10 @@ class TripStorage:
             # closed inside that gap. Computed over the whole table, not
             # just this window, so the oldest charge in the window still
             # sees the charge before it.
-            km = {
-                r["id"]: r["km_before"]
+            # v0.8.35 — the same gap also yields the driving *minutes*,
+            # summed from the same joined trips, so it costs nothing extra.
+            gap = {
+                r["id"]: (r["km_before"], r["min_before"])
                 for r in conn.execute(
                     """
                     WITH bounds AS (
@@ -2159,7 +2167,8 @@ class TripStorage:
                         FROM charges
                     )
                     SELECT b.id AS id,
-                           COALESCE(SUM(t.distance_km), 0) AS km_before
+                           COALESCE(SUM(t.distance_km), 0) AS km_before,
+                           COALESCE(SUM(t.duration_min), 0) AS min_before
                     FROM bounds b
                     LEFT JOIN trips t
                         ON t.ended_at > b.prev_end
@@ -2172,7 +2181,7 @@ class TripStorage:
         out: list[ChargeRecord] = []
         for r in rows:
             rec = _row_to_charge(r)
-            rec.km_before = km.get(r["id"])
+            rec.km_before, rec.min_before = gap.get(r["id"], (None, None))
             out.append(rec)
         return out
 

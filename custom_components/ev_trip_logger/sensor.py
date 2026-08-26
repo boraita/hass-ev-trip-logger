@@ -1205,6 +1205,9 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         # ChargeRecord.km_before); None elsewhere, not zero, so a
         # template can tell "no data" from "the car did not move".
         "km_before": _r(getattr(charge, "km_before", None), 1),
+        # v0.8.35 — driving minutes in the same gap. Same population rule
+        # and same None-vs-zero distinction as km_before.
+        "min_before": _r(getattr(charge, "min_before", None), 0),
     }
 
 

@@ -1936,6 +1936,69 @@ async def test_km_before_sums_trips_between_consecutive_charges(
     )
 
 
+async def test_min_before_measures_driving_time_not_distance(
+    storage: TripStorage,
+) -> None:
+    """v0.8.35 — the gap also reports how long the car was driving.
+
+    Distance and time are not interchangeable inputs. The same 150 km
+    covered in 90 minutes of motorway leaves the pack hot; covered in
+    four hours of town driving it does not. This fixture gives two
+    charges identical `km_before` and different `min_before` so a
+    regression that derived one from the other would fail here.
+    """
+    base = dt_util.now() - timedelta(days=3)
+
+    async def charge(hours: float) -> None:
+        await storage.async_insert_charge(_charge(
+            started_at=base + timedelta(hours=hours),
+            ended_at=base + timedelta(hours=hours, minutes=20),
+            kwh=30.0,
+        ))
+
+    async def trip(hours: float, km: float, minutes: float) -> None:
+        await storage.async_insert(TripRecord(
+            started_at=base + timedelta(hours=hours),
+            ended_at=base + timedelta(hours=hours, minutes=minutes),
+            duration_min=minutes, distance_km=km, energy_kwh=km * 0.2,
+        ))
+
+    await charge(0)
+    await trip(1, 150.0, 90.0)          # motorway
+    await charge(4)
+    await trip(6, 75.0, 120.0)          # town, half the distance
+    await trip(9, 75.0, 120.0)          # ... twice
+    await charge(12)
+
+    recent = await storage.async_recent_charges(limit=10)
+    assert [c.km_before for c in recent] == [
+        pytest.approx(150.0), pytest.approx(150.0), None,
+    ], "both windows cover the same distance on purpose"
+    assert [c.min_before for c in recent] == [
+        pytest.approx(240.0), pytest.approx(90.0), None,
+    ], "the time is what separates them"
+
+
+async def test_min_before_is_zero_not_none_when_the_car_did_not_move(
+    storage: TripStorage,
+) -> None:
+    """Same None-vs-zero rule as km_before, for the same reason.
+
+    Zero minutes of driving before a charge is a real observation — the
+    pack arrived cold. `None` means there was no previous charge to
+    measure a window from.
+    """
+    base = dt_util.now() - timedelta(days=1)
+    for h in (0, 4):
+        await storage.async_insert_charge(_charge(
+            started_at=base + timedelta(hours=h),
+            ended_at=base + timedelta(hours=h, minutes=30),
+            kwh=10.0,
+        ))
+    recent = await storage.async_recent_charges(limit=5)
+    assert [c.min_before for c in recent] == [pytest.approx(0.0), None]
+
+
 async def test_km_before_is_zero_not_none_when_the_car_did_not_move(
     storage: TripStorage,
 ) -> None:

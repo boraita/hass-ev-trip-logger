@@ -4284,6 +4284,7 @@ async def test_charge_attrs_expose_rate_and_context(hass: HomeAssistant) -> None
         evse_energy_kwh=16.3, charging_efficiency_pct=81.2,
     )
     rec.km_before = 197.0
+    rec.min_before = 143.0
     attr = _charge_to_attr(rec)
 
     assert attr["duration_min"] == pytest.approx(21.0)
@@ -4292,6 +4293,7 @@ async def test_charge_attrs_expose_rate_and_context(hass: HomeAssistant) -> None
     assert attr["peak_charge_power_kw"] == pytest.approx(40.4)
     assert attr["temperature_c"] == pytest.approx(28.4)
     assert attr["km_before"] == pytest.approx(197.0)
+    assert attr["min_before"] == pytest.approx(143.0)
 
 
 async def test_charge_attrs_survive_a_charge_with_no_start_time(
@@ -4316,6 +4318,7 @@ async def test_charge_attrs_survive_a_charge_with_no_start_time(
     assert attr["avg_power_kw"] is None
     assert attr["peak_charge_power_kw"] is None
     assert attr["km_before"] is None
+    assert attr["min_before"] is None
     assert attr["kwh"] == pytest.approx(20.0)
 
 
