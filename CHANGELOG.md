@@ -2,6 +2,28 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.38 — 2026-08-26
+**Fix — charging efficiency no longer selects which charges the capacity calibration learns from.** The `metered` tier added in v0.8.30 is retired; `grounded` (every power-integration charge) is the top pool again.
+
+The retired argument was persuasive, which is why it is kept written down next to the dead constant rather than deleted. It went: `kwh` is the shared numerator of both charging efficiency and the capacity sample, so when the power integration misses samples both drop together — sessions at 76-83 % efficiency implied a 76-78 kWh pack while sessions at 91-97 % implied 87-90 kWh, for the same physical battery. A real DC session runs 92-97 % and an AC one 88-93 %, so below 88 % the shortfall looked like it had to be in the measurement.
+
+What it misses is that the shared numerator makes efficiency an instrument on the quantity being estimated, not a check on it. For a fixed meter reading and SoC window, "high efficiency" and "high implied capacity" are the same statement — so the gate deleted the low tail of the capacity distribution and kept the high one. Measured across the ten charges in the author's history that carry a meter reading:
+
+| | n | mean implied capacity |
+|---|---|---|
+| admitted by the gate | 6 | **85.56 kWh** |
+| rejected by the gate | 4 | **79.36 kWh** |
+
+r(efficiency, implied capacity) = **+0.80**. The gate removed 6.2 kWh of downside and none of the upside, and the pool it produced (n=5, median 85.16 kWh) sat above both the nameplate and an independent wall-meter bound of 79.8-83.4 kWh — while the unfiltered pool (n=8, median 84.50) sat closer to it. Admitting the low samples moves the estimate toward the truth.
+
+Measured on the live install, before and after: **n=5 median 85.15 → n=8 median 84.50**, which the v0.8.37 ceiling then clamps to the 82.5 kWh nameplate.
+
+Under-integration remains a real failure mode, and this release does not fix it — it stops paying for it with a biased estimate. Detecting it needs a statistic that does not contain `kwh`, such as the coverage of power samples across a session. Until one exists, no gate beats a one-sided gate.
+
+The `metered` label stays documented because stored capacity history from v0.8.30-v0.8.37 still carries it, but nothing produces it now.
+
+Tests: `test_metered_tier_wins_and_excludes_under_integrated_charges` asserted the opposite of this release, and its fixture is the clearest statement of why it was wrong — every charge in it shares one meter reading and one SoC window, so `kwh` is the only thing that varies, and the test could not distinguish "the gate finds good measurements" from "the gate keeps the high numbers". It was rewritten to the reverse invariant rather than deleted, and the comment explains the trap. Two more added: a low-efficiency charge must still pull the median down (the cost of this change, pinned deliberately), and no pool may ever be labelled `metered` again. 323 pass.
+
 ## v0.8.37 — 2026-08-26
 **Fix — the capacity calibration can no longer claim a pack larger than the one you declared.** The upper clamp goes from `1.5 × declared` to `1.0 × declared`. The floor stays at `0.5`.
 
