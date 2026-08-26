@@ -2,6 +2,21 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.40 — 2026-08-26
+**Fix — a charging efficiency that cannot physically happen is no longer stored as if it were measured.** Every write path routes through a new `plausible_efficiency_pct`, and a startup migration clears rows written before it.
+
+Energy reaching the battery can never exceed what the charger delivered, so a `charging_efficiency_pct` above 100 % is impossible. The plausibility band (50-105 %, the headroom covering meter resolution and ±1 % SoC quantization on a genuinely-99 % session) has existed since v0.8.29 — but only as a **read filter**, excluding bad rows from the rolling median. The rows themselves were written with whatever the division produced.
+
+The author's history carried two: **156.8 %** (1.65 kWh into the battery from 1.05 kWh delivered) and **106.0 %** (13.20 from 12.45). The rolling average was protected; every consumer reading the column directly — the charges list, a template, a dashboard card — showed them as measured facts.
+
+Outside the band the honest record is `None`, not a smaller wrong number: the ratio being impossible means *one of the two figures is wrong and we do not know which*. `evse_energy_kwh` is deliberately left intact, because it may well be the correct invoice or meter reading and it is used for costing — only the derived ratio is unpublishable. The charge-close path also logs a warning naming both figures, so a persistently bad sensor is findable.
+
+All four write paths are covered, including the two manual-correction ones. That matters more than the sensor case: a hand-entered invoice figure mints an impossible ratio just as easily, and the correction pencil on the charges row is the path a user actually touches.
+
+The startup migration (`UPDATE charges SET charging_efficiency_pct = NULL` outside the band) is idempotent and touches only the derived column.
+
+Tests: three new, and all three were **verified to fail with the guard disabled** before being committed. The band's edges are asserted inclusive — 105 % is deliberate headroom and must pass rather than be rounded away, which is also where the first draft of these tests was wrong: it claimed 50 % should be refused when 50 % is the floor and passes by design. The migration test reaches past the API into the table, because that is now the only way to produce a pre-v0.8.40 row.
+
 ## v0.8.39 — 2026-08-26
 **Fix — the band that decides whether a charge measurement is trustworthy no longer moves with the estimate that measurement feeds.** It is now anchored on the declared capacity instead of the calibrated one.
 
