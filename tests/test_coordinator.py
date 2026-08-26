@@ -627,6 +627,60 @@ async def test_charge_energy_prefers_power_integration_with_good_coverage(
     assert coordinator.last_charge.energy_source == "power_integration"
 
 
+def test_a_meter_that_recorded_zero_is_evidence_not_silence() -> None:
+    """v0.8.42 — the bug the v0.8.41 backfill shipped with.
+
+    `_integrate_evse_from_recorder` returns None for two situations that
+    are nothing alike: no usable samples, and a sensor that recorded the
+    whole session and never delivered a watt. v0.8.41 treated both as "no
+    evidence" and skipped, but the second is the STRONGEST evidence that
+    the stored figure came from somewhere other than this meter.
+
+    Measured live after that release: 34 of 35 rows went unlabelled,
+    because the author's wallbox records continuously through every away
+    session and integrates to exactly 0.00 kWh — the common case, not an
+    edge case.
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        EvTripLoggerCoordinator as C,
+    )
+
+    # A wallbox recording through a 36 kWh away session, delivering
+    # nothing: that figure is an operator invoice.
+    assert C._decide_evse_source(36.16, None, sample_count=240) == "invoice"
+    assert C._decide_evse_source(36.16, 0.0, sample_count=240) == "invoice"
+    # The replay reproduces the figure → the sensor produced it. 15.74 is
+    # the author's one home session, matched to three decimals.
+    assert C._decide_evse_source(15.74, 15.74, sample_count=240) == "meter"
+    assert C._decide_evse_source(15.74, 15.60, sample_count=240) == "meter"
+    # Fewer than two samples cannot be integrated over: genuinely unknown,
+    # which is different from zero and must stay unlabelled.
+    assert C._decide_evse_source(36.16, None, sample_count=1) is None
+    assert C._decide_evse_source(36.16, None, sample_count=0) is None
+    # Saw something that is not this figure — labelling that is how the
+    # v0.8.30 "metered" pool went wrong.
+    assert C._decide_evse_source(36.16, 20.0, sample_count=240) is None
+
+
+def test_provenance_tolerance_scales_with_the_figure() -> None:
+    """A fixed kWh tolerance would misjudge both ends of the range.
+
+    The author's home sessions run from 1.05 to 43.25 kWh, so the band
+    has to be a ratio — with an absolute floor, because 10 % of 1.05 kWh
+    is finer than recorder resampling can resolve.
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        EvTripLoggerCoordinator as C,
+    )
+
+    # Small session: the 0.25 kWh floor carries it, 10 % would not.
+    assert C._decide_evse_source(1.05, 0.90, sample_count=60) == "meter"
+    # Large session: 10 % of 43.25 is 4.3, so a 2 kWh gap still matches.
+    assert C._decide_evse_source(43.25, 41.25, sample_count=60) == "meter"
+    # But not a gap of half the session.
+    assert C._decide_evse_source(43.25, 21.0, sample_count=60) is None
+
+
 async def test_acceptance_band_is_anchored_on_declared_not_calibrated(
     hass: HomeAssistant,
 ) -> None:

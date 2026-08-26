@@ -2,6 +2,19 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.42 — 2026-08-26
+**Fix — a meter that recorded zero is evidence, not silence.** The v0.8.41 provenance backfill labelled 1 row of 35 on the author's install; this fixes the case it was actually built for.
+
+`_integrate_evse_from_recorder` returns `None` for two situations that are nothing alike: no usable samples at all, and a sensor that recorded continuously through the whole session and never delivered a watt. v0.8.41's backfill read both as "no evidence" and skipped — but the second is the **strongest** evidence available that the stored figure came from somewhere other than this meter.
+
+It is also the common case, not an edge case: the author's wallbox records right through every away session and integrates to exactly 0.00 kWh, which is why 34 of 35 rows went unlabelled. Exactly the measurement that motivated the release was the one it could not make.
+
+A `None` with at least two samples to integrate over is now read as a genuine zero. Fewer than two samples really is no evidence and still returns nothing, because unknown and zero are different answers.
+
+The decision moved out of the backfill loop into a pure `_decide_evse_source(stored, replayed, sample_count)`. That is the substantive part of this fix: the original was three branches tangled with a recorder query and a database write, so it was untestable without mocking the recorder, and the defect lived in the one branch that never ran in a test. Made pure, it takes two tests and no mocks.
+
+Two new tests, covering the zero-is-invoice case in both spellings (`None` and `0.0`), the replay-reproduces-figure case at the author's real 15.74 kWh, both too-few-samples cases, the saw-something-else case that must stay unlabelled, and the tolerance scaling — the home sessions run 1.05 to 43.25 kWh, so the band has to be a ratio with an absolute floor, since 10 % of 1.05 kWh is finer than recorder resampling can resolve.
+
 ## v0.8.41 — 2026-08-26
 **Feat — charges now record HOW their EVSE energy figure arrived.** New `evse_source` on `recent_charges`: `meter`, `invoice`, or `None`.
 

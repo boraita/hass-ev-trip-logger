@@ -1561,22 +1561,13 @@ class EvTripLoggerCoordinator:
                 result.get(self._evse_power_sensor, [])
                 if isinstance(result, dict) else []
             )
-            if not states:
-                continue          # purged; no evidence either way
             replayed = self._integrate_evse_from_recorder(
                 evse_states=states, charge_states=[],
                 window_start=started, window_end=ended,
             )
-            if replayed is None:
+            source = self._decide_evse_source(stored, replayed, len(states))
+            if source is None:
                 continue
-            if abs(replayed - stored) <= max(
-                _EVSE_SOURCE_MATCH_ABS_KWH, _EVSE_SOURCE_MATCH_RATIO * stored
-            ):
-                source = "meter"
-            elif replayed <= _EVSE_SOURCE_MATCH_RATIO * stored:
-                source = "invoice"
-            else:
-                continue          # saw something, but not this figure
             try:
                 await self.storage.async_set_evse_source(int(row["id"]), source)
                 labelled[source] += 1
@@ -6400,6 +6391,41 @@ class EvTripLoggerCoordinator:
             charge_id, evse_kwh, patched.charging_efficiency_pct,
         )
         return patched
+
+    @staticmethod
+    def _decide_evse_source(
+        stored_kwh: float, replayed_kwh: float | None, sample_count: int
+    ) -> str | None:
+        """Was a stored EVSE figure produced by the sensor, or typed in?
+
+        v0.8.42 — split out of the backfill loop and made pure, because
+        the first version got the central case wrong and nothing could
+        have caught it. `_integrate_evse_from_recorder` returns None for
+        two very different situations: no usable samples at all, and a
+        sensor that was recording the whole time and never delivered a
+        watt. The backfill treated both as "no evidence" and skipped —
+        but the second one is the STRONGEST evidence available that the
+        figure came from somewhere other than this meter. On the author's
+        install it is also the common case: the wallbox recorded
+        continuously through every away session and integrated to exactly
+        0.00 kWh, and 34 of 35 rows went unlabelled because of it.
+
+        So a None with enough samples to integrate over is read as a
+        genuine zero. Fewer than two samples really is no evidence, and
+        returns None.
+        """
+        if sample_count < 2:
+            return None
+        energy = 0.0 if replayed_kwh is None else replayed_kwh
+        if abs(energy - stored_kwh) <= max(
+            _EVSE_SOURCE_MATCH_ABS_KWH, _EVSE_SOURCE_MATCH_RATIO * stored_kwh
+        ):
+            return "meter"
+        if energy <= _EVSE_SOURCE_MATCH_RATIO * stored_kwh:
+            return "invoice"
+        # The sensor saw something that is not this figure. Labelling
+        # that is exactly how the v0.8.30 "metered" pool went wrong.
+        return None
 
     @staticmethod
     def _integrate_evse_from_recorder(
