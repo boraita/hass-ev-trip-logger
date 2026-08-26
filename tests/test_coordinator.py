@@ -653,13 +653,82 @@ def test_a_meter_that_recorded_zero_is_evidence_not_silence() -> None:
     # the author's one home session, matched to three decimals.
     assert C._decide_evse_source(15.74, 15.74, sample_count=240) == "meter"
     assert C._decide_evse_source(15.74, 15.60, sample_count=240) == "meter"
-    # Fewer than two samples cannot be integrated over: genuinely unknown,
-    # which is different from zero and must stay unlabelled.
-    assert C._decide_evse_source(36.16, None, sample_count=1) is None
+    # No samples at all is purged history: genuinely unknown, which is
+    # different from zero and must stay unlabelled.
     assert C._decide_evse_source(36.16, None, sample_count=0) is None
+    # One sample with no peak information cannot be integrated over, so it
+    # stays unlabelled too. v0.8.43 adds the peak, which settles it.
+    assert C._decide_evse_source(36.16, None, sample_count=1) is None
     # Saw something that is not this figure — labelling that is how the
     # v0.8.30 "metered" pool went wrong.
     assert C._decide_evse_source(36.16, 20.0, sample_count=240) is None
+
+
+def test_a_flat_zero_sensor_arrives_as_one_state_not_a_stream() -> None:
+    """v0.8.43 — the recorder stores state CHANGES, not a stream.
+
+    A wallbox idling at 0.0 W through a 20-minute session produces a
+    single boundary row, not hundreds of samples. v0.8.42 required two
+    samples before it would read a zero, so it threw away exactly the
+    evidence the feature was built to read: measured live, 34 of 35 rows
+    stayed unlabelled and the log said "could not be decided" for every
+    away charge. This is the real shape of the author's data — one state,
+    value 0.0, against a stored 36.16 kWh.
+
+    A peak of zero settles it with no integration at all: the sensor was
+    observed across the window and never delivered a watt, so the figure
+    came from somewhere else.
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        EvTripLoggerCoordinator as C,
+    )
+
+    assert C._decide_evse_source(
+        36.16, None, sample_count=1, peak_kw=0.0
+    ) == "invoice"
+    # A single NON-zero sample cannot be integrated, and calling it an
+    # invoice would invent one out of a sensor that may have been
+    # delivering the whole time.
+    assert C._decide_evse_source(
+        36.16, None, sample_count=1, peak_kw=7.4
+    ) is None
+    # No states at all is still unknown, whatever the peak says.
+    assert C._decide_evse_source(
+        36.16, None, sample_count=0, peak_kw=0.0
+    ) is None
+    # A zero peak cannot override a replay that reproduces the figure —
+    # meter is checked first, so a 0 kWh charge stays coherent.
+    assert C._decide_evse_source(
+        0.2, 0.2, sample_count=1, peak_kw=0.0
+    ) == "meter"
+
+
+def test_evse_state_reader_handles_both_units() -> None:
+    """W and kW in the same codebase, one reader.
+
+    v0.8.43 lifted this out of the integrator so the provenance decision
+    could ask about the peak without re-implementing unit handling and
+    getting it subtly different — which is the kind of duplication that
+    produced the 156.8 % efficiency two releases ago.
+    """
+    from custom_components.ev_trip_logger.coordinator import (
+        EvTripLoggerCoordinator as C,
+    )
+
+    class _S:
+        def __init__(self, state, unit=None):
+            self.state = state
+            self.attributes = {"unit_of_measurement": unit} if unit else {}
+
+    assert C._evse_state_kw(_S("7400", "W")) == pytest.approx(7.4)
+    assert C._evse_state_kw(_S("7.4", "kW")) == pytest.approx(7.4)
+    assert C._evse_state_kw(_S("7.4")) == pytest.approx(7.4)
+    assert C._evse_state_kw(_S("-3", "kW")) == 0.0, "clamped, not negative"
+    assert C._evse_state_kw(_S("unavailable")) is None
+    assert C._evse_peak_kw([_S("0", "W"), _S("0", "W")]) == 0.0
+    assert C._evse_peak_kw([_S("0"), _S("7.4"), _S("3")]) == pytest.approx(7.4)
+    assert C._evse_peak_kw([]) is None
+    assert C._evse_peak_kw([_S("unavailable")]) is None
 
 
 def test_provenance_tolerance_scales_with_the_figure() -> None:

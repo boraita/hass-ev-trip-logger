@@ -2,6 +2,24 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.43 — 2026-08-26
+**Fix — a flat-zero sensor arrives as ONE state, not as a stream.** Home Assistant's recorder stores state *changes*, and v0.8.42 required two samples before it would read a zero.
+
+So the provenance backfill still labelled 1 row of 35 after v0.8.42, and the live log said the same thing for every away charge: *"could not be decided"*. The reason, read straight off the recorder for the window of charge 69:
+
+```
+n states = 1
+  2026-08-25T23:00:00+00:00   0.0
+```
+
+A wallbox idling at 0.0 W through a twenty-minute session produces a **single boundary row**. The premise in v0.8.41 and v0.8.42 — "the wallbox records continuously" — was wrong about how the recorder works, and it threw away precisely the evidence the feature was built to read.
+
+A peak of zero now settles it on its own, with no integration required: the sensor was observed across the window and never delivered a watt, so the stored figure came from somewhere else. The ordering matters — `meter` is still checked first, so a genuinely tiny metered charge stays coherent — and a single **non-zero** sample still returns nothing, because it cannot be integrated and calling it an invoice would invent one out of a sensor that may have been delivering the whole time. No states at all remains unknown.
+
+Also lifts the unit-aware state reader out of `_integrate_evse_from_recorder` into a shared `_evse_state_kw` / `_evse_peak_kw`, so the provenance decision can ask about the peak without re-implementing W-versus-kW handling and getting it subtly different. That kind of duplication is what produced the 156.8 % efficiency fixed in v0.8.40.
+
+Two new tests: the real one-state shape of the author's data (one sample, value 0.0, against a stored 36.16 kWh), the single-non-zero-sample case that must stay unlabelled, the zero-peak-cannot-override-a-match case, and the unit reader across W, kW, no unit, negative (clamped), and unavailable. 337 pass.
+
 ## v0.8.42 — 2026-08-26
 **Fix — a meter that recorded zero is evidence, not silence.** The v0.8.41 provenance backfill labelled 1 row of 35 on the author's install; this fixes the case it was actually built for.
 

@@ -1565,7 +1565,9 @@ class EvTripLoggerCoordinator:
                 evse_states=states, charge_states=[],
                 window_start=started, window_end=ended,
             )
-            source = self._decide_evse_source(stored, replayed, len(states))
+            source = self._decide_evse_source(
+                stored, replayed, len(states), self._evse_peak_kw(states),
+            )
             if source is None:
                 continue
             try:
@@ -6393,8 +6395,40 @@ class EvTripLoggerCoordinator:
         return patched
 
     @staticmethod
+    def _evse_state_kw(state_obj: Any) -> float | None:
+        """Power in kW from one recorder state, W or kW, or None.
+
+        v0.8.43 — lifted out of `_integrate_evse_from_recorder` so the
+        provenance decision can ask "did this sensor ever deliver
+        anything" without re-implementing the unit handling and getting
+        it subtly different.
+        """
+        try:
+            v = float(state_obj.state)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        unit = (getattr(state_obj, "attributes", None) or {}).get(
+            "unit_of_measurement"
+        ) or ""
+        if str(unit).strip().lower() in ("w", "watt", "watts"):
+            v = v / 1000.0
+        return max(0.0, v)
+
+    @classmethod
+    def _evse_peak_kw(cls, states: list) -> float | None:
+        """Highest power any of these states reports, or None if unreadable."""
+        vals = [
+            kw for kw in (cls._evse_state_kw(st) for st in states or [])
+            if kw is not None
+        ]
+        return max(vals) if vals else None
+
+    @staticmethod
     def _decide_evse_source(
-        stored_kwh: float, replayed_kwh: float | None, sample_count: int
+        stored_kwh: float,
+        replayed_kwh: float | None,
+        sample_count: int,
+        peak_kw: float | None = None,
     ) -> str | None:
         """Was a stored EVSE figure produced by the sensor, or typed in?
 
@@ -6414,14 +6448,33 @@ class EvTripLoggerCoordinator:
         genuine zero. Fewer than two samples really is no evidence, and
         returns None.
         """
-        if sample_count < 2:
-            return None
+        if sample_count < 1:
+            return None       # purged: no evidence either way
         energy = 0.0 if replayed_kwh is None else replayed_kwh
         if abs(energy - stored_kwh) <= max(
             _EVSE_SOURCE_MATCH_ABS_KWH, _EVSE_SOURCE_MATCH_RATIO * stored_kwh
         ):
             return "meter"
-        if energy <= _EVSE_SOURCE_MATCH_RATIO * stored_kwh:
+        # v0.8.43 — a flat-zero sensor is the case this feature exists
+        # for, and it arrives as ONE state, not as a stream. HA's recorder
+        # stores state *changes*, so a wallbox idling at 0.0 W through a
+        # 20-minute session produces a single boundary row. Requiring two
+        # samples (v0.8.42) therefore threw away exactly the evidence it
+        # was built to read: measured live, 34 of 35 rows stayed
+        # unlabelled and the log said "could not be decided" for every
+        # away charge.
+        #
+        # A peak of zero settles it on its own, with no integration
+        # needed: the sensor was observed across the window and never
+        # delivered a watt, so the stored figure came from elsewhere.
+        if peak_kw is not None and peak_kw <= 0:
+            return "invoice"
+        # Below that, an integral is required — a single NON-zero sample
+        # cannot be integrated, and treating it as zero would invent an
+        # invoice out of a sensor that may well have been delivering.
+        if sample_count >= 2 and energy <= (
+            _EVSE_SOURCE_MATCH_RATIO * stored_kwh
+        ):
             return "invoice"
         # The sensor saw something that is not this figure. Labelling
         # that is exactly how the v0.8.30 "metered" pool went wrong.
@@ -6441,15 +6494,7 @@ class EvTripLoggerCoordinator:
         Returns the integrated energy in kWh, or None when no usable
         samples were found.
         """
-        def _to_kw(state_obj) -> float | None:
-            try:
-                v = float(state_obj.state)
-            except (TypeError, ValueError):
-                return None
-            unit = (state_obj.attributes or {}).get("unit_of_measurement") or ""
-            if str(unit).strip().lower() in ("w", "watt", "watts"):
-                v = v / 1000.0
-            return max(0.0, v)
+        _to_kw = EvTripLoggerCoordinator._evse_state_kw
 
         # Build sorted (ts, kw) samples within the window.
         samples: list[tuple[datetime, float]] = []
