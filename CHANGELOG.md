@@ -2,6 +2,21 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.39 — 2026-08-26
+**Fix — the band that decides whether a charge measurement is trustworthy no longer moves with the estimate that measurement feeds.** It is now anchored on the declared capacity instead of the calibrated one.
+
+A charge is tagged `energy_source = 'power_integration'` only if its power integral lands within ±40 % of `ΔSoC × capacity`, and the capacity calibration is computed from exactly the charges carrying that tag. Anchoring the band on the calibrated figure therefore pre-filtered the pool by the number the pool derives — the same defect as the efficiency gate retired in v0.8.38, one level further up.
+
+v0.8.37's ceiling already capped the upward direction: the calibration can no longer exceed the nameplate, so the band cannot widen past ±40 % of the declared figure. **What remains, and what this fixes, is the downward direction.** On a pack calibrated to 70 kWh of a declared 82.5, the band narrows to ±40 % of the smaller number and starts rejecting the higher integrals that would have corrected it. An install could lock itself into an underestimate with nothing in the logs to say so — and the more a pack genuinely degrades, the tighter the trap gets.
+
+The declared capacity is the one anchor in this calculation that never moves with the estimate, which is the entire requirement. It is a plausibility band, not a precision instrument: at ±40 % it is wide enough that anchoring it on a nameplate rather than a degraded real capacity costs nothing, and a genuinely 70 kWh pack still lands inside. The `kwh_soc` fallback still uses the calibrated capacity, because that is the right working figure for energy arithmetic — only the accept/reject decision changed.
+
+**No migration, and no immediate effect on an install whose calibration currently sits at the nameplate** (where the two anchors are identical, as they are on the author's install after v0.8.37 clamped it). This is a guard that starts mattering as a pack ages and the calibration drops below declared. Existing charges are not re-tagged; the decision is made once, at close.
+
+The rejection log line now names the declared-capacity band and the SoC fallback separately, so a rejected integral says what it was compared against.
+
+Tests: two new. The first sets a calibration of 60.0 against a declared 82.5 and feeds a 45 kWh integral — inside the declared band `[24.75, 57.75]`, outside the calibrated band `[18.00, 42.00]` — and requires it to be accepted, because the pack really is bigger than 60 kWh and that measurement is the evidence saying so. It was **verified to fail against the previous behaviour** before being committed; the v0.8.38 post-mortem was a test that passed for a reason that did not exist. The second pins that the band is looser now, not absent: a 90 kWh integral, more than the whole pack, is still refused.
+
 ## v0.8.38 — 2026-08-26
 **Fix — charging efficiency no longer selects which charges the capacity calibration learns from.** The `metered` tier added in v0.8.30 is retired; `grounded` (every power-integration charge) is the top pool again.
 
