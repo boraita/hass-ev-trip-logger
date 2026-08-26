@@ -2,6 +2,19 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.36 — 2026-08-26
+**Fix — stop publishing a battery health above 100 %, which route planners read as a pack better than new.** `sensor.<device>_battery_soh` and the `soh` field pushed to ABRP are now capped at 100.
+
+A usable pack does not hold more energy than it did new, so a reading above 100 % is never a measurement — it is the capacity estimator running high. Published as health, it inverts its own meaning: a planner fed 103 % reads a battery 3 % *better* than new and plans a longer range than the car has.
+
+This was live, not hypothetical. The author's install published **103.23 %** — an 85.16 kWh calibration against an 82.5 kWh nameplate — and sent it to A Better Route Planner on every telemetry frame, which reported a degradation of *minus* 3.2 %. Independent wall-meter evidence (eight home AC sessions, 242 % of pooled SoC against 214.61 kWh at the plug) bounds the real pack at **79.8-83.4 kWh**; reaching 85.16 would need an onboard-charger efficiency of 96.1 %, which no onboard AC charger achieves. The pack is at or slightly below nameplate. The estimator was the thing that grew.
+
+The cap is a floor under the damage, not a repair of the estimator, so the overshoot is kept rather than discarded: the SoH sensor gained a **`soh_uncapped_pct`** attribute carrying the raw ratio. Above 100 there, it means "distrust `calibrated_capacity_kwh`" — it is the single clearest signal that the capacity calibration is biased, and hiding it would remove the evidence along with the symptom.
+
+Nothing is stored or migrated: SoH is derived on read, so a restart is enough. The capacity calibration itself is untouched by this release and is addressed separately.
+
+Tests: four new, covering the cap, an unchanged sub-100 reading (a one-sided clamp must not flatten real degradation), the pre-calibration case (100 % published, `None` uncapped — nothing has been measured yet), and the ABRP payload pinned at its source. There was previously **no test coverage of `battery_soh` at all**.
+
 ## v0.8.35 — 2026-08-26
 **Feat — charges now report how long the car was driving before them, not only how far.** New `min_before` on `recent_charges`, alongside v0.8.32's `km_before`.
 

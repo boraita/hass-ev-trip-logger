@@ -3495,11 +3495,12 @@ class BatterySohSensor(_BaseTripSensor):
         # picked a model from `cohort_baselines.json`, else nameplate.
         # Tessie pattern: this reduces the per-user calibration period
         # before SoH stabilises.
-        baseline = self._coordinator.battery_capacity_baseline
-        calibrated = self._coordinator._battery_capacity_calibrated
-        if calibrated is None or baseline <= 0:
-            return 100.0  # no data yet → assume healthy
-        return round(calibrated / baseline * 100.0, 2)
+        # v0.8.36 — capped at 100 by `battery_soh_pct`. A pack does not
+        # hold more than it did new, so anything above that is the
+        # capacity estimator running high, not health; published as-is it
+        # reads as negative degradation. The uncapped figure stays on the
+        # `soh_uncapped_pct` attribute so the overshoot is still visible.
+        return self._coordinator.battery_soh_pct
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -3581,6 +3582,13 @@ class BatterySohSensor(_BaseTripSensor):
                 round(calibrated, 2) if calibrated is not None else None
             ),
             "calibration_charges": coord._battery_capacity_calibration_n,
+            # v0.8.36 — the uncapped ratio. `state` is capped at 100
+            # because a pack cannot exceed its as-new capacity, but the
+            # overshoot is the single most useful signal that the
+            # capacity estimator is running high, so it is kept here
+            # rather than discarded. Above 100 means "distrust
+            # calibrated_capacity_kwh", not "the battery improved".
+            "soh_uncapped_pct": coord.battery_soh_pct_raw,
             # v0.8.30 — which pool the number came from. "metered" and
             # "grounded" are measurements; "soc" is the tautology pool
             # (kwh/ΔSoC returns the capacity that produced kwh), kept
