@@ -2,6 +2,17 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.44 — 2026-08-26
+**Fix — a charger's power is not regeneration.** Trips that overlapped a charge are excluded from the regen ratio and from the K median.
+
+When a charge runs inside an open trip, the charger's power lands in the trip's own power integral, and the trip's sign convention reads it as regeneration. Both halves of the regen/discharge split are then contaminated. On the author's history exactly one trip is affected — 74 km, **28.01 kWh of "regen"**, a gross throughput of 67 kWh/100 km, `kwh_charged_during = 23.93` — and that single row moved the reported regen ratio from about **7.3 % to 10.8 %**, a 3.5-point error on a number read as "how much you got back from braking". The K median is excluded for the same reason: its numerator is the same polluted integral.
+
+**What this deliberately does not exclude, and why that matters.** The first version of this fix rejected `regen_kwh > discharge_kwh` as physically impossible. It is not. A net-descent trip genuinely recovers more than it spends, and the SoC rising across the trip is the confirmation. Two of the three rows that break that "invariant" here are perfectly good data — 10 km at SoC 70 → 74 %, and 3 km flat — and excluding them would have deleted evidence to tidy a number.
+
+The one row that is actually wrong is wrong for a different reason, and `kwh_charged_during` names it exactly. The discriminator has to be the cause, not a symptom that honest data shares.
+
+Both cases are now pinned by tests: the contaminated trip must be excluded, and the descent trip must keep its ratio above 1.0. The exclusion test was verified to fail without the change.
+
 ## v0.8.43 — 2026-08-26
 **Fix — a flat-zero sensor arrives as ONE state, not as a stream.** Home Assistant's recorder stores state *changes*, and v0.8.42 required two samples before it would read a zero.
 
