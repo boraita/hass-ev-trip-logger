@@ -2,6 +2,13 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.35 — 2026-08-26
+**Feat — charges now report how long the car was driving before them, not only how far.** New `min_before` on `recent_charges`, alongside v0.8.32's `km_before`.
+
+The two are not interchangeable, which is the whole reason to add it. 150 km covered in 90 minutes of motorway leaves the pack hot; the same 150 km covered in four hours of town driving does not. `km_before` alone cannot tell those apart, and pack temperature at arrival is the mechanism anything downstream is actually reaching for.
+
+It comes from the same window and the same joined trips as `km_before` — one extra `SUM(duration_min)` in the existing query — so it costs no additional work and inherits the same rules: derived on read rather than stored (it depends on the *previous* charge, and a manual recovery lands with a fresh id and an old timestamp), `0` when the car genuinely did not move, and `None` only when there is no previous charge to measure a window from.
+
 ## v0.8.34 — 2026-08-24
 **Feat — charges now record where they happened, so a charger can be recognised across sessions.** New `charge_lat` / `charge_lon`, captured from the device_tracker at close and exposed on `recent_charges`.
 
