@@ -478,6 +478,23 @@ CREATE TABLE IF NOT EXISTS charges (
     -- the class from the observed peak cannot tell them apart, because in
     -- the second case the peak IS the low number. NULL until entered.
     charger_power_kw REAL,
+    -- v0.8.41: HOW `evse_energy_kwh` arrived, which the column itself
+    -- cannot say. Three paths write it and they are not the same
+    -- evidence:
+    --   'meter'   — integrated from the configured EVSE/wallbox power
+    --               sensor, live during the session or replayed from
+    --               the recorder. An independent measurement.
+    --   'invoice' — typed in by the user (a receipt, an operator app).
+    --               Trustworthy as a bill, but it is the GRID side of a
+    --               charger we do not control, and on a DC session it
+    --               includes cabinet losses that never reached the car.
+    --   NULL      — recorded before v0.8.41, or no EVSE figure at all.
+    -- This distinction is why the v0.8.30 `metered` capacity tier was
+    -- wrong about its own name: on this install the wallbox integrated
+    -- to exactly 0.00 kWh during all eight away sessions, yet those
+    -- rows carried an `evse_energy_kwh`, and four of the five samples
+    -- in that "metered" pool rested on invoice figures.
+    evse_source TEXT,
     -- v0.8.34: where the car was when the session ended, from the
     -- device_tracker. Charges carry no coordinates of their own, and
     -- `location` is 'not_home' for every public charger, so this is the
@@ -713,6 +730,11 @@ class ChargeRecord:
     # v0.5.90: kwh / evse_energy_kwh × 100 — real AC→DC charging
     # efficiency. None when evse_energy_kwh is missing or zero.
     charging_efficiency_pct: float | None = None
+    # v0.8.41: 'meter' | 'invoice' | None — see the `evse_source` column
+    # comment. A capacity estimator that wants an independent input has
+    # to be able to tell a wallbox reading from a typed-in receipt, and
+    # until this existed it could not.
+    evse_source: str | None = None
     # v0.6.0: peak instantaneous charging power observed during the
     # session (max |power_kw| sample). Drives the DCFC-stress
     # accumulator in the SoH model; sessions ≥ 100 kW are flagged as
@@ -976,6 +998,13 @@ class TripStorage:
         for col in ("charge_lat", "charge_lon"):
             if col not in charge_cols:
                 conn.execute(f"ALTER TABLE charges ADD COLUMN {col} REAL")
+        # v0.8.41: provenance of evse_energy_kwh. Existing rows stay NULL
+        # — "unknown", honestly, since nothing recorded it at the time.
+        # A bounded startup backfill fills in what the recorder can still
+        # answer for; anything older keeps its NULL rather than being
+        # guessed at.
+        if "evse_source" not in charge_cols:
+            conn.execute("ALTER TABLE charges ADD COLUMN evse_source TEXT")
         # v0.8.40: clear efficiencies that were never physically possible.
         # Until this release the plausibility band was only a read filter,
         # so rows were stored with whatever the division produced — the
@@ -2338,8 +2367,8 @@ class TripStorage:
                     currency, soc_start, soc_end, location, notes, is_dcfc,
                     evse_energy_kwh, charging_efficiency_pct,
                     peak_charge_power_kw, temperature_c, energy_source,
-                    charger_power_kw, charge_lat, charge_lon
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    charger_power_kw, charge_lat, charge_lon, evse_source
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _iso_local(record.started_at) if record.started_at else None,
@@ -2361,6 +2390,7 @@ class TripStorage:
                     record.charger_power_kw,
                     record.charge_lat,
                     record.charge_lon,
+                    record.evse_source,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -2425,6 +2455,9 @@ class TripStorage:
         "started_at", "ended_at", "kwh", "soc_start", "soc_end",
         "location", "notes", "is_dcfc", "currency",
         "evse_energy_kwh", "peak_charge_power_kw", "temperature_c",
+        # v0.8.41 — patchable so `backfill_charge_evse` can declare that
+        # the figure it just wrote came from the EVSE sensor.
+        "evse_source",
     })
 
     async def async_patch_charge(
@@ -2568,6 +2601,17 @@ class TripStorage:
                 if evse_energy_kwh is not None
                 else row["evse_energy_kwh"]
             )
+            # v0.8.41 — this path is the user correcting a charge, so a
+            # figure arriving here is a receipt, not a measurement. Only
+            # overwritten when a new figure is actually supplied; an
+            # existing 'meter' label survives a price-only edit.
+            new_evse_source = (
+                "invoice" if evse_energy_kwh is not None
+                else (
+                    row["evse_source"]
+                    if "evse_source" in row.keys() else None
+                )
+            )
             # v0.8.40 — guarded: correcting a charge's invoiced kWh must
             # not be able to mint an impossible efficiency either.
             new_eff = (
@@ -2587,11 +2631,12 @@ class TripStorage:
                 "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
                 "location = ?, notes = ?, evse_energy_kwh = ?, "
                 "charging_efficiency_pct = ?, charger_power_kw = ?, "
+                "evse_source = ?, "
                 "price_locked = COALESCE(?, price_locked) WHERE id = ?",
                 (
                     new_price, new_total, new_location, new_notes,
-                    new_evse_kwh, new_eff, new_charger_kw, price_locked,
-                    charge_id,
+                    new_evse_kwh, new_eff, new_charger_kw, new_evse_source,
+                    price_locked, charge_id,
                 ),
             )
             updated = conn.execute(
@@ -2657,6 +2702,17 @@ class TripStorage:
                 if evse_energy_kwh is not None
                 else row["evse_energy_kwh"]
             )
+            # v0.8.41 — this path is the user correcting a charge, so a
+            # figure arriving here is a receipt, not a measurement. Only
+            # overwritten when a new figure is actually supplied; an
+            # existing 'meter' label survives a price-only edit.
+            new_evse_source = (
+                "invoice" if evse_energy_kwh is not None
+                else (
+                    row["evse_source"]
+                    if "evse_source" in row.keys() else None
+                )
+            )
             # v0.8.40 — guarded: correcting a charge's invoiced kWh must
             # not be able to mint an impossible efficiency either.
             new_eff = (
@@ -2676,17 +2732,66 @@ class TripStorage:
                 "UPDATE charges SET price_per_kwh = ?, total_cost = ?, "
                 "location = ?, notes = ?, evse_energy_kwh = ?, "
                 "charging_efficiency_pct = ?, charger_power_kw = ?, "
+                "evse_source = ?, "
                 "price_locked = COALESCE(?, price_locked) WHERE id = ?",
                 (
                     new_price, new_total, new_location, new_notes,
-                    new_evse_kwh, new_eff, new_charger_kw, price_locked,
-                    row["id"],
+                    new_evse_kwh, new_eff, new_charger_kw, new_evse_source,
+                    price_locked, row["id"],
                 ),
             )
             updated = conn.execute(
                 "SELECT * FROM charges WHERE id = ?", (row["id"],)
             ).fetchone()
         return _row_to_charge(updated)
+
+    async def async_charges_missing_evse_source(
+        self, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """v0.8.41 — charges carrying an EVSE figure with no provenance.
+
+        Bounded like the GPS equivalent, and for the same reason: the
+        only way to decide retroactively whether a figure came from the
+        EVSE sensor is to replay that sensor over the charge window, and
+        the recorder only keeps about ten days. Older rows will never
+        resolve and are left NULL rather than guessed at.
+        """
+        return await self._hass.async_add_executor_job(
+            self._charges_missing_evse_source, limit
+        )
+
+    def _charges_missing_evse_source(self, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, started_at, ended_at, evse_energy_kwh "
+                "FROM charges "
+                "WHERE evse_energy_kwh IS NOT NULL AND evse_energy_kwh > 0 "
+                "  AND evse_source IS NULL "
+                "  AND started_at IS NOT NULL "
+                "ORDER BY ended_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def async_set_evse_source(self, charge_id: int, source: str) -> None:
+        """Label one charge's EVSE provenance, without touching the figure.
+
+        Guarded on `evse_source IS NULL` so a backfill can never overwrite
+        a label written at the time by the code that actually knew — the
+        same rule as `async_set_charge_gps`.
+        """
+        await self._hass.async_add_executor_job(
+            self._set_evse_source, charge_id, source
+        )
+
+    def _set_evse_source(self, charge_id: int, source: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE charges SET evse_source = ? "
+                "WHERE id = ? AND evse_source IS NULL",
+                (source, charge_id),
+            )
 
     async def async_charges_missing_gps(self, limit: int = 50) -> list[dict[str, Any]]:
         """v0.8.34 — charges with no recorded position, newest first.
@@ -4784,6 +4889,11 @@ def _row_to_charge(row: sqlite3.Row) -> ChargeRecord:
         charger_power_kw=(
             row["charger_power_kw"]
             if "charger_power_kw" in row.keys() else None
+        ),
+        # NOTE `in row.keys()`, not `in row`: sqlite3.Row's __contains__
+        # tests VALUES. See the SIM118 note in pyproject.toml.
+        evse_source=(
+            row["evse_source"] if "evse_source" in row.keys() else None
         ),
         charge_lat=row["charge_lat"] if "charge_lat" in row.keys() else None,
         charge_lon=row["charge_lon"] if "charge_lon" in row.keys() else None,

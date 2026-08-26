@@ -1176,6 +1176,12 @@ def _charge_to_attr(charge: Any) -> dict[str, Any]:
         "charging_efficiency_pct": _r(
             getattr(charge, "charging_efficiency_pct", None), 1
         ),
+        # v0.8.41 — 'meter' | 'invoice' | None. The kWh figure above is
+        # not the same evidence in the two cases: a wallbox integral is
+        # an independent measurement, a typed-in receipt is the grid side
+        # of a charger we do not control. A consumer that treats them
+        # alike is the mistake the v0.8.30 capacity tier made.
+        "evse_source": getattr(charge, "evse_source", None),
         # v0.8.14 — 'power_integration' | 'soc_delta' | 'manual' | None.
         # Lets a dashboard flag "this figure is a SoC estimate" instead
         # of presenting every kwh value with the same implied precision.

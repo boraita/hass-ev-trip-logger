@@ -2,6 +2,33 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.41 — 2026-08-26
+**Feat — charges now record HOW their EVSE energy figure arrived.** New `evse_source` on `recent_charges`: `meter`, `invoice`, or `None`.
+
+Three paths write `evse_energy_kwh` and, until now, none of them recorded which:
+
+| path | what it is |
+|---|---|
+| live integral of the configured EVSE sensor | a measurement of a meter we control |
+| `backfill_charge_evse` (recorder replay of that sensor) | the same evidence, replayed |
+| a figure typed into `log_charge` / `set_charge_price` | a receipt — the **grid** side of a charger we do not control, including cabinet losses that never reached the car on a DC session |
+
+They are not the same evidence, and the column could not say which it held. **That is why the v0.8.30 `metered` capacity tier was wrong about its own name.** On the author's install the home wallbox integrates to exactly **0.00 kWh** during all eight away sessions, yet those rows carry an `evse_energy_kwh` — and four of the five samples in that "metered" pool rested on invoice figures. Any future estimator wanting a genuinely independent input has to be able to tell them apart, and until this release it could not.
+
+Writers are labelled at the point where the answer is actually known: the charge-close path declares `meter` when it integrated the sensor live, `backfill_charge_evse` declares `meter` because it replayed the same sensor, and both correction paths declare `invoice` — a figure arriving through the pencil on a charges row is a receipt. A price-only edit leaves an existing `meter` label alone, so fixing a tariff cannot silently downgrade a real measurement.
+
+**A bounded startup backfill** decides the existing rows by replaying the EVSE sensor over each charge window, with three outcomes rather than two:
+
+* the replay reproduces the stored figure (within 10 % or 0.25 kWh) → `meter`
+* the sensor was recording and saw essentially nothing → `invoice`, because the figure must have come from somewhere else
+* anything in between → **left NULL**. The sensor saw *something* that is not this figure, and inventing a label for that is precisely how the last "metered" pool went wrong.
+
+In practice the two cases are nowhere near each other: the author's wallbox reproduced its one home session to three decimals and read exactly zero on the eight away sessions. Bounded to 50 per startup; rows older than the recorder's retention keep their NULL, honestly, rather than being guessed at. The label write is guarded on `evse_source IS NULL`, so a retroactive inference can never overwrite one recorded at the time by code that knew.
+
+This is groundwork, and it changes no number today. It is the prerequisite for a capacity estimator grounded on `evse × η / ΔSoC`, which would be the first input independent of **both** the SoC readings and the vehicle's power sensor — the same arithmetic that bounded this pack at 79.8-83.4 kWh from 242 % of pooled SoC against 214.61 kWh at the plug.
+
+Five new tests: the label survives storage, the correction path marks an invoice, a price-only edit keeps `meter`, a backfilled guess never overwrites a recorded label, and the backfill queue excludes rows already decided, rows with no figure, and rows with no start time (no window to replay means it can never be decided, so it must not sit in the queue forever). 333 pass.
+
 ## v0.8.40 — 2026-08-26
 **Fix — a charging efficiency that cannot physically happen is no longer stored as if it were measured.** Every write path routes through a new `plausible_efficiency_pct`, and a startup migration clears rows written before it.
 

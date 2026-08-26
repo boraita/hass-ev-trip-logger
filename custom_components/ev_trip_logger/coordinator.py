@@ -417,6 +417,16 @@ _CAPACITY_CHARGE_WINDOW = 30  # last N eligible charges
 # agreement — so before trusting the integral at all we require it to
 # have actually seen most of the session. Only once that coverage bar is
 # cleared do we widen the acceptance band past the old fixed ±30 %.
+# v0.8.41 — deciding retroactively whether a stored EVSE figure came from
+# the sensor or from a receipt. A replay that reproduces the figure means
+# the sensor produced it; a replay of essentially nothing means the figure
+# came from somewhere else. The two cases are far apart in practice — the
+# author's wallbox reproduced its one home session to three decimals and
+# integrated to exactly 0.00 kWh across all eight away sessions — so the
+# tolerance only has to be wide enough for recorder resampling, and
+# anything landing between the two is left unlabelled rather than guessed.
+_EVSE_SOURCE_MATCH_RATIO = 0.10
+_EVSE_SOURCE_MATCH_ABS_KWH = 0.25
 _CHARGE_ENERGY_MIN_SAMPLES = 3
 _CHARGE_ENERGY_MIN_COVERAGE_RATIO = 0.5
 _CHARGE_ENERGY_TOLERANCE = 0.4
@@ -1482,6 +1492,107 @@ class EvTripLoggerCoordinator:
             self._notify_listeners()
             self._notify_trip_log_listeners()
 
+    async def _async_backfill_evse_source(self) -> None:
+        """v0.8.41 — label the provenance of EVSE figures already stored.
+
+        Three paths write `evse_energy_kwh` and, until v0.8.41, none of
+        them recorded which: the live sensor integral, a recorder replay
+        of that sensor, and a figure the user typed from a receipt. The
+        first two are measurements of a meter we control; the third is
+        the grid side of a charger we do not, and on a DC session it
+        includes cabinet losses that never reached the car. A capacity
+        estimator that wants an independent input has to tell them apart.
+
+        The only retroactive test is to replay the EVSE sensor over the
+        charge window and see whether it reproduces the stored figure:
+
+          * reproduces it (within `_EVSE_SOURCE_MATCH_RATIO`) → 'meter'
+          * the sensor was recording and saw essentially nothing →
+            'invoice', because the number must have come from elsewhere
+          * anything in between → left NULL. The sensor saw *something*
+            that is not this figure, and inventing a label for that is
+            how the last "metered" pool went wrong.
+
+        Measured on the author's history, the two cases are not close
+        together: the wallbox reproduced the one home session to three
+        decimals and integrated to exactly 0.00 kWh across all eight away
+        sessions. Bounded to 50 per startup; rows older than the
+        recorder's retention keep their NULL.
+        """
+        if not self._evse_power_sensor:
+            return
+        try:
+            pending = await self.storage.async_charges_missing_evse_source(
+                limit=50
+            )
+        except Exception as err:  # pragma: no cover — defensive
+            _LOGGER.debug("EVSE provenance backfill: list query failed: %s", err)
+            return
+        if not pending:
+            return
+        try:
+            from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+            from homeassistant.components.recorder.history import (  # noqa: PLC0415
+                state_changes_during_period,
+            )
+        except Exception:  # pragma: no cover — recorder always present
+            return
+        recorder = get_instance(self.hass)
+        labelled = {"meter": 0, "invoice": 0}
+        for row in pending:
+            try:
+                started = datetime.fromisoformat(row["started_at"])
+                ended = datetime.fromisoformat(row["ended_at"])
+                stored = float(row["evse_energy_kwh"])
+            except (TypeError, ValueError):
+                continue
+            try:
+                result = await recorder.async_add_executor_job(
+                    state_changes_during_period,
+                    self.hass, started, ended, self._evse_power_sensor,
+                )
+            except Exception as err:  # pragma: no cover — defensive
+                _LOGGER.debug(
+                    "EVSE provenance backfill: recorder query failed for "
+                    "charge %s: %s", row.get("id"), err,
+                )
+                continue
+            states = (
+                result.get(self._evse_power_sensor, [])
+                if isinstance(result, dict) else []
+            )
+            if not states:
+                continue          # purged; no evidence either way
+            replayed = self._integrate_evse_from_recorder(
+                evse_states=states, charge_states=[],
+                window_start=started, window_end=ended,
+            )
+            if replayed is None:
+                continue
+            if abs(replayed - stored) <= max(
+                _EVSE_SOURCE_MATCH_ABS_KWH, _EVSE_SOURCE_MATCH_RATIO * stored
+            ):
+                source = "meter"
+            elif replayed <= _EVSE_SOURCE_MATCH_RATIO * stored:
+                source = "invoice"
+            else:
+                continue          # saw something, but not this figure
+            try:
+                await self.storage.async_set_evse_source(int(row["id"]), source)
+                labelled[source] += 1
+            except Exception as err:  # pragma: no cover — defensive
+                _LOGGER.debug(
+                    "EVSE provenance backfill failed for charge %s: %s",
+                    row.get("id"), err,
+                )
+        if labelled["meter"] or labelled["invoice"]:
+            _LOGGER.info(
+                "EVSE provenance backfill: %d metered, %d invoiced of %d "
+                "charge(s); the rest are older than the recorder keeps or "
+                "could not be decided",
+                labelled["meter"], labelled["invoice"], len(pending),
+            )
+
     async def _async_backfill_charge_gps(self) -> None:
         """v0.8.34 — resolve a position for charges logged before v0.8.34.
 
@@ -2196,6 +2307,7 @@ class EvTripLoggerCoordinator:
         if self._location:
             self.hass.async_create_task(self._async_backfill_gps())
             self.hass.async_create_task(self._async_backfill_charge_gps())
+            self.hass.async_create_task(self._async_backfill_evse_source())
         else:
             self.hass.async_create_task(self._async_backfill_geocodes())
 
@@ -4106,6 +4218,9 @@ class EvTripLoggerCoordinator:
             evse_energy_kwh=(
                 active.evse_energy_kwh if active.evse_energy_kwh > 0 else None
             ),
+            # v0.8.41 — integrated live from the configured EVSE sensor
+            # during the session, so this one really is a measurement.
+            evse_source="meter" if active.evse_energy_kwh > 0 else None,
             peak_charge_power_kw=(
                 active.peak_charge_power_kw
                 if active.peak_charge_power_kw > 0 else None
@@ -5790,6 +5905,7 @@ class EvTripLoggerCoordinator:
         peak_charge_power_kw: float | None = None,
         temperature_c: float | None = None,
         energy_source: str | None = None,
+        evse_source: str | None = None,
     ) -> ChargeRecord:
         """Persist a charge session.
 
@@ -5868,6 +5984,15 @@ class EvTripLoggerCoordinator:
                 else None
             ),
             charging_efficiency_pct=charging_eff_pct,
+            # v0.8.41 — how the EVSE figure arrived. `None` when there is
+            # no figure at all; otherwise whatever the caller declared,
+            # and 'invoice' when a caller supplied kWh without saying,
+            # because a hand-passed number is the only thing it can be.
+            evse_source=(
+                evse_source
+                if evse_source is not None
+                else ("invoice" if evse_energy_kwh else None)
+            ),
             peak_charge_power_kw=(
                 round(peak_charge_power_kw, 2)
                 if peak_charge_power_kw is not None and peak_charge_power_kw > 0
@@ -6250,7 +6375,14 @@ class EvTripLoggerCoordinator:
             )
             return None
         patched = await self.storage.async_patch_charge(
-            charge_id, {"evse_energy_kwh": round(evse_kwh, 3)},
+            charge_id,
+            {
+                "evse_energy_kwh": round(evse_kwh, 3),
+                # v0.8.41 — replayed from the recorder, but replayed from
+                # the EVSE *sensor*, so it is the same evidence as a live
+                # integral and must be labelled as such.
+                "evse_source": "meter",
+            },
         )
         if patched is None:
             return None
