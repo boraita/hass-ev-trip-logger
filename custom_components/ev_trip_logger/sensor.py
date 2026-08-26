@@ -1124,6 +1124,11 @@ def _trip_to_attr(
             getattr(trip, "consumption_upper_kwh_100km", None), 1
         ),
         "low_confidence": getattr(trip, "low_confidence", None),
+        # v0.8.45 — a hand-corrected figure the bulk heals will not touch.
+        # Exposed so a card can show it as locked instead of letting the
+        # user wonder why a value stopped moving with the calibration.
+        "energy_locked": bool(getattr(trip, "energy_locked", False)),
+        "cost_locked": bool(getattr(trip, "cost_locked", False)),
     }
 
 
