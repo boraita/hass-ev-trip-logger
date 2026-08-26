@@ -3958,8 +3958,40 @@ class EvTripLoggerCoordinator:
             and covered_h / session_duration_h >= _CHARGE_ENERGY_MIN_COVERAGE_RATIO
         )
         if active.energy_added_kwh > 0 and good_coverage:
-            lo = (1.0 - _CHARGE_ENERGY_TOLERANCE) * kwh_soc
-            hi = (1.0 + _CHARGE_ENERGY_TOLERANCE) * kwh_soc
+            # v0.8.39 — the acceptance band is anchored on the DECLARED
+            # capacity, not the calibrated one. `kwh_soc` above still uses
+            # the calibrated value, because that is the working figure for
+            # energy math; but using it here closed a feedback loop.
+            #
+            # The loop: a charge is only tagged `power_integration` if its
+            # integral lands within ±40 % of ΔSoC × capacity, and the
+            # capacity calibration is computed from exactly the charges
+            # carrying that tag. So the pool that derives the capacity was
+            # pre-filtered by the capacity it derives, and the filter moved
+            # with the answer — the same defect as the retired efficiency
+            # gate (v0.8.38), one level further up.
+            #
+            # v0.8.37's ceiling capped the upward direction: the
+            # calibration can no longer exceed the nameplate, so the band
+            # can no longer widen past ±40 % of the declared figure. The
+            # live risk is now DOWNWARD. On a pack calibrated to 70 kWh of
+            # a declared 82.5, the band narrows to ±40 % of the smaller
+            # number, rejecting the higher integrals that would have
+            # corrected it — an install can lock itself into an
+            # underestimate with nothing in the logs to say so.
+            #
+            # The declared capacity is the one anchor in this calculation
+            # that never moves with the estimate, which is the whole
+            # requirement. It is a plausibility band, not a precision
+            # instrument: at ±40 % it is wide enough that anchoring it on
+            # a nameplate rather than a degraded real capacity costs
+            # nothing, and a genuinely 70 kWh pack still lands inside.
+            band_ref = (
+                (soc_end - active.soc_start) / 100.0
+                * self._battery_capacity_declared
+            )
+            lo = (1.0 - _CHARGE_ENERGY_TOLERANCE) * band_ref
+            hi = (1.0 + _CHARGE_ENERGY_TOLERANCE) * band_ref
             if lo <= active.energy_added_kwh <= hi:
                 kwh = round(active.energy_added_kwh, 3)
                 energy_source = "power_integration"
@@ -3974,10 +4006,10 @@ class EvTripLoggerCoordinator:
             else:
                 _LOGGER.info(
                     "Charge kWh: power-integration %.2f outside ±%.0f %% "
-                    "of SoC (%.2f kWh) despite good coverage — falling "
-                    "back to SoC math.",
+                    "of the declared-capacity band (%.2f kWh) despite good "
+                    "coverage — falling back to SoC math (%.2f kWh).",
                     active.energy_added_kwh,
-                    _CHARGE_ENERGY_TOLERANCE * 100.0, kwh_soc,
+                    _CHARGE_ENERGY_TOLERANCE * 100.0, band_ref, kwh_soc,
                 )
         elif active.energy_added_kwh > 0:
             _LOGGER.info(

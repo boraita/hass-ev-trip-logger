@@ -627,6 +627,109 @@ async def test_charge_energy_prefers_power_integration_with_good_coverage(
     assert coordinator.last_charge.energy_source == "power_integration"
 
 
+async def test_acceptance_band_is_anchored_on_declared_not_calibrated(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.39 — the band that admits a measurement must not move with it.
+
+    A charge is tagged `power_integration` only if its integral lands
+    within ±40 % of ΔSoC × capacity, and the capacity calibration is
+    computed from exactly the charges carrying that tag. Anchoring the
+    band on the calibrated figure therefore pre-filtered the pool by the
+    number the pool derives, and the filter moved with the answer.
+
+    v0.8.37's ceiling capped the upward direction. What is left is the
+    downward one, which this test pins: a pack calibrated LOW rejects the
+    higher integrals that would have corrected it, and locks itself in.
+
+    Declared 82.5 kWh, calibrated down to 60.0, ΔSoC 50 %:
+      * declared band   ±40 % of 41.25  →  [24.75, 57.75]
+      * calibrated band ±40 % of 30.00  →  [18.00, 42.00]
+    A 45 kWh integral sits inside the first and outside the second. It
+    must be accepted, because the pack really is bigger than 60 kWh and
+    this measurement is the evidence that says so.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(POW, "0")
+        hass.states.async_set(CHG, STATE_OFF)
+        entry = await _setup(
+            hass, bat=20.0,
+            **{CONF_BATTERY_CAPACITY: 82.5, CONF_CHARGE_SENSOR: CHG,
+               CONF_POWER: POW},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+        coordinator._battery_capacity_calibrated = 60.0
+        assert coordinator.battery_capacity == 60.0
+
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+
+        # 90 kW for 30 min = 45.0 kWh, 3 samples across the session.
+        hass.states.async_set(POW, "-90", force_update=True)
+        await hass.async_block_till_done()
+        for _ in range(3):
+            frozen.tick(timedelta(minutes=10))
+            hass.states.async_set(POW, "-90", force_update=True)
+            await hass.async_block_till_done()
+
+        hass.states.async_set(BAT, "70")
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=5))
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+    assert coordinator.last_charge is not None
+    assert coordinator.last_charge.energy_source == "power_integration", (
+        "45 kWh is inside the declared-capacity band; anchoring on the "
+        "60 kWh calibration would have thrown away the one measurement "
+        "able to correct it"
+    )
+    assert coordinator.last_charge.kwh == pytest.approx(45.0, abs=0.05)
+
+
+async def test_acceptance_band_still_rejects_an_impossible_integral(
+    hass: HomeAssistant,
+) -> None:
+    """The band is looser after v0.8.39, not absent.
+
+    ΔSoC 50 % of a declared 82.5 kWh pack is 41.25 kWh, so the band runs
+    to 57.75. A 90 kWh integral — more than the whole pack — is still
+    refused, and the charge falls back to SoC math.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(POW, "0")
+        hass.states.async_set(CHG, STATE_OFF)
+        entry = await _setup(
+            hass, bat=20.0,
+            **{CONF_BATTERY_CAPACITY: 82.5, CONF_CHARGE_SENSOR: CHG,
+               CONF_POWER: POW},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+        hass.states.async_set(POW, "-180", force_update=True)
+        await hass.async_block_till_done()
+        for _ in range(3):
+            frozen.tick(timedelta(minutes=10))
+            hass.states.async_set(POW, "-180", force_update=True)
+            await hass.async_block_till_done()
+
+        hass.states.async_set(BAT, "70")
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=5))
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+    assert coordinator.last_charge is not None
+    assert coordinator.last_charge.energy_source == "soc_delta"
+    assert coordinator.last_charge.kwh == pytest.approx(41.25, abs=0.05)
+
+
 async def test_charge_energy_distrusts_sparse_power_samples(
     hass: HomeAssistant,
 ) -> None:
