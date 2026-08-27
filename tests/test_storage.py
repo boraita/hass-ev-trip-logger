@@ -2098,6 +2098,83 @@ async def test_correcting_the_energy_leaves_the_cost_free_to_re_derive(
     )
 
 
+async def test_startup_clears_false_regen_on_charge_overlapped_trips(
+    storage: TripStorage,
+) -> None:
+    """v0.8.46 — the row must not state the charger's power as regen.
+
+    v0.8.44 kept these figures out of the regen ratio and the K median,
+    which fixed the aggregates and left the row itself still asserting a
+    false fact. That is the same half-measure v0.8.40 corrected for
+    charging efficiency: an impossible figure is not a bad measurement to
+    be filtered downstream, it is a statement we should not be making.
+
+    The real row: 74 km with `regen_kwh = 28.01` — 37.8 kWh of recovery
+    per 100 km, which no car does — a `discharge_kwh` derived by
+    subtracting that from the same polluted total, and 49.54 kWh of gross
+    throughput, i.e. 67 kWh/100 km.
+    """
+    base = dt_util.now() - timedelta(hours=4)
+    dirty = await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=90),
+        duration_min=90.0, distance_km=74.0, energy_kwh=14.84,
+        soc_used_pct=-11.0, energy_source="soc_plus_charge",
+        regen_kwh=28.01, discharge_kwh=21.53, energy_from_power=49.54,
+        kwh_charged_during=23.93,
+    ))
+    clean = await storage.async_insert(TripRecord(
+        started_at=base + timedelta(hours=2),
+        ended_at=base + timedelta(hours=2, minutes=45),
+        duration_min=45.0, distance_km=50.0, energy_kwh=10.0,
+        regen_kwh=1.5, discharge_kwh=11.5, energy_from_power=13.0,
+    ))
+
+    await storage.async_init()          # re-runs the migrations
+
+    bad = await storage.async_get_trip_by_id(dirty)
+    assert bad is not None
+    assert bad.regen_kwh is None
+    assert bad.discharge_kwh is None
+    assert bad.energy_from_power is None
+    assert bad.kwh_charged_during == pytest.approx(23.93), (
+        "the measured charge is the one real number on the row"
+    )
+    assert bad.energy_kwh == pytest.approx(14.84), (
+        "energy comes from SoC + the metered charge, not from the "
+        "polluted integral, so it must survive"
+    )
+
+    ok = await storage.async_get_trip_by_id(clean)
+    assert ok is not None
+    assert ok.regen_kwh == pytest.approx(1.5), "a clean trip is untouched"
+    assert ok.energy_from_power == pytest.approx(13.0)
+
+
+async def test_the_cleanup_respects_a_user_lock(
+    storage: TripStorage,
+) -> None:
+    """v0.8.45's lock outranks v0.8.46's cleanup.
+
+    If a human went in and corrected these figures by hand, they are no
+    longer the charger's power — they are the user's answer, and a
+    migration must not delete it.
+    """
+    base = dt_util.now() - timedelta(hours=4)
+    trip_id = await storage.async_insert(TripRecord(
+        started_at=base, ended_at=base + timedelta(minutes=90),
+        duration_min=90.0, distance_km=74.0, energy_kwh=14.84,
+        regen_kwh=28.01, discharge_kwh=21.53, energy_from_power=49.54,
+        kwh_charged_during=23.93,
+    ))
+    await storage.async_update_trip(trip_id, {"regen_kwh": 4.0})
+
+    await storage.async_init()
+
+    rec = await storage.async_get_trip_by_id(trip_id)
+    assert rec is not None
+    assert rec.regen_kwh == pytest.approx(4.0)
+
+
 async def test_a_charge_overlapped_trip_is_kept_out_of_the_regen_ratio(
     storage: TripStorage,
 ) -> None:

@@ -5702,6 +5702,41 @@ class EvTripLoggerCoordinator:
         record.kwh_charged_during = (
             round(during_kwh, 2) if during_kwh > 0.005 else None
         )
+        # v0.8.46 — a charge inside the trip window poisons every
+        # power-derived figure on the row, and they must not be published
+        # as measurements of driving.
+        #
+        # The charger's power lands in the same integral as the driving,
+        # and the trip's sign convention (negative = into the battery)
+        # files it as regeneration. The real row that exposed this: 74 km
+        # with `regen_kwh = 28.01` — 37.8 kWh of "recovery" per 100 km,
+        # which no car does — a `discharge_kwh` derived by subtracting
+        # that from the same polluted total, and an `energy_from_power` of
+        # 49.54 kWh, i.e. 67 kWh/100 km of gross throughput.
+        #
+        # v0.8.44 kept these out of the regen ratio and the K median. That
+        # fixed the aggregates and left the row itself still stating a
+        # false fact, which is the same half-measure v0.8.40 corrected for
+        # charging efficiency: an impossible figure is not a bad
+        # measurement to be excluded downstream, it is a statement we
+        # should not be making. None is the honest record.
+        #
+        # `energy_kwh` is untouched: on these rows it comes from the SoC
+        # delta plus the metered charge (`soc_plus_charge`), never from
+        # this integral, so it stays correct. `kwh_charged_during` keeps
+        # the measured charge, which is the one real number here.
+        if record.kwh_charged_during:
+            _LOGGER.info(
+                "Trip %s: %.2f kWh charged inside the window — dropping "
+                "regen/discharge/gross (%.2f/%.2f/%.2f kWh), which are the "
+                "charger's power, not the car's driving.",
+                record.trip_id or "?", record.kwh_charged_during,
+                record.regen_kwh or 0.0, record.discharge_kwh or 0.0,
+                record.energy_from_power or 0.0,
+            )
+            record.regen_kwh = None
+            record.discharge_kwh = None
+            record.energy_from_power = None
 
         # v0.8.17 — a charge that lands INSIDE the trip's window was
         # measured (`kwh_charged_during`) and then used for nothing but

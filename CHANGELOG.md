@@ -2,6 +2,19 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.46 — 2026-08-27
+**Fix — a trip no longer reports the charger's power as its own regeneration.** When a charge runs inside a trip's window, `regen_kwh`, `discharge_kwh` and `energy_from_power` are dropped at close, and a startup migration clears the rows already written that way.
+
+v0.8.44 kept these figures out of the regen ratio and the K median. That fixed the aggregates and left the row itself still asserting a false fact — the same half-measure v0.8.40 corrected for charging efficiency. An impossible figure is not a bad measurement to be filtered downstream; it is a statement we should not be making.
+
+The real row: 74 km with **`regen_kwh` = 28.01**, which is 37.8 kWh of recovery per 100 km and no car does that; a `discharge_kwh` derived by subtracting it from the same polluted total; and 49.54 kWh of gross throughput, **67 kWh/100 km**. All three are the charger's power, filed as regeneration because the trip's sign convention reads energy flowing into the battery that way.
+
+`energy_kwh` is deliberately untouched: on these rows it comes from the SoC delta plus the metered charge (`soc_plus_charge`), never from the polluted integral, so it stays correct. `kwh_charged_during` also stays — it is the one real measurement on the row. The close path logs which figures it dropped and why, so the row's blanks are explainable rather than mysterious.
+
+**The lock from v0.8.45 was widened, because this release gave it more to protect.** `energy_locked` was triggered only by `energy_kwh` and `consumption_kwh_100km`; it now also triggers on `regen_kwh`, `discharge_kwh` and `energy_from_power`. Without that, a user who corrected the regen by hand would have had it deleted by this very migration on the next restart. The gap surfaced because the test for it failed — the first draft asserted a lock that did not exist.
+
+Two new tests: the migration clears a contaminated row while leaving a clean one alone and preserving `energy_kwh` and `kwh_charged_during`, and a hand-corrected figure outranks the cleanup. The first was verified to fail without the migration. 344 pass.
+
 ## v0.8.45 — 2026-08-26
 **Feat — a trip figure you corrected by hand is no longer overwritten by a bulk heal.** New `energy_locked` and `cost_locked` on trips, the equivalent of `charges.price_locked`.
 
