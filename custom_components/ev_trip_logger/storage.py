@@ -892,6 +892,28 @@ class TripStorage:
         for col in ("kwh_charged_before", "kwh_charged_during"):
             if col not in trip_cols:
                 conn.execute(f"ALTER TABLE trips ADD COLUMN {col} REAL")
+        # v0.8.46: clear power-derived figures on trips that had a charge
+        # inside their window. Until this release the row published the
+        # CHARGER's power as the car's regeneration — one row here read
+        # 28.01 kWh of "regen" over 74 km, which is 37.8 kWh/100 km of
+        # recovery and impossible. Only the three polluted columns are
+        # touched: `energy_kwh` on these rows comes from the SoC delta
+        # plus the metered charge, never from this integral, and
+        # `kwh_charged_during` is the one real measurement on the row.
+        # Idempotent. Skips rows the user has locked (v0.8.45).
+        conn.execute(
+            """
+            UPDATE trips SET
+                regen_kwh = NULL,
+                discharge_kwh = NULL,
+                energy_from_power = NULL
+            WHERE COALESCE(kwh_charged_during, 0) > 0
+              AND (regen_kwh IS NOT NULL
+                   OR discharge_kwh IS NOT NULL
+                   OR energy_from_power IS NOT NULL)
+              AND COALESCE(energy_locked, 0) = 0
+            """
+        )
         if "confidence" not in trip_cols:
             conn.execute("ALTER TABLE trips ADD COLUMN confidence TEXT")
         # v0.5.43: per-trip driver identity.
@@ -1469,7 +1491,15 @@ class TripStorage:
         # v0.8.45 — a hand correction locks what it corrected, so the
         # bulk heals leave it alone. Sticky: set once, never cleared here,
         # exactly like `charges.price_locked`.
-        if {"energy_kwh", "consumption_kwh_100km"} & clean.keys():
+        # v0.8.46 — the lock covers every energy-side column a heal can
+        # rewrite, not just the two v0.8.45 knew about. The v0.8.46
+        # cleanup nulls regen/discharge/gross on charge-overlapped trips,
+        # so a hand correction to any of those has to be protected too or
+        # the migration deletes the user's answer on the next restart.
+        if {
+            "energy_kwh", "consumption_kwh_100km",
+            "regen_kwh", "discharge_kwh", "energy_from_power",
+        } & clean.keys():
             clean["energy_locked"] = 1
         if "cost" in clean:
             clean["cost_locked"] = 1
