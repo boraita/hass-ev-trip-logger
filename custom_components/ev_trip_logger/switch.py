@@ -103,4 +103,12 @@ class AbrpPushSwitch(SwitchEntity, RestoreEntity):
             # accepted; a string is ABRP's own reason for dropping it
             # (most often an unknown `car_model`).
             "last_error": getattr(client, "last_error", None),
+            # v0.8.47 — the two pack figures we push. They are the ones
+            # that broke on 2026-08-26: a calibration drift sent ABRP a
+            # 103.23 % SoH for four days and planned every route against
+            # a battery better than new, with nothing on screen saying
+            # what we were telling it. Surfacing them makes the push
+            # auditable at a glance instead of after a forensic dig.
+            "sent_capacity_kwh": round(self._coordinator.battery_capacity, 2),
+            "sent_soh_pct": self._coordinator.battery_soh_pct,
         }

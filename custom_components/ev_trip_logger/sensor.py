@@ -1694,6 +1694,25 @@ class AbrpNextChargeSocSensor(_BaseTripSensor):
     def native_value(self) -> int | None:
         return self._value
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """v0.8.47 — why the state is what it is.
+
+        `unknown` had two very different meanings and no way to tell them
+        apart: ABRP answered and no route is planned, or the call never
+        landed. A consumer that guesses picks "no route" and tells the
+        user something nobody verified.
+        """
+        client = self._coordinator._abrp
+        checked = getattr(client, "next_charge_checked_at", None)
+        return {
+            "status": getattr(client, "next_charge_status", None),
+            "checked_at": (
+                dt_util.utc_from_timestamp(checked).isoformat()
+                if checked else None
+            ),
+        }
+
 
 # v0.8.17 — floors for the SoH degradation rate. Below either of these a
 # two-point slope is dominated by the noise of the capacity estimate

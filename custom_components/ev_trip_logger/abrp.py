@@ -152,6 +152,15 @@ class AbrpClient:
         self._suppress_until = 0.0
         #: Last next-charge target SoC read from ABRP (None when no active route).
         self.next_charge_soc: int | None = None
+        #: v0.8.47 — WHY there is no next-charge value. Until now the
+        #: getter returned None for "ABRP answered, no route planned" and
+        #: for "the call never got through", and a UI cannot tell those
+        #: apart — it ends up asserting "no active route" when the real
+        #: answer is a dead token. One of: "ok", "no_route",
+        #: "http_<code>", "network", "unparsed", or None before the first
+        #: attempt.
+        self.next_charge_status: str | None = None
+        self.next_charge_checked_at: float | None = None
         #: Timestamp of the last successful send (for diagnostics).
         self.last_sent_at: float | None = None
         #: Last rejection reported by ABRP in a 200 response body, or None
@@ -227,8 +236,21 @@ class AbrpClient:
             return False
 
     async def refresh_next_charge(self) -> int | None:
-        """Read the next-charge target SoC (only set while a route is active)."""
+        """Read the next-charge target SoC (only set while a route is active).
+
+        v0.8.47 — every exit now records `next_charge_status` as well.
+        Previously a failed call and an idle planner both returned None,
+        so the dashboard rendered "no active route in ABRP" for a dead
+        token, a network drop and a genuine absence of route alike. That
+        is a claim we had no basis for: only the `no_route` branch knows
+        anything about the planner.
+
+        The value is deliberately NOT cleared on a transient failure — a
+        target read a minute ago is better than a blank while the network
+        hiccups — but the status says the reading is stale.
+        """
         if self._suppressed:
+            self.next_charge_status = "suppressed"
             return self.next_charge_soc
         params = {"api_key": self._api_key, "token": self._token}
         try:
@@ -236,12 +258,31 @@ class AbrpClient:
                 NEXT_CHARGE_ENDPOINT, params=params, timeout=_HTTP_TIMEOUT
             ) as resp:
                 if resp.status != 200:
+                    self.next_charge_status = f"http_{resp.status}"
+                    self.next_charge_checked_at = time.time()
+                    _LOGGER.debug(
+                        "ABRP get_next_charge: HTTP %s", resp.status
+                    )
                     return self.next_charge_soc
                 data = await resp.json(content_type=None)
-        except ClientError as exc:
+        except (ClientError, ValueError) as exc:
+            self.next_charge_status = "network"
+            self.next_charge_checked_at = time.time()
             _LOGGER.debug("ABRP get_next_charge failed: %s", exc)
             return self.next_charge_soc
-        self.next_charge_soc = _parse_next_charge(data)
+        self.next_charge_checked_at = time.time()
+        parsed = _parse_next_charge(data)
+        if parsed is not None:
+            self.next_charge_soc = parsed
+            self.next_charge_status = "ok"
+        elif isinstance(data, dict):
+            # A well-formed answer carrying no target: the planner really
+            # has no route running. This is the ONLY branch entitled to
+            # say so, and it is the one that clears a stale value.
+            self.next_charge_soc = None
+            self.next_charge_status = "no_route"
+        else:
+            self.next_charge_status = "unparsed"
         return self.next_charge_soc
 
 
