@@ -216,3 +216,80 @@ async def test_send_clears_last_error_after_recovery() -> None:
     assert client.last_error is not None
     assert await client.send({"soc": 50.0}) is True
     assert client.last_error is None
+
+
+# ---------------------------------------------------------------------------
+# v0.8.47 — "no value" is not one answer, it is four.
+# ---------------------------------------------------------------------------
+
+class _NcResp:
+    def __init__(self, status, payload):
+        self.status = status
+        self._payload = payload
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    async def json(self, content_type=None): return self._payload
+
+
+class _NcSession:
+    """Minimal aiohttp stand-in: one canned response, or an exception."""
+    def __init__(self, resp=None, raises=None):
+        self._resp, self._raises = resp, raises
+    def get(self, *a, **kw):
+        if self._raises:
+            raise self._raises
+        return self._resp
+
+
+def _nc_client(session):
+    from custom_components.ev_trip_logger.abrp import AbrpClient
+    return AbrpClient(session=session, api_key="k", token="t")
+
+
+async def test_no_route_is_distinguished_from_a_failed_call() -> None:
+    """The whole point: these two used to be indistinguishable.
+
+    Both returned None, so the dashboard rendered "no active route in
+    ABRP" for a dead token exactly as it did for an idle planner — a
+    claim about the planner that nothing had verified.
+    """
+    from aiohttp import ClientError
+
+    idle = _nc_client(_NcSession(_NcResp(200, {"status": "ok", "result": {}})))
+    assert await idle.refresh_next_charge() is None
+    assert idle.next_charge_status == "no_route"
+
+    dead = _nc_client(_NcSession(_NcResp(401, {})))
+    assert await dead.refresh_next_charge() is None
+    assert dead.next_charge_status == "http_401"
+
+    down = _nc_client(_NcSession(raises=ClientError("boom")))
+    assert await down.refresh_next_charge() is None
+    assert down.next_charge_status == "network"
+
+
+async def test_an_active_route_reports_its_target_and_ok() -> None:
+    c = _nc_client(_NcSession(_NcResp(200, {"status": "ok", "result": {"soc": 23}})))
+    assert await c.refresh_next_charge() == 23
+    assert c.next_charge_status == "ok"
+    assert c.next_charge_checked_at is not None
+
+
+async def test_a_transient_failure_keeps_the_last_known_target() -> None:
+    """A target read a minute ago beats a blank while the network hiccups.
+
+    Only a well-formed "no route" answer is allowed to clear it, because
+    only that answer knows the route ended.
+    """
+    from aiohttp import ClientError
+
+    c = _nc_client(_NcSession(_NcResp(200, {"status": "ok", "result": {"soc": 23}})))
+    assert await c.refresh_next_charge() == 23
+
+    c._session = _NcSession(raises=ClientError("boom"))
+    assert await c.refresh_next_charge() == 23, "stale, but better than blank"
+    assert c.next_charge_status == "network"
+
+    c._session = _NcSession(_NcResp(200, {"status": "ok", "result": {}}))
+    assert await c.refresh_next_charge() is None, "the route really ended"
+    assert c.next_charge_status == "no_route"

@@ -2,6 +2,19 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.47 — 2026-08-27
+**Fix — "no next-charge target" had four possible causes and reported one.** The ABRP next-charge read now records *why* it has no value, and the sensor exposes it.
+
+`refresh_next_charge` returned `None` for an idle planner, a rejected token, a network drop and an unparseable body alike. A dashboard reading that `None` has no choice but to guess, and the guess it made was **"no active route in ABRP"** — a statement about the planner that nothing had verified. On a dead token it was simply false.
+
+The client now sets `next_charge_status` on every exit: `ok`, `no_route`, `http_<code>`, `network`, `unparsed`, or `suppressed`. Only the `no_route` branch — a well-formed answer that carries no target — is entitled to say the planner is idle, and it is the only one that clears a previously-read target. A transient failure deliberately **keeps** the last value: a target read a minute ago beats a blank while the network hiccups, and the status marks it stale.
+
+`sensor.<device>_abrp_next_charge_soc` gained `status` and `checked_at` attributes.
+
+**Also — the telemetry switch now shows the two pack figures being pushed**, as `sent_capacity_kwh` and `sent_soh_pct`. Those are exactly what broke on 2026-08-26: a calibration drift sent ABRP a 103.23 % SoH for four days, so every route was planned against a battery better than new, and nothing on screen said what we were telling it. It took a two-agent investigation to find. Now it is one glance.
+
+Four new tests covering all four outcomes, the active-route case, and the stale-value rule. Renaming was needed: the first draft's helpers collided with existing ones in `test_abrp.py` and silently broke a passing test — caught because that test then failed.
+
 ## v0.8.46 — 2026-08-27
 **Fix — a trip no longer reports the charger's power as its own regeneration.** When a charge runs inside a trip's window, `regen_kwh`, `discharge_kwh` and `energy_from_power` are dropped at close, and a startup migration clears the rows already written that way.
 
