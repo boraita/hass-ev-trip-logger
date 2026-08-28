@@ -2098,6 +2098,52 @@ async def test_correcting_the_energy_leaves_the_cost_free_to_re_derive(
     )
 
 
+async def test_short_trips_cannot_win_the_efficiency_record(
+    storage: TripStorage,
+) -> None:
+    """v0.8.48 — a rate ranked over a distance too short to measure it.
+
+    SoC is reported in whole percent, so a trip's energy carries about
+    one step of quantisation — 0.825 kWh on an 82.5 kWh pack. At a
+    typical 20 kWh/100 km that is ~4 km of driving, so on a 3 km hop the
+    error is larger than the trip.
+
+    The result on the author's real history: the podium was 1.83, 1.84
+    and 4.34 kWh/100 km, on trips of 3, 4 and 19 km. No electric car does
+    1.8 kWh/100 km. The list was ranking measurement noise — and ranking
+    it by how noisy it was, since the shorter the trip the better it
+    scored.
+    """
+    base = dt_util.now() - timedelta(days=1)
+
+    async def trip(km: float, cons: float, mins: float = 30.0):
+        await storage.async_insert(TripRecord(
+            started_at=base, ended_at=base + timedelta(minutes=mins),
+            duration_min=mins, distance_km=km,
+            energy_kwh=km * cons / 100.0, consumption_kwh_100km=cons,
+            avg_speed_kmh=km / (mins / 60.0), cost=1.0,
+        ))
+
+    await trip(3.0, 1.83)     # the impossible one that used to win
+    await trip(19.0, 4.34)    # a fragment of a longer drive
+    await trip(60.0, 17.5)    # a real, well-measured drive
+    await trip(120.0, 19.2)
+
+    tops = await storage.async_tops_lists(limit=9)
+    eff = tops["top_efficiency"]
+    assert [t["distance_km"] for t in eff] == [60.0, 120.0], (
+        "only trips long enough to measure a rate are eligible"
+    )
+    assert eff[0]["consumption_kwh_100km"] == pytest.approx(17.5)
+
+    # The same short trips are still eligible everywhere the ranking key
+    # is measured directly rather than derived from a quantised SoC.
+    assert any(t["distance_km"] == 3.0 for t in tops["cheapest"]), (
+        "cost is not a rate over distance; a short trip may genuinely be "
+        "the cheapest"
+    )
+
+
 async def test_startup_clears_false_regen_on_charge_overlapped_trips(
     storage: TripStorage,
 ) -> None:

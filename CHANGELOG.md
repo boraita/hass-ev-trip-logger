@@ -2,6 +2,33 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.48 — 2026-08-29
+**Fix — the efficiency record was ranking measurement noise, and ranking it by how noisy it was.** A trip now needs at least 40 km to be eligible for `top_efficiency`.
+
+The podium on the author's real history:
+
+| | distance | consumption |
+|---|---|---|
+| 1st | 3 km | **1.83 kWh/100 km** |
+| 2nd | 4 km | **1.84 kWh/100 km** |
+| 3rd | 19 km | 4.34 kWh/100 km |
+
+No electric car does 1.8 kWh/100 km. These are 3-4 km hops where the SoC simply never ticked down, so the energy came out near zero and they swept the board.
+
+**The arithmetic behind the threshold.** SoC is reported in whole percent, so one step is capacity/100 — about 0.825 kWh on an 82.5 kWh pack — and a trip's energy carries roughly that much quantisation error. At a typical 20 kWh/100 km one step is ~4 km of driving, so:
+
+| trip | energy | quantisation error |
+|---|---|---|
+| 10 km | 2.0 kWh | 41 % |
+| 20 km | 4.0 kWh | 21 % |
+| **40 km** | 8.0 kWh | **10 %** |
+
+40 km is where the error drops to roughly a tenth of the figure. On this history it costs almost nothing — 23 trips of 60 qualify, against 24 at a 30 km bar — so the tighter bound is free.
+
+**Only `top_efficiency` is gated**, deliberately. `top_consumption` sorts on absolute `energy_kwh`, which a 3 km trip cannot win; distance, duration and speed are measured directly and carry no SoC quantisation at all; and `cheapest` ranks cost, where a short trip may genuinely be the cheapest — a test asserts short trips are still eligible there.
+
+Tests: one new covering the real podium shape, and an existing assertion updated. That old assertion — a 10 km trip winning the efficiency record — encoded the defect as the expected result, which is why it never caught it. Both were verified to fail with the gate disabled.
+
 ## v0.8.47 — 2026-08-27
 **Fix — "no next-charge target" had four possible causes and reported one.** The ABRP next-charge read now records *why* it has no value, and the sensor exposes it.
 

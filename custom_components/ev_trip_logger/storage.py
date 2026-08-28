@@ -4387,6 +4387,34 @@ class TripStorage:
         """Top-N trips per criterion (distance, duration, consumption, efficiency, speed)."""
         return await self._hass.async_add_executor_job(self._tops_lists, limit)
 
+    #: v0.8.48 — minimum distance for a trip to be eligible for the
+    #: EFFICIENCY record. That list ranks a RATE (kWh/100 km), and a rate
+    #: computed from a quantised numerator is meaningless over a short
+    #: distance.
+    #:
+    #: The arithmetic: SoC is reported in whole percent, so one step is
+    #: capacity/100 — about 0.825 kWh on an 82.5 kWh pack — and a trip's
+    #: energy carries roughly that much quantisation error. At a typical
+    #: 20 kWh/100 km, one step is ~4 km of driving. For the error to stay
+    #: under ~10 % of the trip's energy the trip has to cover ~40 km.
+    #:
+    #: What it was doing without this gate, on the author's history:
+    #:
+    #:   1st  3 km   1.83 kWh/100 km
+    #:   2nd  4 km   1.84 kWh/100 km
+    #:   3rd 19 km   4.34 kWh/100 km
+    #:
+    #: No electric car does 1.8 kWh/100 km. Those are 3-4 km hops where
+    #: the SoC simply never ticked down, so the energy came out near zero
+    #: and they swept the podium. The leaderboard was ranking measurement
+    #: noise, and ranking it *by how noisy it was*: the shorter the trip,
+    #: the better it scored.
+    #:
+    #: Only `top_efficiency` is gated. `top_consumption` sorts on absolute
+    #: `energy_kwh`, which a 3 km trip cannot win, and distance / duration
+    #: / speed are measured directly and carry no SoC quantisation at all.
+    _TOPS_MIN_KM_FOR_RATE: float = 40.0
+
     def _tops_lists(self, limit: int) -> dict[str, list[dict[str, Any]]]:
         criteria = {
             # SQL ORDER BY clause and human-friendly key
@@ -4405,13 +4433,18 @@ class TripStorage:
                 # €0 because the user's energy_price option was misconfigured is
                 # noise, not a record. Same goes for top_speed at 0 km/h etc.
                 key = order_by.split()[0]
+                # v0.8.48 — see `_TOPS_MIN_KM_FOR_RATE`.
+                extra = (
+                    f" AND distance_km >= {self._TOPS_MIN_KM_FOR_RATE} "
+                    if name == "top_efficiency" else ""
+                )
                 rows = conn.execute(
                     f"""
                     SELECT id, started_at, ended_at, distance_km, duration_min,
                            energy_kwh, consumption_kwh_100km, avg_speed_kmh, cost,
                            currency, origin, destination
                     FROM trips
-                    WHERE {key} IS NOT NULL AND {key} > 0
+                    WHERE {key} IS NOT NULL AND {key} > 0{extra}
                     ORDER BY {order_by}
                     LIMIT ?
                     """,

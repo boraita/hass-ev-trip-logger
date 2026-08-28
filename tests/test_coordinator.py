@@ -2255,7 +2255,16 @@ async def test_v050_storage_round_trip_positions_and_aggregates(
     tops = await storage.async_tops_lists(limit=5)
     assert "longest" in tops and len(tops["longest"]) == 3
     assert tops["longest"][0]["distance_km"] == 50.0  # tr_b
-    assert tops["top_efficiency"][0]["consumption_kwh_100km"] == 15.0  # tr_c is best
+    # v0.8.48 — tr_c (10 km at 15.0) used to win this. It no longer
+    # qualifies: an efficiency record ranks a RATE, and over 10 km the
+    # 1 %-of-SoC quantisation in the numerator is ~40 % of the trip's
+    # energy. Only tr_b (50 km) clears `_TOPS_MIN_KM_FOR_RATE`.
+    #
+    # The old assertion encoded the defect: on the author's real data this
+    # list was topped by 3 km hops reading 1.83 kWh/100 km, which no
+    # electric car does. It ranked noise, and ranked it by how noisy it was.
+    assert [t["distance_km"] for t in tops["top_efficiency"]] == [50.0]
+    assert tops["top_efficiency"][0]["consumption_kwh_100km"] == 18.0
     assert tops["cheapest"][0]["cost"] == 0.5  # tr_c
 
     # ===== Avg charge metrics =====
