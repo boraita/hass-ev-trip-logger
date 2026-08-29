@@ -580,6 +580,72 @@ async def test_auto_detect_charge_records_session(hass: HomeAssistant) -> None:
     assert "auto-detected" in (coordinator.last_charge.notes or "")
 
 
+async def test_a_cloud_dropout_mid_drive_does_not_split_the_trip(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.49 — `vehicle_on=off` is not proof the ignition went off.
+
+    On a cloud-polled car, losing the car reads exactly like switching it
+    off: `vehicle_on` goes off and `speed` goes to 0 while the car is
+    doing 90 km/h. Measured on the author's install (28/08): off at
+    14:59:48, six minutes of silence, then everything lands at once —
+    speed 80, odometer +10 km. The 180 s grace expired in the hole, so
+    the trip closed and a second one opened, and one 35 km drive became
+    three rows reading 29.5 / 16.5 / 7.5 kWh/100 km against a true 18.9.
+
+    The odometer is the evidence the timer is not: if it advanced while
+    the car claimed to be off, the car was driving. So the deferred close
+    re-checks it and keeps deferring while the kilometres keep coming.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        entry = await _setup(hass, odo=1000.0, bat=80.0, on=True)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=5))
+        hass.states.async_set(ODO, "1030")
+        await hass.async_block_till_done()
+        assert coordinator.current is not None, "a trip must be open"
+
+        # The cloud drops the car mid-drive.
+        hass.states.async_set(VOK, STATE_OFF)
+        await hass.async_block_till_done()
+
+        # Grace expires, but the odometer has moved: the car is driving.
+        frozen.tick(timedelta(seconds=200))
+        hass.states.async_set(ODO, "1040")
+        await hass.async_block_till_done()
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+        assert coordinator.current is not None, (
+            "the odometer moved while 'off' — that is a dropout, not an "
+            "ignition off, and closing here is what split the drive"
+        )
+
+        # The car comes back and finishes the drive.
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=3))
+        hass.states.async_set(ODO, "1055")
+        await hass.async_block_till_done()
+
+        # Now it really stops: off, and the odometer stays put.
+        hass.states.async_set(VOK, STATE_OFF)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(seconds=200))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    assert coordinator.current is None, "a real stop still closes the trip"
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.distance_km == pytest.approx(55.0), (
+        "one trip covering the whole drive, dropout included"
+    )
+
+
 async def test_charge_energy_prefers_power_integration_with_good_coverage(
     hass: HomeAssistant,
 ) -> None:

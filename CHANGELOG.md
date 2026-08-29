@@ -2,6 +2,32 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.49 — 2026-08-29
+**Fix — a cloud dropout mid-drive no longer splits one journey into several trips.** The deferred close now re-checks the odometer, and keeps deferring while the kilometres keep arriving.
+
+On a cloud-polled car, losing contact reads exactly like switching the ignition off: `vehicle_on` goes to `off` and `speed` to 0 while the car is doing 90 km/h. Measured on the author's install:
+
+```
+14:59:48   vehicle_on → off,  speed → 0
+           ...six minutes with no data at all...
+15:05:59   vehicle_on → on,  speed 80,  odometer 31998 → 32008
+```
+
+The odometer advanced **10 km** while the car claimed to be off. The 180 s grace expired inside the hole, so the trip closed and another opened — and one continuous 35 km drive became three rows reading **29.5 / 16.5 / 7.5 kWh/100 km** against a true 18.9. Across the author's 60 most recent trips, **18 (30 %) sit in such a chain**, boundaries matching to the second.
+
+**Why not just raise the grace.** It would be a guess — the real holes here run from 0.4 to 17.7 minutes, so no timer covers them without delaying every honest trip close by the same amount — and it treats the symptom. The odometer is the actual evidence: if it advanced while the car claimed to be off, the car was driving, whatever the sensor said. That works at any gap length and needs no threshold.
+
+Two details that took a second pass to get right:
+
+* The comparison baseline is the reading at the **last check**, not at the off-edge. Against the off-edge, once the car had moved 0.5 km the trip could never close until the hard cap.
+* `ended_at` advances with it. On a dropout the trip really did continue past the false off-edge, so closing at the original `off_ts` would discard the kilometres the odometer had just proved.
+
+`_VEHICLE_OFF_MAX_DEFER_S` (1 h) bounds the whole thing, because an odometer that only catches up in one lump *after* a real stop would otherwise hold a finished trip open forever. Hitting that cap logs a warning rather than passing silently.
+
+This replaces nothing from v0.8.48 — that gated the efficiency *record* against quantisation noise, which is a different defect with a different cause. This one stops the trips fragmenting in the first place.
+
+One new test, built from the measured sequence, verified to fail without the change.
+
 ## v0.8.48 — 2026-08-29
 **Fix — the efficiency record was ranking measurement noise, and ranking it by how noisy it was.** A trip now needs at least 40 km to be eligible for `top_efficiency`.
 
