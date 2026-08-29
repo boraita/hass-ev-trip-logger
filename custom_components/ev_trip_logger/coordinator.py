@@ -295,6 +295,27 @@ _VEHICLE_ON_OFF_DEBOUNCE_S = 3.0
 # duration. Live snapshot updates pause as soon as the off arrives —
 # the sensors don't keep ticking during the grace window.
 _VEHICLE_OFF_GRACE_S = 180.0
+# v0.8.49 — the grace above is a TIMER, and a cloud-polled vehicle_on can
+# go 'off' for reasons that have nothing to do with the ignition: when the
+# upstream cloud loses the car, `vehicle_on` reads off and `speed` reads 0
+# while the car is doing 90 km/h. Measured on 28/08: off at 14:59:48,
+# silence, then at 15:05:59 everything lands at once — speed 80, odometer
+# +10 km. A 6-minute hole, well past the 180 s grace, so the trip closed
+# and a second one opened. One 35 km drive became three rows reading
+# 29.5 / 16.5 / 7.5 kWh/100 km against a true 18.9.
+#
+# Raising the timer is the wrong fix twice over: it is a guess (the real
+# holes here run 0.4 to 17.7 minutes, so no value covers them without
+# delaying every honest trip close by that long), and it treats a
+# symptom. The odometer is the actual evidence — if it advanced while the
+# car claimed to be off, the car was driving, whatever the sensor said.
+#
+# So the deferred close re-checks the odometer before committing, and
+# keeps deferring while the kilometres keep coming. `_VEHICLE_OFF_MAX_DEFER_S`
+# bounds it, because an odometer that catches up in one lump AFTER a real
+# stop would otherwise hold a finished trip open forever.
+_VEHICLE_OFF_MOVED_KM = 0.5
+_VEHICLE_OFF_MAX_DEFER_S = 3600.0
 # v0.5.79 — stuck-trip watchdog. The idle watchdog (_async_live_tick)
 # only force-closes when vehicle_on=off. When the upstream integration
 # (BYD cloud poll, Tesla Fleet) goes offline for hours, vehicle_on may
@@ -2546,11 +2567,52 @@ class EvTripLoggerCoordinator:
                 self._pending_close_unsub()
                 self._pending_close_unsub = None
             off_ts = now
+            # v0.8.49 — carried across re-checks. `odo` is the reading at
+            # the LAST check, not at the off-edge: comparing against the
+            # off-edge forever would mean that once the car had moved
+            # 0.5 km the trip could never close until the hard cap. And
+            # `end_ts` advances with it, because on a dropout the trip
+            # really did continue past the false off-edge — closing it at
+            # `off_ts` would throw away the kilometres it just proved.
+            defer = {"odo": self._read_float(self._odometer), "end_ts": off_ts}
 
             @callback
             def _debounced_close(_at: datetime) -> None:
                 self._pending_close_unsub = None
-                self.hass.async_create_task(self._async_close_trip(off_ts))
+                # The odometer decides, not the timer. If it moved while
+                # the car claimed to be off, that was a cloud dropout
+                # mid-drive and closing here would split one journey.
+                odo_now = self._read_float(self._odometer)
+                waited = (dt_util.now() - off_ts).total_seconds()
+                moved = (
+                    defer["odo"] is not None
+                    and odo_now is not None
+                    and odo_now - defer["odo"] >= _VEHICLE_OFF_MOVED_KM
+                )
+                if moved and waited < _VEHICLE_OFF_MAX_DEFER_S:
+                    _LOGGER.info(
+                        "vehicle_on=off but the odometer moved %.1f km — "
+                        "the cloud lost the car mid-drive, not an ignition "
+                        "off. Keeping the trip open (%.0f s so far).",
+                        odo_now - defer["odo"], waited,
+                    )
+                    defer["odo"] = odo_now
+                    defer["end_ts"] = dt_util.now()
+                    self._pending_close_unsub = async_call_later(
+                        self.hass, _VEHICLE_OFF_GRACE_S, _debounced_close
+                    )
+                    return
+                if moved:
+                    _LOGGER.warning(
+                        "vehicle_on=off, odometer still moving after %.0f s "
+                        "— closing anyway at the deferral cap. An odometer "
+                        "that only catches up in lumps would otherwise hold "
+                        "a finished trip open forever.",
+                        waited,
+                    )
+                self.hass.async_create_task(
+                    self._async_close_trip(defer["end_ts"])
+                )
 
             self._pending_close_unsub = async_call_later(
                 self.hass, _VEHICLE_OFF_GRACE_S, _debounced_close
