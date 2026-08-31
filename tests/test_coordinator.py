@@ -919,6 +919,73 @@ async def test_acceptance_band_still_rejects_an_impossible_integral(
     assert coordinator.last_charge.kwh == pytest.approx(41.25, abs=0.05)
 
 
+async def test_a_single_huge_gap_disqualifies_the_integral(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.50 — coverage measured the SPAN, and was blind inside it.
+
+    The v0.8.14 check is (last - first) / duration, so samples at both
+    ends of a long session score 100 % however little happens between.
+
+    Charge 74 was that shape: a solar-modulated home charge cycling on and
+    off every 10-20 s, 14.3 h long, and one gap of **237 minutes**. Any
+    gap over `_MAX_POWER_TRAPEZOID_DT_H` is dropped, so the energy that
+    flowed during those four hours was never counted — the integral came
+    out 26.25 kWh against 40.6 kWh on the wall meter, 32 % short, yet
+    still *inside* the ±40 % plausibility band. It was adopted as a
+    measurement and entered the capacity pool implying a 55.9 kWh pack.
+
+    That "inside the band" part is what makes this test non-trivial: an
+    integral short enough to fail the band would have been caught
+    already. Here 30 kWh of well-sampled charging lands comfortably
+    inside the band for a 40-point delta (`[19.8, 46.2]`), and only the
+    45-minute hole afterwards can disqualify it.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(POW, "0")
+        hass.states.async_set(CHG, STATE_OFF)
+        entry = await _setup(
+            hass, bat=20.0,
+            **{CONF_BATTERY_CAPACITY: 82.5, CONF_CHARGE_SENSOR: CHG,
+               CONF_POWER: POW},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+
+        # 20 kW sampled every 10 min for 90 min = 30.0 kWh, densely
+        # covered and well inside the band.
+        hass.states.async_set(POW, "-20", force_update=True)
+        await hass.async_block_till_done()
+        for _ in range(9):
+            frozen.tick(timedelta(minutes=10))
+            hass.states.async_set(POW, "-20", force_update=True)
+            await hass.async_block_till_done()
+
+        # The hole. Power kept flowing; nobody sampled it.
+        frozen.tick(timedelta(minutes=45))
+        hass.states.async_set(POW, "-20", force_update=True)
+        await hass.async_block_till_done()
+
+        hass.states.async_set(BAT, "60")
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=1))
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+    assert coordinator.last_charge is not None
+    assert coordinator.last_charge.kwh == pytest.approx(33.0, abs=0.5), (
+        "falls back to SoC math: 40 points of a declared 82.5 kWh pack"
+    )
+    assert coordinator.last_charge.energy_source == "soc_delta", (
+        "a 45-minute hole makes the integral incomplete, however wide the "
+        "samples span and however plausible the total looks"
+    )
+
+
 async def test_charge_energy_distrusts_sparse_power_samples(
     hass: HomeAssistant,
 ) -> None:

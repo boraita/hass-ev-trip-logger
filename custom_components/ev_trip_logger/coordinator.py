@@ -450,6 +450,36 @@ _EVSE_SOURCE_MATCH_RATIO = 0.10
 _EVSE_SOURCE_MATCH_ABS_KWH = 0.25
 _CHARGE_ENERGY_MIN_SAMPLES = 3
 _CHARGE_ENERGY_MIN_COVERAGE_RATIO = 0.5
+# v0.8.50 — the coverage ratio above measures the SPAN the samples cover,
+# (last - first) / duration, and is blind to what happens between them:
+# two samples, one at each end of a 14-hour session, score 100 %.
+#
+# Charge 74 was exactly that. A solar-modulated home charge cycling on and
+# off every 10-20 s, 14.3 hours long, 6.3 samples per hour and one gap of
+# **237 minutes**. The mechanism is not a bad interpolation: any gap over
+# `_MAX_POWER_TRAPEZOID_DT_H` (20 min) is DROPPED, so the energy that
+# flowed during those four hours was never counted at all. The integral
+# came out at 26.25 kWh against 40.6 kWh on the wall meter — 32 % short.
+# That row then entered the capacity pool implying a 55.9 kWh pack against
+# a median of 83.8, and every future solar charge would add another.
+#
+# So the dropped segments are the evidence, and the gap has to be measured
+# before the cap discards them.
+#
+# Measured across the recent power-integration charges, the separation is
+# not subtle:
+#
+#   id 64   4.0 h   29.8 samples/h   worst gap    8 min   -> 90.1 kWh
+#   id 66   0.7 h   66.0             worst gap    3 min   -> 77.5
+#   id 68   1.1 h   53.1             worst gap    8 min   -> 86.2
+#   id 69   0.3 h  111.8             worst gap    1 min   -> 85.2
+#   id 74  14.3 h    6.3             worst gap  237 min   -> 55.9  BAD
+#
+# No good session exceeded 8 minutes. 30 minutes sits four times above
+# that and eight times below the bad one, so it separates them without
+# sitting on either. Density per hour was NOT chosen: it fails on a short
+# session with few but well-spaced samples, where the integral is fine.
+_CHARGE_ENERGY_MAX_GAP_H = 0.5
 _CHARGE_ENERGY_TOLERANCE = 0.4
 # v0.5.54 — degradation tracking. Persist a new row in `capacity_history`
 # whenever the calibrated value moves by more than this threshold. Smaller
@@ -746,6 +776,13 @@ class ChargeInProgress:
     # would otherwise look numerically fine and still be very wrong).
     _power_sample_count: int = 0
     _first_charge_power_ts: datetime | None = None
+    # v0.8.50 — the LARGEST gap between two consecutive integrated
+    # samples, in hours. The v0.8.14 coverage check divides
+    # (last - first) by the session duration, which measures the SPAN the
+    # samples cover and says nothing about what happens inside it: two
+    # samples, one at each end, score 100 %. That is exactly the shape
+    # that produced charge 74 — see `_CHARGE_ENERGY_MAX_GAP_H`.
+    _max_power_gap_h: float = 0.0
     # v0.5.89 — same integral but from the EVSE / wallbox side
     # (`CONF_EVSE_POWER_SENSOR`). Charger output is typically 5-15 %
     # higher than what the battery receives — AC→DC conversion losses
@@ -3446,6 +3483,15 @@ class EvTripLoggerCoordinator:
             prev_ts = self.current_charge._last_power_ts
             if prev_kw is not None and prev_ts is not None:
                 dt_h = (now - prev_ts).total_seconds() / 3600.0
+                # v0.8.50 — the worst hole, tracked BEFORE the
+                # `_MAX_POWER_TRAPEZOID_DT_H` cap. It has to be here: a
+                # gap over that cap is DROPPED, so counting only accepted
+                # segments could never record a hole bigger than 20 min —
+                # which is precisely the shape that needs catching. The
+                # first draft of this had the update inside the branch
+                # below, where it was inert.
+                if dt_h > self.current_charge._max_power_gap_h:
+                    self.current_charge._max_power_gap_h = dt_h
                 # Kept nested: the outer test is "is this sample pair
                 # spaced sanely", the inner one "is it charging at all".
                 if 0 < dt_h <= _MAX_POWER_TRAPEZOID_DT_H:  # noqa: SIM102
@@ -4129,6 +4175,9 @@ class EvTripLoggerCoordinator:
             active._power_sample_count >= _CHARGE_ENERGY_MIN_SAMPLES
             and session_duration_h > 0
             and covered_h / session_duration_h >= _CHARGE_ENERGY_MIN_COVERAGE_RATIO
+            # v0.8.50 — and no single hole big enough to make the
+            # trapezoid a guess. See `_CHARGE_ENERGY_MAX_GAP_H`.
+            and active._max_power_gap_h <= _CHARGE_ENERGY_MAX_GAP_H
         )
         if active.energy_added_kwh > 0 and good_coverage:
             # v0.8.39 — the acceptance band is anchored on the DECLARED
@@ -4187,10 +4236,12 @@ class EvTripLoggerCoordinator:
         elif active.energy_added_kwh > 0:
             _LOGGER.info(
                 "Charge kWh: power-integration %.2f has weak coverage "
-                "(%d samples over %.0f %% of the session) — falling back "
-                "to SoC math (%.2f kWh) regardless of proximity.",
+                "(%d samples over %.0f %% of the session, worst gap "
+                "%.0f min) — falling back to SoC math (%.2f kWh) "
+                "regardless of proximity.",
                 active.energy_added_kwh, active._power_sample_count,
                 covered_h / session_duration_h * 100.0 if session_duration_h > 0 else 0.0,
+                active._max_power_gap_h * 60.0,
                 kwh_soc,
             )
         # v0.5.89 — log the EVSE/wallbox side delivery + implied

@@ -2,6 +2,33 @@
 
 Summarised, human-readable history from v0.8.0 onward. Full technical detail for every release (including everything before v0.8.0) lives in [GitHub Releases](https://github.com/boraita/hass-ev-trip-logger/releases) and the commit history.
 
+## v0.8.50 — 2026-08-31
+**Fix — the charge-coverage check measured how *wide* the power samples were spread, not whether anything was sampled in between.** It now also rejects an integral containing a hole longer than 30 minutes.
+
+The v0.8.14 check is `(last - first) / duration`, so samples at both ends of a long session score 100 % however little happens between them.
+
+A real charge on the author's install: a solar-modulated home session cycling on and off every 10-20 s, 14.3 hours long, 6.3 samples per hour, and **one gap of 237 minutes**. Any gap over `_MAX_POWER_TRAPEZOID_DT_H` (20 min) is dropped, so the energy that flowed during those four hours was never counted. The integral came out at **26.25 kWh against 40.6 kWh on the wall meter — 32 % short** — and still landed *inside* the ±40 % plausibility band, so it was adopted as a measurement. The row then entered the capacity pool implying a **55.9 kWh** pack against a pool median of 83.8.
+
+The clamp absorbed it this time and one outlier of nine does not move a median. But every future solar-modulated charge would add another 55-ish sample, and once they were the majority the calibration would have followed them.
+
+Measured across the recent power-integration charges, the separation is not subtle:
+
+| charge | duration | samples/h | worst gap | implied capacity |
+|---|---|---|---|---|
+| 64 | 4.0 h | 29.8 | 8 min | 90.1 kWh |
+| 66 | 0.7 h | 66.0 | 3 min | 77.5 |
+| 68 | 1.1 h | 53.1 | 8 min | 86.2 |
+| 69 | 0.3 h | 111.8 | 1 min | 85.2 |
+| **74** | 14.3 h | 6.3 | **237 min** | **55.9** |
+
+No good session exceeded 8 minutes. 30 minutes sits four times above that and eight times below the bad one. **Density per hour was measured and rejected as the discriminator**: it fails on a short session with few but well-spaced samples, where the integral is fine.
+
+**Two mistakes in the first draft, both worth recording.** The gap tracking was placed inside the branch that only runs for *accepted* trapezoid segments — where it could never observe a hole larger than 20 minutes, i.e. it was inert for exactly the case it existed to catch. It now updates before the cap, because a dropped segment *is* the evidence. And the constant's comment described the mechanism as a bad interpolation across the gap; it is not — the segment is discarded and the energy is simply missing.
+
+The weak-coverage log line now names the worst gap alongside the sample count.
+
+One new test. Its first two versions passed with the guard disabled and therefore proved nothing: a hole big enough to matter also drags the integral below the ±40 % band, so the band caught it first. The committed version puts 30 kWh of densely-sampled charging *inside* the band for a 40-point delta and then adds the hole, so only the gap check can disqualify it — which is the shape charge 74 actually had.
+
 ## v0.8.49 — 2026-08-29
 **Fix — a cloud dropout mid-drive no longer splits one journey into several trips.** The deferred close now re-checks the odometer, and keeps deferring while the kilometres keep arriving.
 
