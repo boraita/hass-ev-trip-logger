@@ -609,7 +609,16 @@ class EvTripLoggerOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            # Merge onto the stored options instead of replacing them.
+            # HA's options-flow frontend omits vol.Optional fields the
+            # user did not touch (EntitySelector especially), so a bare
+            # `data=user_input` silently blanks every untouched optional.
+            # This mirrors the merge async_step_reconfigure already does;
+            # the effective config {**data, **options} comes out identical
+            # to that flow. A text field cleared to "" still overwrites,
+            # so intentional clears of text options keep working.
+            merged = {**self.config_entry.options, **user_input}
+            return self.async_create_entry(title="", data=merged)
 
         defaults = {**self.config_entry.data, **self.config_entry.options}
         # v0.5.67 — combine required + optional schemas so odometer /
