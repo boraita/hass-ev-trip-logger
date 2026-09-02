@@ -39,6 +39,7 @@ from custom_components.ev_trip_logger.const import (
     SERVICE_END_TRIP,
     SERVICE_LOG_CHARGE,
     CONF_LAST_TRIP_ENERGY_SENSOR,
+    CONF_BATTERY_ENERGY_SENSOR,
 )
 
 CHG = "binary_sensor.byd_charging"
@@ -49,6 +50,7 @@ BAT = "sensor.battery"
 VOK = "binary_sensor.vehicle_on"
 POW = "sensor.power"
 SPD = "sensor.speed"
+PACK = "sensor.pack_energy"  # v0.8.52 — usable kWh in the pack
 
 
 def _seed_states(hass: HomeAssistant, *, odo: float, bat: float, on: bool) -> None:
@@ -4927,3 +4929,257 @@ async def test_charge_attrs_expose_the_charger_rating(hass: HomeAssistant) -> No
         ended_at=dt_util.now(), kwh=40.0, price_per_kwh=0.3, total_cost=12.0,
     ))
     assert bare["charger_power_kw"] is None
+
+
+# ---------------------------------------------------------------------------
+# v0.8.52 — pack-energy sensor (CONF_BATTERY_ENERGY_SENSOR) overlay.
+# ---------------------------------------------------------------------------
+async def test_trip_energy_prefers_pack_delta_when_fresh(
+    hass: HomeAssistant,
+) -> None:
+    """A fresh, guarded pack-energy pair overrides SoC-delta trip energy.
+
+    Open 75 kWh @ 90 %, close 68 kWh @ 80 %. SoC math would say
+    (90-80)/100 * 75 = 7.5 kWh; the pack delta is 75-68 = 7.0 kWh and
+    must win, tagged `pack_energy`.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(PACK, "75")
+        entry = await _setup(
+            hass, bat=90.0, **{CONF_BATTERY_ENERGY_SENSOR: PACK},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+        assert coordinator.current is not None
+        assert coordinator.current.energy_start_kwh == pytest.approx(75.0)
+
+        frozen.tick(timedelta(minutes=2))
+        hass.states.async_set(ODO, "1015")
+        hass.states.async_set(PACK, "68")
+        hass.states.async_set(BAT, "80")
+        await hass.async_block_till_done()
+
+        hass.states.async_set(VOK, STATE_OFF)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=4))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    assert coordinator.current is None
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.energy_kwh == pytest.approx(7.0)
+    assert coordinator.last_trip.energy_source == "pack_energy"
+
+
+async def test_trip_energy_falls_back_when_pack_stale(
+    hass: HomeAssistant,
+) -> None:
+    """Isolation regression: a stale pack reading at close is ignored and
+    trip energy is exactly today's SoC math.
+
+    The pack sensor is configured and was fresh at open, but goes quiet
+    for >15 min before close, so the close reading is stale and the
+    trip must fall back to the SoC-delta value (7.5 kWh, `soc`).
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(PACK, "75")
+        entry = await _setup(
+            hass, bat=90.0, **{CONF_BATTERY_ENERGY_SENSOR: PACK},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+
+        frozen.tick(timedelta(minutes=1))
+        hass.states.async_set(ODO, "1015")
+        hass.states.async_set(BAT, "80")
+        await hass.async_block_till_done()
+
+        hass.states.async_set(VOK, STATE_OFF)
+        await hass.async_block_till_done()
+        # Pack sensor goes quiet — advance well past the 15 min stale
+        # window before the trip actually closes.
+        frozen.tick(timedelta(minutes=16))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    assert coordinator.current is None
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.energy_kwh == pytest.approx(7.5)
+    assert coordinator.last_trip.energy_source == "soc"
+
+
+async def test_trip_energy_rejects_pack_failing_crosscheck(
+    hass: HomeAssistant,
+) -> None:
+    """A pack reading that contradicts SoC is rejected; energy falls back.
+
+    Open 75 kWh @ 90 %; at close SoC says 80 % but the pack sensor reads
+    40 kWh — |40/75 - 0.80| = 0.27 > 0.15 band, so it is dropped and the
+    trip uses SoC math (7.5 kWh, `soc`).
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(PACK, "75")
+        entry = await _setup(
+            hass, bat=90.0, **{CONF_BATTERY_ENERGY_SENSOR: PACK},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(VOK, STATE_ON)
+        await hass.async_block_till_done()
+
+        frozen.tick(timedelta(minutes=2))
+        hass.states.async_set(ODO, "1015")
+        hass.states.async_set(PACK, "40")  # contradicts SoC
+        hass.states.async_set(BAT, "80")
+        await hass.async_block_till_done()
+
+        hass.states.async_set(VOK, STATE_OFF)
+        await hass.async_block_till_done()
+        frozen.tick(timedelta(minutes=4))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    assert coordinator.current is None
+    assert coordinator.last_trip is not None
+    assert coordinator.last_trip.energy_kwh == pytest.approx(7.5)
+    assert coordinator.last_trip.energy_source == "soc"
+
+
+async def test_charge_energy_prefers_pack_delta_when_fresh(
+    hass: HomeAssistant,
+) -> None:
+    """A fresh, guarded pack-energy pair overrides SoC-delta charge kWh.
+
+    Open 30 kWh @ 40 %, close 60 kWh @ 80 %. The pack delta is 30 kWh
+    and is tagged `pack_energy` (distinct from the `soc_delta` tag the
+    SoC math would carry).
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(CHG, STATE_OFF)
+        hass.states.async_set(PACK, "30")
+        entry = await _setup(
+            hass, bat=40.0,
+            **{CONF_CHARGE_SENSOR: CHG, CONF_BATTERY_ENERGY_SENSOR: PACK},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        hass.states.async_set(CHG, STATE_ON)
+        await hass.async_block_till_done()
+        assert coordinator.current_charge is not None
+        assert coordinator.current_charge.energy_start_kwh == pytest.approx(30.0)
+
+        frozen.tick(timedelta(minutes=10))
+        hass.states.async_set(PACK, "60")
+        hass.states.async_set(BAT, "80")
+        await hass.async_block_till_done()
+
+        hass.states.async_set(CHG, STATE_OFF)
+        await hass.async_block_till_done()
+
+    assert coordinator.current_charge is None
+    assert coordinator.last_charge is not None
+    assert coordinator.last_charge.kwh == pytest.approx(30.0)
+    assert coordinator.last_charge.energy_source == "pack_energy"
+
+
+async def test_cell_capacity_tier_calibrates_from_pack_samples(
+    hass: HomeAssistant,
+) -> None:
+    """Feeding >=5 fresh pack ticks that imply ~80 kWh calibrates the
+    capacity to ~80 via the new `cell` tier.
+
+    SoC 90 %, pack 72 kWh → implied 72 / 0.9 = 80 kWh. Declared is 82.5
+    so the 0.5..1.0x clamp does not bite.
+    """
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()) as frozen:
+        hass.states.async_set(PACK, "72")
+        entry = await _setup(
+            hass, bat=90.0,
+            **{CONF_BATTERY_ENERGY_SENSOR: PACK, CONF_BATTERY_CAPACITY: 82.5},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        for _ in range(5):
+            frozen.tick(timedelta(minutes=6))
+            hass.states.async_set(PACK, "72", force_update=True)
+            hass.states.async_set(BAT, "90", force_update=True)
+            await hass.async_block_till_done()
+
+        await coordinator._async_refresh_battery_capacity()
+        await hass.async_block_till_done()
+
+    assert coordinator._battery_capacity_calibration_source == "cell"
+    assert coordinator._battery_capacity_calibrated == pytest.approx(80.0, abs=0.5)
+
+
+async def test_pack_energy_slope_guard_rejects_impossible_jump(
+    hass: HomeAssistant,
+) -> None:
+    """The physical-slope guard drops a reading that moves faster than
+    250 kW * dt from the last accepted value."""
+    import freezegun
+
+    with freezegun.freeze_time(dt_util.utcnow()):
+        hass.states.async_set(PACK, "90")
+        entry = await _setup(
+            hass, bat=90.0,
+            **{CONF_BATTERY_ENERGY_SENSOR: PACK, CONF_BATTERY_CAPACITY: 100.0},
+        )
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        now = dt_util.now()
+        # A small, physical move from the anchor is accepted...
+        coordinator._pack_energy_last = (now - timedelta(seconds=60), 88.0)
+        assert coordinator._read_pack_energy_guarded(now, 90.0) == pytest.approx(90.0)
+
+        # ...but a 20 kWh jump in 60 s (>> 250 kW * 60 s = 4.17 kWh) is not.
+        coordinator._pack_energy_last = (now - timedelta(seconds=60), 70.0)
+        assert coordinator._read_pack_energy_guarded(now, 90.0) is None
+
+
+async def test_measured_pack_energy_sensor_exposure(hass: HomeAssistant) -> None:
+    """When configured and fresh, the sensor reports the guarded reading
+    and an implied-capacity attribute; when unset, it is not created."""
+    from custom_components.ev_trip_logger.sensor import MeasuredPackEnergySensor
+
+    hass.states.async_set(PACK, "68")
+    entry = await _setup(hass, bat=90.0, **{CONF_BATTERY_ENERGY_SENSOR: PACK})
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    sensor = MeasuredPackEnergySensor(coordinator)
+    assert sensor.native_value == pytest.approx(68.0)
+    attrs = sensor.extra_state_attributes
+    assert attrs["source_entity"] == PACK
+    # implied capacity = 68 / (90/100) = 75.56
+    assert attrs["implied_capacity_kwh"] == pytest.approx(75.56, abs=0.02)
+    assert attrs["fresh"] is True
+
+    # Registered on the entry when configured.
+    registry = er.async_get(hass)
+    uids = {e.unique_id for e in registry.entities.values()}
+    assert f"{coordinator.entry_id}_measured_pack_energy" in uids
+
+
+async def test_measured_pack_energy_sensor_absent_when_unset(
+    hass: HomeAssistant,
+) -> None:
+    """No pack-energy sensor configured → the entity is not created."""
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    registry = er.async_get(hass)
+    uids = {e.unique_id for e in registry.entities.values()}
+    assert f"{coordinator.entry_id}_measured_pack_energy" not in uids

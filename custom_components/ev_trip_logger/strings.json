@@ -140,6 +140,7 @@
       "current_journey": { "name": "Current journey" },
       "recent_journeys": { "name": "Recent journeys" },
       "battery_energy": { "name": "Battery energy" },
+      "measured_pack_energy": { "name": "Measured pack energy" },
       "energy_to_full": { "name": "Energy to full charge" },
       "battery_state": { "name": "Battery percent" },
       "current_driver": { "name": "Current driver" },

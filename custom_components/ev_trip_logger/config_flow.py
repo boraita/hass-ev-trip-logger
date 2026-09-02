@@ -52,6 +52,7 @@ from .const import (
     CONF_POLLING_PAUSED_SENSOR,
     CONF_LAST_TRIP_ENERGY_SENSOR,
     CONF_LAST_TRIP_DISTANCE_SENSOR,
+    CONF_BATTERY_ENERGY_SENSOR,
     CONF_POWER_SIGN_INVERTED,
     CONF_EVSE_POWER_SENSOR,
     CONF_TRACKED_SENSORS,
@@ -324,6 +325,20 @@ def _optional_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="power")
+            ),
+            # v0.8.52 — optional pack-energy sensor: usable kWh remaining
+            # in the battery, read from the vehicle's BMS. A precision
+            # overlay for trip/charge energy and capacity calibration.
+            # No unit_of_measurement on the selector — many BMS energy
+            # entities carry device_class=energy without a UoM the
+            # selector would otherwise filter on.
+            _optional(
+                CONF_BATTERY_ENERGY_SENSOR,
+                EntitySelector(
+                    EntitySelectorConfig(domain="sensor", device_class="energy")
+                ),
+            ): EntitySelector(
+                EntitySelectorConfig(domain="sensor", device_class="energy")
             ),
             vol.Required(
                 CONF_BATTERY_CAPACITY,

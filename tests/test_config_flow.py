@@ -120,3 +120,56 @@ async def test_options_flow_clears_text_option_when_emptied(hass: HomeAssistant)
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options.get(CONF_ABRP_CAR_MODEL) == ""
+
+
+def test_optional_schema_contains_battery_energy_sensor() -> None:
+    """v0.8.52 — the pack-energy sensor must be offered in the options UI."""
+    from custom_components.ev_trip_logger.config_flow import _optional_schema
+    from custom_components.ev_trip_logger.const import CONF_BATTERY_ENERGY_SENSOR
+
+    schema = _optional_schema()
+    keys = {str(marker) for marker in schema.schema}
+    assert CONF_BATTERY_ENERGY_SENSOR in keys
+
+
+async def test_options_flow_preserves_battery_energy_sensor(
+    hass: HomeAssistant,
+) -> None:
+    """v0.8.52 — clone of the untouched-optional merge test for the
+    pack-energy sensor: a stored value must survive a submit that omits
+    the field (frontend drops untouched EntitySelectors)."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from custom_components.ev_trip_logger.const import CONF_BATTERY_ENERGY_SENSOR
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Test EV",
+        data={
+            CONF_NAME: "Test EV",
+            CONF_ODOMETER: "sensor.odometer",
+            CONF_BATTERY: "sensor.battery",
+            CONF_VEHICLE_ON: "binary_sensor.vehicle_on",
+        },
+        options={CONF_BATTERY_ENERGY_SENSOR: "sensor.pack_energy"},
+        unique_id="test-ev-pack-energy-merge",
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_NAME: "Test EV",
+            CONF_ODOMETER: "sensor.odometer",
+            CONF_BATTERY: "sensor.battery",
+            CONF_VEHICLE_ON: "binary_sensor.vehicle_on",
+        },
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+    effective = {**entry.data, **entry.options}
+    assert effective.get(CONF_BATTERY_ENERGY_SENSOR) == "sensor.pack_energy"

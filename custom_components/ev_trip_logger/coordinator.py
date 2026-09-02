@@ -68,6 +68,7 @@ from .const import (
     CONF_POLLING_PAUSED_SENSOR,
     CONF_LAST_TRIP_ENERGY_SENSOR,
     CONF_LAST_TRIP_DISTANCE_SENSOR,
+    CONF_BATTERY_ENERGY_SENSOR,
     CONF_POWER_SIGN_INVERTED,
     CONF_EVSE_POWER_SENSOR,
     CONF_TRACKED_SENSORS,
@@ -487,6 +488,31 @@ _CHARGE_ENERGY_TOLERANCE = 0.4
 # conclusion). Keeps the history table from churning on every charge while
 # still capturing real degradation steps.
 _CAPACITY_HISTORY_MIN_DELTA_KWH = 0.5
+# v0.8.52 — pack-energy sensor (CONF_BATTERY_ENERGY_SENSOR): usable kWh
+# remaining in the battery read from the BMS. A precision overlay: every
+# plug-in point computes today's value first, then replaces it ONLY when
+# a fresh, guarded reading exists. All guards live in
+# `_read_pack_energy_guarded`.
+#   * stale-max-age: a reading older than this is ignored (same 15 min
+#     window used elsewhere for cloud-polled quiet sensors).
+_PACK_ENERGY_STALE_MAX_AGE_S = 900.0
+#   * range: 0 .. declared × this. A BMS glitch reporting a pack larger
+#     than physically possible is dropped.
+_PACK_ENERGY_RANGE_RATIO_HI = 1.2
+#   * physical slope: |Δkwh| between consecutive readings must be within
+#     this power × Δt. Rejects teleporting values (unit swaps, resets).
+_PACK_ENERGY_MAX_POWER_KW = 250.0
+#   * cross-check: |kwh/declared − soc/100| ≤ band. Anchored on DECLARED
+#     capacity (never the calibrated one) so it can never close a loop.
+_PACK_ENERGY_XCHECK_BAND = 0.15
+#   * capacity sampling: only sample above this SoC (low-SoC BMS energy
+#     figures are noisy and the implied capacity extrapolation is worst).
+_PACK_ENERGY_GOOD_SOC_MIN = 10.0
+#   * throttle capacity-sample writes to at most one per this interval.
+_PACK_ENERGY_CAPACITY_SAMPLE_MIN_INTERVAL_S = 300.0
+#   * cell-tier calibration window + minimum sample count.
+_PACK_ENERGY_CAPACITY_WINDOW = 30
+_PACK_ENERGY_CAPACITY_MIN_SAMPLES = 5
 # v0.5.57 — expected SoH model. Constants derived from research:
 # Geotab 22,700 EV study 2025, Tesla 2023 Impact Report, ADAC VW ID.3
 # Dauertest, Recurrent climate study, BYD warranty extension Jan 2026,
@@ -695,6 +721,13 @@ class TripInProgress:
     # never under-reported due to stale SoC.
     energy_from_power_kwh: float = 0.0
     last_abs_power_kw: float | None = None
+    # v0.8.52 — usable-kWh-in-pack reading captured at trip open, ONLY
+    # when the guarded pack-energy sensor was fresh and sane. When both
+    # this and the close reading exist, their difference is the trip's
+    # measured consumption and overrides the SoC-delta estimate. None
+    # whenever the sensor is absent/stale — trip energy then falls back
+    # to today's ladder unchanged.
+    energy_start_kwh: float | None = None
     # v0.5.41 — counts live_tick invocations to schedule periodic
     # update_entity force-refreshes (denser GPS during the drive
     # than the upstream's natural cadence delivers).
@@ -798,6 +831,13 @@ class ChargeInProgress:
     # wallbox is wired. Persisted to charges.peak_charge_power_kw at
     # close (and propagated through merge updates).
     peak_charge_power_kw: float = 0.0
+    # v0.8.52 — usable-kWh-in-pack reading captured at charge open, ONLY
+    # when the guarded pack-energy sensor was fresh and sane. When both
+    # this and the close reading exist, their difference is the measured
+    # kWh added and overrides the SoC-delta / power-integration estimate.
+    # None whenever the sensor is absent/stale — charge energy then falls
+    # back to today's ladder unchanged.
+    energy_start_kwh: float | None = None
 
 
 class EvTripLoggerCoordinator:
@@ -847,6 +887,13 @@ class EvTripLoggerCoordinator:
         # the odometer prefix in async_start when not configured.
         self._last_trip_energy_sensor = merged.get(CONF_LAST_TRIP_ENERGY_SENSOR)
         self._last_trip_distance_sensor = merged.get(CONF_LAST_TRIP_DISTANCE_SENSOR)
+        # v0.8.52 — optional pack-energy sensor (usable kWh in the pack).
+        # A precision overlay; every consumer guards it through
+        # `_read_pack_energy_guarded`. `_pack_energy_last` holds the last
+        # ACCEPTED (now, kwh) reading, used by the physical-slope guard.
+        self._battery_energy_sensor = merged.get(CONF_BATTERY_ENERGY_SENSOR)
+        self._pack_energy_last: tuple[datetime, float] | None = None
+        self._pack_energy_last_capacity_sample_ts: datetime | None = None
         # v0.5.38 — list of external numeric sensors to roll up via the
         # HA recorder. The platform creates two AVG sensors per entry
         # (7-day and 30-day). Stored verbatim so multi-entry option
@@ -2800,6 +2847,33 @@ class EvTripLoggerCoordinator:
                 soc_val = None
             if soc_val is not None:
                 self._soc_history.append((dt_util.now(), soc_val))
+            # v0.8.52 — opportunistic cell-tier capacity sample. On a
+            # fresh battery tick, if a guarded pack-energy reading is
+            # available at a decent SoC, record the capacity it implies
+            # (`kwh / (soc/100)`). Throttled so a burst of cloud updates
+            # writes at most one sample per interval. No-op when the
+            # sensor is unset (guarded read returns None first line).
+            if (
+                self._battery_energy_sensor
+                and soc_val is not None
+                and soc_val >= _PACK_ENERGY_GOOD_SOC_MIN
+            ):
+                _now = dt_util.now()
+                _last_ts = self._pack_energy_last_capacity_sample_ts
+                if (
+                    _last_ts is None
+                    or (_now - _last_ts).total_seconds()
+                    >= _PACK_ENERGY_CAPACITY_SAMPLE_MIN_INTERVAL_S
+                ):
+                    kwh = self._read_pack_energy_guarded(_now, soc_val)
+                    if kwh is not None and soc_val > 0:
+                        implied = kwh / (soc_val / 100.0)
+                        self._pack_energy_last_capacity_sample_ts = _now
+                        self.hass.async_create_task(
+                            self.storage.async_insert_capacity_sample(
+                                implied, kwh, soc_val, _now,
+                            )
+                        )
 
         # v0.5.25 — every cloud poll snapshot the location entity. Most
         # cloud-polled integrations refresh battery, odometer and
@@ -3741,6 +3815,7 @@ class EvTripLoggerCoordinator:
             self.current_charge = ChargeInProgress(
                 started_at=now, soc_start=soc, last_seen_soc=soc,
                 odometer_at_start=self._read_float(self._odometer),
+                energy_start_kwh=self._read_pack_energy_guarded(now, soc),
             )
             _LOGGER.debug("Charge session opened at %s, soc=%s", now, soc)
             self._notify_listeners()
@@ -3785,6 +3860,7 @@ class EvTripLoggerCoordinator:
             self.current_charge = ChargeInProgress(
                 started_at=now, soc_start=soc, last_seen_soc=soc,
                 odometer_at_start=self._read_float(self._odometer),
+                energy_start_kwh=self._read_pack_energy_guarded(now, soc),
             )
             _LOGGER.debug(
                 "Charge session opened after trip force-close: soc=%s", soc
@@ -4157,6 +4233,28 @@ class EvTripLoggerCoordinator:
         # checked BEFORE the tolerance band, not folded into it.
         kwh = kwh_soc
         energy_source = "soc_delta"
+        # v0.8.52 — pack-energy overlay: the highest-priority measurement.
+        # A charge ADDS energy, so end − start is the measured kWh in.
+        # Only taken when both the open anchor and a fresh, guarded close
+        # reading exist and the gain is positive; the power-integration
+        # path below is then skipped entirely (it only runs when this is
+        # None, keeping the non-sensor case byte-for-byte identical).
+        energy_end = self._read_pack_energy_guarded(now, soc_end)
+        pack_delta_kwh = (
+            (energy_end - active.energy_start_kwh)
+            if energy_end is not None
+            and active.energy_start_kwh is not None
+            and (energy_end - active.energy_start_kwh) > 0
+            else None
+        )
+        if pack_delta_kwh is not None:
+            kwh = round(pack_delta_kwh, 3)
+            energy_source = "pack_energy"
+            _LOGGER.info(
+                "Charge kWh: using pack-energy delta %.3f (SoC said %.2f, "
+                "start %.3f → end %.3f kWh)",
+                kwh, kwh_soc, active.energy_start_kwh, energy_end,
+            )
         session_duration_h = (
             (now - active.started_at).total_seconds() / 3600.0
             if active.started_at else 0.0
@@ -4179,7 +4277,7 @@ class EvTripLoggerCoordinator:
             # trapezoid a guess. See `_CHARGE_ENERGY_MAX_GAP_H`.
             and active._max_power_gap_h <= _CHARGE_ENERGY_MAX_GAP_H
         )
-        if active.energy_added_kwh > 0 and good_coverage:
+        if pack_delta_kwh is None and active.energy_added_kwh > 0 and good_coverage:
             # v0.8.39 — the acceptance band is anchored on the DECLARED
             # capacity, not the calibrated one. `kwh_soc` above still uses
             # the calibrated value, because that is the working figure for
@@ -4233,7 +4331,7 @@ class EvTripLoggerCoordinator:
                     active.energy_added_kwh,
                     _CHARGE_ENERGY_TOLERANCE * 100.0, band_ref, kwh_soc,
                 )
-        elif active.energy_added_kwh > 0:
+        elif pack_delta_kwh is None and active.energy_added_kwh > 0:
             _LOGGER.info(
                 "Charge kWh: power-integration %.2f has weak coverage "
                 "(%d samples over %.0f %% of the session, worst gap "
@@ -5057,6 +5155,9 @@ class EvTripLoggerCoordinator:
             # v0.5.43 — may still be None here (BT pairs a few seconds
             # after ignition); the live tick keeps retrying.
             driver=self._read_driver(),
+            # v0.8.52 — anchor the pack-energy overlay. None when the
+            # sensor is unset/unavailable/stale/implausible.
+            energy_start_kwh=self._read_pack_energy_guarded(now, soc),
         )
         # v0.5.25 — seed gps_samples with the most-recent buffered
         # sample (if any within the lookback window) so even very short
@@ -5524,7 +5625,23 @@ class EvTripLoggerCoordinator:
             and power_ratio_ok
         )
         soc_pct = soc_used or 0.0
-        if energy_soc is not None and soc_pct >= 3.0:
+        # v0.8.52 — pack-energy overlay: the highest-priority rung. A
+        # trip CONSUMES, so start − end is the measured drop. Only taken
+        # when both the open anchor and a fresh, guarded close reading
+        # exist and the drop is positive; otherwise every branch below
+        # is today's ladder, unchanged.
+        energy_end = self._read_pack_energy_guarded(now, soc_end)
+        pack_delta_kwh = (
+            (active.energy_start_kwh - energy_end)
+            if energy_end is not None
+            and active.energy_start_kwh is not None
+            and (active.energy_start_kwh - energy_end) > 0
+            else None
+        )
+        if pack_delta_kwh is not None:
+            energy = pack_delta_kwh
+            energy_source = "pack_energy"
+        elif energy_soc is not None and soc_pct >= 3.0:
             energy = energy_soc
             energy_source = "soc"
         elif energy_soc is not None and soc_pct >= 1.0:
@@ -7407,6 +7524,63 @@ class EvTripLoggerCoordinator:
             return float(state.state)
         except (TypeError, ValueError):
             return None
+
+    def _read_pack_energy_guarded(
+        self, now: datetime, soc: float | None,
+    ) -> float | None:
+        """v0.8.52 — the single gate for the pack-energy sensor.
+
+        Returns the current usable-kWh-in-pack reading ONLY when it
+        passes every guard; otherwise None. This centralises all the
+        plausibility checks so every plug-in point (trip/charge energy,
+        capacity sampling, the exposed sensor) shares identical
+        semantics: compute today's value first, then overlay this when
+        (and only when) it is fresh and sane.
+
+        Guards, in order:
+          1. sensor unconfigured → None immediately (isolation: with no
+             sensor, every consumer falls through to today's behaviour).
+          2. freshness — via `_read_float_if_fresh`, so a cloud-polled
+             entity that went quiet can't feed a leftover value.
+          3. range — 0 .. declared × `_PACK_ENERGY_RANGE_RATIO_HI`.
+          4. physical slope — |Δkwh| vs the last accepted reading must
+             be within `_PACK_ENERGY_MAX_POWER_KW` × Δt.
+          5. cross-check — |kwh/declared − soc/100| ≤
+             `_PACK_ENERGY_XCHECK_BAND`, using the DECLARED capacity
+             (never the calibrated one — that would close a loop), only
+             when `soc` is known and declared > 0.
+
+        On pass, records `(now, kwh)` as the last accepted reading so
+        the next slope check has an anchor, then returns kwh.
+        """
+        if not self._battery_energy_sensor:
+            return None
+        kwh = self._read_float_if_fresh(
+            self._battery_energy_sensor, now, _PACK_ENERGY_STALE_MAX_AGE_S,
+        )
+        if kwh is None:
+            return None
+        declared = self._battery_capacity_declared
+        # Range guard: reject negatives and BMS glitches beyond physical.
+        if kwh < 0 or (declared > 0 and kwh > declared * _PACK_ENERGY_RANGE_RATIO_HI):
+            return None
+        # Physical-slope guard: a reading can't move faster than the pack
+        # can physically charge/discharge. Skipped on the first accepted
+        # reading (no anchor yet).
+        if self._pack_energy_last is not None:
+            last_ts, last_kwh = self._pack_energy_last
+            dt_s = abs((now - last_ts).total_seconds())
+            max_delta = _PACK_ENERGY_MAX_POWER_KW * (dt_s / 3600.0)
+            if abs(kwh - last_kwh) > max_delta:
+                return None
+        # Cross-check against SoC using the DECLARED capacity only.
+        if (
+            soc is not None and declared > 0
+            and abs(kwh / declared - soc / 100.0) > _PACK_ENERGY_XCHECK_BAND
+        ):
+            return None
+        self._pack_energy_last = (now, kwh)
+        return kwh
 
     def _read_str(self, entity_id: str | None) -> str | None:
         return self._read_state(entity_id)

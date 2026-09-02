@@ -192,6 +192,21 @@ class CapacityCalibration(NamedTuple):
     rejects: dict[str, int]
     source: str
 
+
+def _empty_rejects() -> dict[str, int]:
+    """The all-zero per-gate reject counter used by the SoH sensor.
+
+    v0.8.52 — the cell tier applies no per-gate rejection (its samples
+    are pre-filtered at capture by `_read_pack_energy_guarded`), so it
+    returns this shape to keep `CapacityCalibration.rejects` uniform.
+    """
+    return {
+        "kwh_too_small": 0,
+        "temp_cold": 0,
+        "temp_hot": 0,
+        "bad_soc_delta": 0,
+    }
+
 #: SQL predicate for "this charge has a usable EVSE meter reading" —
 #: shared by every paired kwh/evse sum so the ratio between them cannot
 #: fall outside the plausibility band above.
@@ -1002,6 +1017,28 @@ class TripStorage:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_capacity_history_observed_at "
             "ON capacity_history(observed_at)"
+        )
+        # v0.8.52 — pack-energy "cell" capacity samples. Each row is a
+        # single guarded pack-energy reading and the capacity it implies
+        # (`implied_kwh = energy_kwh / (soc/100)`). The cell tier medians
+        # the most recent samples ahead of the grounded/soc tiers. Kept
+        # in its own table (not `capacity_history`, which stores adopted
+        # calibration snapshots) so raw samples never pollute the SoH
+        # degradation timeline.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS capacity_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_at TEXT NOT NULL,
+                implied_kwh REAL NOT NULL,
+                energy_kwh REAL,
+                soc REAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capacity_samples_observed_at "
+            "ON capacity_samples(observed_at)"
         )
         # Safe to call on fresh or migrated DBs.
         conn.execute(
@@ -1985,6 +2022,64 @@ class TripStorage:
             "cheapest": _row_to_record(cheapest) if cheapest else None,
         }
 
+    async def async_insert_capacity_sample(
+        self,
+        implied_kwh: float,
+        energy_kwh: float | None,
+        soc: float | None,
+        when: datetime,
+    ) -> None:
+        """v0.8.52 — persist one guarded pack-energy capacity sample."""
+        await self._hass.async_add_executor_job(
+            self._insert_capacity_sample, implied_kwh, energy_kwh, soc, when,
+        )
+
+    def _insert_capacity_sample(
+        self,
+        implied_kwh: float,
+        energy_kwh: float | None,
+        soc: float | None,
+        when: datetime,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO capacity_samples "
+                "(observed_at, implied_kwh, energy_kwh, soc) "
+                "VALUES (?, ?, ?, ?)",
+                (when.isoformat(), float(implied_kwh),
+                 None if energy_kwh is None else float(energy_kwh),
+                 None if soc is None else float(soc)),
+            )
+
+    def _cell_capacity_kwh(
+        self, window: int, min_samples: int,
+    ) -> tuple[float | None, int]:
+        """v0.8.52 — median implied capacity over the last `window`
+        pack-energy samples. Returns `(median|None, n)`; median is None
+        when fewer than `min_samples` rows exist."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT implied_kwh FROM capacity_samples "
+                "ORDER BY observed_at DESC, id DESC LIMIT ?",
+                (window,),
+            ).fetchall()
+        vals: list[float] = []
+        for (implied,) in rows:
+            try:
+                vals.append(float(implied))
+            except (TypeError, ValueError):
+                continue
+        n = len(vals)
+        if n < min_samples:
+            return (None, n)
+        vals.sort()
+        mid = n // 2
+        med = (
+            vals[mid] if n % 2 == 1
+            else (vals[mid - 1] + vals[mid]) / 2.0
+        )
+        return (med, n)
+
     async def async_effective_capacity_kwh(
         self,
         *,
@@ -2069,6 +2164,17 @@ class TripStorage:
         # under-integration needs an instrument that does not contain
         # `kwh` — sample coverage over the session, say — not a ratio
         # that does.
+        # v0.8.52 — cell tier, highest priority. Pack-energy samples are
+        # a direct BMS measurement of usable kWh, already guarded at
+        # capture (freshness/range/slope/cross-check). Their implied
+        # capacity does not depend on the calibration it feeds, so —
+        # unlike the soc tier — it is evidence, not a tautology, and it
+        # outranks even the grounded power-integration pool.
+        cell_median, cell_n = self._cell_capacity_kwh(window, min_charges)
+        if cell_median is not None and cell_n >= min_charges:
+            return CapacityCalibration(
+                cell_median, cell_n, _empty_rejects(), source="cell",
+            )
         grounded = self._effective_capacity_kwh_query(
             min_delta_pct, window, min_kwh, temp_min_c, temp_max_c,
             energy_source="power_integration",

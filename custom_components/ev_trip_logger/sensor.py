@@ -339,6 +339,11 @@ async def async_setup_entry(
     entities.append(CurrentJourneySensor(coordinator))
     entities.append(RecentJourneysSensor(coordinator))
     entities.append(BatteryEnergySensor(coordinator))
+    # v0.8.52 — only expose the pack-energy overlay sensor when the
+    # source sensor is actually configured; otherwise it would be a
+    # permanently-unavailable entity on every install.
+    if coordinator._battery_energy_sensor:
+        entities.append(MeasuredPackEnergySensor(coordinator))
     entities.append(EnergyToFullSensor(coordinator))
     entities.append(BatteryPercentSensor(coordinator))
     entities.append(RangeAtRecentEfficiencySensor(coordinator))
@@ -2199,6 +2204,54 @@ class BatteryEnergySensor(_BaseTripSensor):
         if soc is None:
             return None
         return round(soc / 100.0 * self._coordinator.battery_capacity, 2)
+
+
+class MeasuredPackEnergySensor(_BaseTripSensor):
+    """v0.8.52 — usable kWh in the pack, read from the BMS pack-energy
+    sensor, exposed ONLY when the reading passes every guard.
+
+    Distinct from `BatteryEnergySensor` (which is SoC% x capacity): this
+    is a direct measurement, surfaced so the dashboard can show the
+    guarded value and the capacity it implies. Unavailable whenever the
+    reading is unset/stale/implausible — the overlay's own definition of
+    "trustworthy right now".
+    """
+
+    def __init__(self, coordinator: EvTripLoggerCoordinator) -> None:
+        super().__init__(coordinator)
+        self.entity_description = SensorEntityDescription(
+            key="measured_pack_energy",
+            translation_key="measured_pack_energy",
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            device_class=SensorDeviceClass.ENERGY_STORAGE,
+            state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:battery-heart-variant",
+            suggested_display_precision=2,
+        )
+        self._attr_unique_id = f"{coordinator.entry_id}_measured_pack_energy"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._coordinator._read_pack_energy_guarded(
+            dt_util.now(), self._coordinator.battery_level
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        kwh = self._coordinator._read_pack_energy_guarded(
+            dt_util.now(), self._coordinator.battery_level
+        )
+        soc = self._coordinator.battery_level
+        implied = (
+            round(kwh / (soc / 100.0), 2)
+            if kwh is not None and soc is not None and soc > 0
+            else None
+        )
+        return {
+            "source_entity": self._coordinator._battery_energy_sensor,
+            "implied_capacity_kwh": implied,
+            "fresh": kwh is not None,
+        }
 
 
 class EnergyToFullSensor(_BaseTripSensor):

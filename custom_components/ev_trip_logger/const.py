@@ -87,6 +87,12 @@ CONF_LAST_TRIP_ENERGY_SENSOR: Final = "last_trip_energy_sensor"
 # energy when this matches the logger's odometer-derived distance
 # (defends against a stale sensor referring to the previous trip).
 CONF_LAST_TRIP_DISTANCE_SENSOR: Final = "last_trip_distance_sensor"
+# v0.8.52 — optional pack-energy sensor: usable kWh remaining in the
+# battery, read directly from the vehicle's BMS. When present and fresh
+# (guarded), it is a precision overlay that replaces SoC-delta math for
+# trip/charge energy and drives a cell-tier capacity calibration. When
+# absent/stale, behaviour is byte-for-byte identical to before.
+CONF_BATTERY_ENERGY_SENSOR: Final = "battery_energy_sensor"  # usable kWh remaining in pack
 # v0.5.43 — optional driver-identity sensor. Any entity whose state
 # names the person currently using the car: the manufacturer
 # integration's "connected bluetooth device" sensor, an input_select
