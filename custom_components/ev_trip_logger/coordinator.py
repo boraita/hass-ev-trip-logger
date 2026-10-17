@@ -1028,6 +1028,7 @@ class EvTripLoggerCoordinator:
         # property below prefers it.
         self._battery_capacity_calibrated: float | None = None
         self._battery_capacity_calibration_n: int = 0
+        self._capacity_clamp_logged: tuple[float, int] | None = None
         # v0.6.5 — per-gate reject counts from the last calibration run.
         # Surfaced in the BatterySohSensor attributes so a user can see
         # "9 charges considered, 4 used, 3 too-small, 2 cold".
@@ -2172,13 +2173,27 @@ class EvTripLoggerCoordinator:
             # on the nameplate, and the difference matters: the first
             # means the capacity pool is biased and needs looking at.
             if median > hi:
-                _LOGGER.warning(
+                # The nameplate is the known capacity and the ceiling is
+                # deliberate, so this is information, not a fault.
+                # Recalibration runs on every refresh; log once per
+                # distinct pool, not once per run.
+                clamp_key = (round(median, 1), n)
+                level = (
+                    logging.DEBUG
+                    if clamp_key == self._capacity_clamp_logged
+                    else logging.INFO
+                )
+                self._capacity_clamp_logged = clamp_key
+                _LOGGER.log(
+                    level,
                     "Capacity calibration clamped: pool median %.2f kWh "
                     "exceeds the %.2f kWh nameplate (source=%s, n=%d). "
                     "A pack does not grow with use — treat the estimate "
                     "as biased, not the battery as improved.",
                     median, hi, source, n,
                 )
+            else:
+                self._capacity_clamp_logged = None
         prev = self._battery_capacity_calibrated
         changed = (
             (prev is None) != (new_value is None)
