@@ -173,3 +173,38 @@ async def test_journey_sensors_surface_cost_lifo(
     out = recent.extra_state_attributes["journeys"][0]
     assert "cost_lifo" in out
     assert out["cost_lifo"] == pytest.approx(0.62)
+
+
+async def test_tracked_avg_unit_restored_before_source_exists(
+    hass,  # type: ignore[no-untyped-def]
+) -> None:
+    """v0.8.54 — after a restart the first published state must already
+    carry the unit the sensor had before, even though the source entity
+    has not been created yet. Otherwise the recorder sees
+    `unit_of_measurement: None` against statistics compiled in
+    kWh/100km and suppresses long-term statistics."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from custom_components.ev_trip_logger.const import DOMAIN
+    from custom_components.ev_trip_logger.sensor import TrackedAvgSensor
+
+    from .test_coordinator import _setup
+
+    src = "sensor.byd_not_created_yet"
+    entry = await _setup(hass)
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    sensor = TrackedAvgSensor(coordinator, src, days=30)
+    sensor.hass = hass
+    sensor.async_get_last_state = AsyncMock(
+        return_value=MagicMock(attributes={"unit_of_measurement": "kWh/100km"})
+    )
+    sensor._async_refresh = AsyncMock()
+    unsubs: list = []
+    sensor.async_on_remove = unsubs.append
+
+    await sensor.async_added_to_hass()
+    for unsub in unsubs:
+        unsub()
+
+    assert sensor.native_unit_of_measurement == "kWh/100km"

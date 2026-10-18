@@ -27,6 +27,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
@@ -1726,7 +1727,7 @@ _SOH_RATE_MIN_SNAPSHOTS = 6
 _SOH_RATE_MIN_SPAN_YEARS = 0.25  # three months
 
 
-class TrackedAvgSensor(_BaseTripSensor):
+class TrackedAvgSensor(_BaseTripSensor, RestoreEntity):
     """Rolling N-day mean of an arbitrary numeric sensor via HA recorder.
 
     Configured via CONF_TRACKED_SENSORS. Each tracked entity gets two
@@ -1799,6 +1800,17 @@ class TrackedAvgSensor(_BaseTripSensor):
 
     async def async_added_to_hass(self) -> None:
         from .const import TRACKED_AVG_REFRESH_S  # noqa: PLC0415
+        # v0.8.54 — the in-memory unit cache starts empty on every
+        # restart, and the source is often created seconds AFTER this
+        # sensor first publishes. Those first states carried
+        # `unit_of_measurement: None`, which the recorder logs as a
+        # units-changed warning and then stops compiling statistics.
+        # Seed the cache from the last state before the first publish.
+        if self._unit_cache is None:
+            last = await self.async_get_last_state()
+            unit = last.attributes.get("unit_of_measurement") if last else None
+            if unit:
+                self._unit_cache = unit
         await self._async_refresh()
         self.async_on_remove(
             async_track_time_interval(
